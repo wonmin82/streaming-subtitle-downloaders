@@ -1,0 +1,1616 @@
+// ==UserScript==
+// @name       Apple TV+ Subtitles Downloader
+// @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
+// @description Download subtitles from Apple TV+
+// @version    1.0.0
+// @author     Wonmin Jung
+// @license    MIT
+// @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
+// @downloadURL https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/apple-tv-plus-subtitles-downloader.user.js
+// @updateURL  https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/apple-tv-plus-subtitles-downloader.user.js
+// @match      https://tv.apple.com/*
+// @match      https://*.tv.apple.com/*
+// @match      https://*.itunes.apple.com/*
+// @grant      GM_xmlhttpRequest
+// @grant      unsafeWindow
+// @connect    *.apple.com
+// @connect    *.apple.co
+// @connect    *.itunes.apple.com
+// @connect    *.mzstatic.com
+// @connect    *.aaplimg.com
+// @connect    *.cdn-apple.com
+// @connect    *.apple-dns.net
+// @connect    *
+// @require    https://cdn.jsdelivr.net/npm/jszip@3.5.0/dist/jszip.min.js
+// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js
+// @run-at     document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    var debug = location.hash === '#debug' || location.hash.indexOf('atvsd_debug') >= 0;
+    var MAX_RETRIES = 5;
+    var LOG_PREFIX = '[Apple TV+ Subtitles DL]';
+    var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    var MESSAGE_TYPE_TRACK = 'atvsd-subtitle-track';
+
+    var state = {
+        initialized: false,
+        installedHooks: false,
+        observer: null,
+        oldlocation: null,
+        langs: [],
+        langKeys: {},
+        seenManifestUrls: {},
+        seenResourceUrls: {},
+        manifestMeta: {},
+        playbackScanStartedAt: 0,
+        playbackActive: false,
+        selectedTrackKey: '',
+        userSelectedTrack: false,
+        mediaTitle: '',
+        seasonNumber: null,
+        episodeNumber: null,
+        episodeTag: '',
+        wait: false,
+        status: 'Start playback, then wait for tracks...',
+        lastError: '',
+        downloadall: false,
+        zip: null
+    };
+
+    init();
+
+    function init() {
+        if (state.initialized) return;
+        state.initialized = true;
+
+        installNetworkHooks();
+        startPerformanceObserver();
+        if (isTopFrame()) {
+            installStyles();
+            installFrameBridge();
+            scheduleUi();
+            setInterval(tick, 1000);
+        } else {
+            setInterval(scanPerformanceEntries, 1000);
+        }
+        debuglog('Script loaded');
+    }
+
+    function tick() {
+        var pageKey = isAppleTvPage() ? location.href.split('#')[0] : '';
+        if (state.oldlocation !== pageKey) {
+            state.oldlocation = pageKey;
+            if (isAppleTvPage()) {
+                state.status = 'Scanning playback...';
+                resetSubtitleTracks();
+                resetMediaMetadata();
+                refreshMediaMetadataFromDom();
+                scanPerformanceEntries();
+                updateUi();
+            }
+        }
+
+        if (isAppleTvPage()) {
+            scanPerformanceEntries();
+            var playbackActive = hasPlaybackSurface();
+            if (playbackActive) {
+                if (!state.playbackActive) {
+                    state.playbackActive = true;
+                    discardShortPreviewTracks();
+                    state.status = 'Scanning active playback...';
+                    scanPerformanceEntries();
+                }
+                ensureWidget();
+            } else {
+                state.playbackActive = false;
+                hideWidget();
+            }
+        } else {
+            hideWidget();
+        }
+    }
+
+    function isAppleTvPage() {
+        return isAppleHost(location.hostname);
+    }
+
+    function isAppleHost(hostname) {
+        return hostname === 'tv.apple.com' ||
+            /\.tv\.apple\.com$/i.test(hostname || '') ||
+            /\.itunes\.apple\.com$/i.test(hostname || '');
+    }
+
+    function isTopFrame() {
+        try { return window.top === window; } catch (err) { return false; }
+    }
+
+    function hasPlaybackSurface() {
+        if (!isTopFrame()) return false;
+        return hasVisiblePlaybackView() || hasPlayableLongFormVideo();
+    }
+
+    function hasVisiblePlaybackView() {
+        var views = document.querySelectorAll('[data-testid="playback-view"], .main-playback-view, .playback-view');
+        for (var i = 0; i < views.length; i++) {
+            if (isVisiblePlaybackRect(views[i])) return true;
+        }
+        return false;
+    }
+
+    function hasPlayableLongFormVideo() {
+        var videos = collectVideosDeep(document);
+        for (var i = 0; i < videos.length; i++) {
+            var video = videos[i];
+            var rect = video.getBoundingClientRect();
+            if (isPlayableVideo(video, rect)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function isVisiblePlaybackRect(element) {
+        var rect = element.getBoundingClientRect();
+        if (rect.width < 320 || rect.height < 180) return false;
+        if (rect.bottom <= 0 || rect.right <= 0) return false;
+        if (rect.top >= window.innerHeight || rect.left >= window.innerWidth) return false;
+        var style = window.getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    }
+
+    function collectVideosDeep(root) {
+        var videos = [];
+        collectVideosFromRoot(root, videos, 0);
+        return videos;
+    }
+
+    function collectVideosFromRoot(root, videos, depth) {
+        if (!root || depth > 8) return;
+        try {
+            if (root.querySelectorAll) {
+                Array.prototype.forEach.call(root.querySelectorAll('video'), function (video) {
+                    videos.push(video);
+                });
+                Array.prototype.forEach.call(root.querySelectorAll('*'), function (element) {
+                    if (element.shadowRoot) {
+                        collectVideosFromRoot(element.shadowRoot, videos, depth + 1);
+                    }
+                });
+            }
+        } catch (err) {
+            debuglog('Could not inspect video root: ' + err.message);
+        }
+    }
+
+    function isPlayableVideo(video, rect) {
+        if (!rect || rect.width < 240 || rect.height < 160) return false;
+        if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) return false;
+        if (isBackgroundPreviewVideo(video)) return false;
+
+        var style = window.getComputedStyle(video);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+
+        var hasMedia = !!(video.currentSrc || video.src || video.readyState > 0);
+        var duration = Number(video.duration);
+        var knownDuration = isFinite(duration) && duration > 0;
+        var longForm = duration === Infinity || (knownDuration && duration > 180) || Number(video.currentTime) > 60;
+        return hasMedia && longForm;
+    }
+
+    function isPlaybackResourceContext() {
+        return hasVisiblePlaybackView() || hasPlayableLongFormVideo();
+    }
+
+    function isBackgroundPreviewVideo(video) {
+        var node = video;
+        while (node) {
+            if (node.nodeType === 11 && node.host) {
+                node = node.host;
+                continue;
+            }
+            if (node.nodeType !== 1) {
+                node = node.parentNode;
+                continue;
+            }
+            var tagName = (node.tagName || '').toLowerCase();
+            var marker = [
+                tagName,
+                node.id || '',
+                node.className || '',
+                node.getAttribute('data-testid') || '',
+                node.getAttribute('aria-hidden') || ''
+            ].join(' ');
+            if (/amp-background-video|background-video|preview/i.test(marker)) return true;
+            node = node.parentNode || (node.getRootNode && node.getRootNode().host);
+        }
+        return false;
+    }
+
+    function playbackMenuParent() {
+        var dialog = visiblePlaybackDialog();
+        return dialog || document.body;
+    }
+
+    function visiblePlaybackDialog() {
+        var dialogs = document.querySelectorAll('dialog[data-testid="playback-view"], dialog.playback-view, [data-testid="playback-view"].is-playback-active, .playback-view.is-playback-active');
+        for (var i = 0; i < dialogs.length; i++) {
+            if (isVisiblePlaybackRect(dialogs[i])) return dialogs[i];
+        }
+        return null;
+    }
+
+    function attachWidgetToPlaybackSurface(root) {
+        var parent = playbackMenuParent();
+        if (!parent || root.parentNode === parent) return;
+        parent.appendChild(root);
+    }
+
+    function discardShortPreviewTracks() {
+        if (!state.langs.length) return;
+        var kept = [];
+        state.langKeys = {};
+        state.langs.forEach(function (track) {
+            if (isShortPreviewTrack(track)) return;
+            track.key = trackIdentity(track);
+            track.identity = track.key;
+            if (!state.langKeys[track.key]) {
+                state.langKeys[track.key] = track;
+                kept.push(track);
+            } else {
+                mergeTrack(state.langKeys[track.key], track);
+            }
+        });
+        state.langs = kept;
+    }
+
+    function installFrameBridge() {
+        window.addEventListener('message', function (event) {
+            var data = event.data;
+            if (!data || data.type !== MESSAGE_TYPE_TRACK || !data.track) return;
+            if (!isTrustedAppleOrigin(event.origin)) return;
+            addTrack(data.track, true);
+            state.status = 'Ready. Select a subtitle track.';
+            updateUi();
+        });
+    }
+
+    function isTrustedAppleOrigin(origin) {
+        try {
+            var host = new URL(origin).hostname;
+            return isAppleHost(host) || /\.apple\.com$/i.test(host) || /\.mzstatic\.com$/i.test(host) || /\.aaplimg\.com$/i.test(host);
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function forwardTrackToTop(track) {
+        try {
+            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, track: cloneTrackForMessage(track) }, '*');
+        } catch (err) {
+            debuglog('Could not forward track to top frame: ' + err.message);
+        }
+    }
+
+    function cloneTrackForMessage(track) {
+        return {
+            NAME: track.NAME || '',
+            LANGUAGE: track.LANGUAGE || '',
+            FORCED: track.FORCED || 'NO',
+            CHARACTERISTICS: track.CHARACTERISTICS || '',
+            TYPE: track.TYPE || '',
+            URI: track.URI || '',
+            source: track.source || '',
+            segments: track.segments || null,
+            activePlayback: !!track.activePlayback,
+            playlistDuration: track.playlistDuration || null,
+            manifestUrl: track.manifestUrl || ''
+        };
+    }
+
+    function scheduleUi() {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', ensureWidget, false);
+        } else {
+            ensureWidget();
+        }
+    }
+
+    function installStyles() {
+        Array.prototype.forEach.call(document.querySelectorAll('style#dpsd-styles'), function (existing) {
+            existing.parentNode.removeChild(existing);
+        });
+
+        var style = document.createElement('style');
+        style.id = 'dpsd-styles';
+        style.textContent = [
+            '#dpsd-root{position:fixed;display:block;width:300px;top:0;left:calc(50% - 150px);z-index:2147483647;font-family:Arial,sans-serif;color:#fff;font-size:10px;pointer-events:auto}',
+            '#dpsd-root *{box-sizing:border-box}',
+            '#dpsd-menu{list-style:none;position:relative;width:300px;background:#333;color:#fff;padding:0;margin:auto;font-size:12px;z-index:99999998}',
+            '#dpsd-menu li{padding:10px;min-height:34px;line-height:14px;white-space:normal}',
+            '#dpsd-menu li.dpsd-header{font-weight:bold;cursor:default}',
+            '#dpsd-menu li:not(.dpsd-header){display:none;cursor:pointer}',
+            '#dpsd-root:hover #dpsd-menu li,#dpsd-root:focus-within #dpsd-menu li{display:block}',
+            '#dpsd-menu li:not(.dpsd-header):hover{background:#666}',
+            '#dpsd-menu li.dpsd-info{cursor:default}',
+            '#dpsd-menu li.dpsd-info:hover{background:transparent}',
+            '#dpsd-menu li.dpsd-disabled{opacity:.45;cursor:not-allowed}',
+            '#dpsd-menu li.dpsd-disabled:hover{background:transparent}',
+            '#dpsd-track{width:100%;margin-top:6px;border:1px solid #555;background:#222;color:#fff;padding:4px;font-size:12px}',
+            '#dpsd-status{color:#ddd;word-break:break-word}',
+            '#dpsd-count,#dpsd-selected-name,#dpsd-format{font-weight:normal}'
+        ].join('\n');
+
+        appendWhenPossible(style);
+    }
+
+    function appendWhenPossible(node) {
+        var parent = document.head || document.documentElement;
+        if (parent) {
+            parent.appendChild(node);
+            return;
+        }
+        setTimeout(function () { appendWhenPossible(node); }, 25);
+    }
+
+    function ensureWidget() {
+        if (!isAppleTvPage()) return;
+        if (!document.body) {
+            setTimeout(ensureWidget, 100);
+            return;
+        }
+        if (!hasPlaybackSurface()) {
+            hideWidget();
+            return;
+        }
+
+        var root = document.getElementById('dpsd-root');
+        if (root) {
+            attachWidgetToPlaybackSurface(root);
+            root.style.display = '';
+            updateUi();
+            return;
+        }
+
+        root = document.createElement('div');
+        root.id = 'dpsd-root';
+        var menu = document.createElement('ol');
+        menu.id = 'dpsd-menu';
+        root.appendChild(menu);
+
+        menu.appendChild(createMenuItem('', 'Apple TV+ subtitle downloader', 'dpsd-header'));
+        menu.appendChild(createMenuItem('dpsd-download', 'Download selected subtitle'));
+        menu.appendChild(createMenuItem('dpsd-download-en', 'Download English subtitle'));
+        menu.appendChild(createMenuItem('dpsd-download-ko', 'Download Korean subtitle'));
+        menu.appendChild(createMenuItem('dpsd-download-en-ko', 'Download English + Korean subtitles'));
+        menu.appendChild(createMenuItem('dpsd-download-all', 'Download all detected subtitles'));
+
+        var selectedItem = createMenuItem('', 'Selected track: ', 'dpsd-info');
+        var selectedName = document.createElement('span');
+        selectedName.id = 'dpsd-selected-name';
+        selectedName.textContent = 'none';
+        var trackSelect = document.createElement('select');
+        trackSelect.id = 'dpsd-track';
+        selectedItem.appendChild(selectedName);
+        selectedItem.appendChild(trackSelect);
+        menu.appendChild(selectedItem);
+
+        var countItem = createMenuItem('', 'Detected subtitles: ', 'dpsd-info');
+        var countValue = document.createElement('span');
+        countValue.id = 'dpsd-count';
+        countValue.textContent = '0 tracks';
+        countItem.appendChild(countValue);
+        menu.appendChild(countItem);
+
+        var formatItem = createMenuItem('', 'Subtitle format: ', 'dpsd-info');
+        var formatValue = document.createElement('span');
+        formatValue.id = 'dpsd-format';
+        formatValue.textContent = 'WebVTT';
+        formatItem.appendChild(formatValue);
+        menu.appendChild(formatItem);
+
+        menu.appendChild(createMenuItem('dpsd-rescan', 'Rescan playback resources'));
+
+        var statusItem = createMenuItem('', 'Status: ', 'dpsd-info');
+        var statusValue = document.createElement('span');
+        statusValue.id = 'dpsd-status';
+        statusValue.textContent = 'Start playback, then wait for tracks...';
+        statusItem.appendChild(statusValue);
+        menu.appendChild(statusItem);
+
+        attachWidgetToPlaybackSurface(root);
+
+        bindMenuAction('dpsd-rescan', function () {
+            state.status = 'Rescanning playback resources...';
+            scanPerformanceEntries();
+            updateUi();
+        });
+        document.getElementById('dpsd-track').addEventListener('change', function () {
+            state.selectedTrackKey = this.value;
+            state.userSelectedTrack = true;
+            updateUi();
+        });
+        bindMenuAction('dpsd-download', function () {
+            if (state.wait || state.langs.length === 0) return;
+            var select = document.getElementById('dpsd-track');
+            state.selectedTrackKey = select.value;
+            state.userSelectedTrack = true;
+            var track = findTrackByKey(select.value);
+            if (track) downloadTrack(track);
+        });
+        bindMenuAction('dpsd-download-all', downloadAllTracks);
+        bindMenuAction('dpsd-download-en', function () {
+            downloadPreferredTrack('en');
+        });
+        bindMenuAction('dpsd-download-ko', function () {
+            downloadPreferredTrack('ko');
+        });
+        bindMenuAction('dpsd-download-en-ko', downloadEnglishAndKorean);
+
+        updateUi();
+    }
+
+    function hideWidget() {
+        var root = document.getElementById('dpsd-root');
+        if (root) root.style.display = 'none';
+    }
+
+    function createMenuItem(id, text, className) {
+        var item = document.createElement('li');
+        if (id) {
+            item.id = id;
+            item.setAttribute('role', 'button');
+            item.setAttribute('tabindex', '0');
+        }
+        if (className) item.className = className;
+        item.appendChild(document.createTextNode(text));
+        return item;
+    }
+
+    function bindMenuAction(id, handler) {
+        var node = document.getElementById(id);
+        if (!node) return;
+        node.addEventListener('click', function () {
+            if (node.classList.contains('dpsd-disabled')) return;
+            handler();
+        });
+        node.addEventListener('keydown', function (event) {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            if (node.classList.contains('dpsd-disabled')) return;
+            handler();
+        });
+    }
+
+    function updateUi() {
+        var root = document.getElementById('dpsd-root');
+        if (!root) return;
+        if (!hasPlaybackSurface()) {
+            hideWidget();
+            return;
+        }
+
+        var select = document.getElementById('dpsd-track');
+        var count = document.getElementById('dpsd-count');
+        var status = document.getElementById('dpsd-status');
+        var download = document.getElementById('dpsd-download');
+        var downloadAll = document.getElementById('dpsd-download-all');
+        var downloadEn = document.getElementById('dpsd-download-en');
+        var downloadKo = document.getElementById('dpsd-download-ko');
+        var downloadEnKo = document.getElementById('dpsd-download-en-ko');
+        var selectedName = document.getElementById('dpsd-selected-name');
+        var preferredEn = findPreferredTrack('en');
+        var preferredKo = findPreferredTrack('ko');
+        var desiredKey = state.userSelectedTrack ? state.selectedTrackKey : preferredSelectionKey();
+
+        select.innerHTML = '';
+        state.langs.forEach(function (track) {
+            var option = document.createElement('option');
+            option.value = track.key;
+            option.textContent = track.NAME;
+            select.appendChild(option);
+        });
+
+        if (state.langs.length === 0) {
+            var empty = document.createElement('option');
+            empty.textContent = 'No subtitles detected yet';
+            empty.value = '';
+            select.appendChild(empty);
+        }
+
+        if (!findTrackByKey(desiredKey)) {
+            desiredKey = preferredSelectionKey();
+        }
+        if (desiredKey) {
+            select.value = desiredKey;
+            state.selectedTrackKey = desiredKey;
+        }
+
+        count.textContent = state.langs.length + (state.langs.length === 1 ? ' track' : ' tracks');
+        selectedName.textContent = findTrackByKey(select.value) ? findTrackByKey(select.value).NAME : 'none';
+        status.textContent = state.lastError || state.status;
+        setMenuItemDisabled(download, state.wait || state.langs.length === 0);
+        setMenuItemDisabled(downloadAll, state.wait || state.langs.length === 0);
+        setMenuItemDisabled(downloadEn, state.wait || !preferredEn);
+        setMenuItemDisabled(downloadKo, state.wait || !preferredKo);
+        setMenuItemDisabled(downloadEnKo, state.wait || !preferredEn || !preferredKo);
+        downloadEn.title = preferredEn ? preferredEn.NAME : 'No English subtitle detected yet';
+        downloadKo.title = preferredKo ? preferredKo.NAME : 'No Korean subtitle detected yet';
+        downloadEnKo.title = preferredEn && preferredKo ? preferredEn.NAME + ' + ' + preferredKo.NAME : 'English and Korean subtitles are both required';
+    }
+
+    function setMenuItemDisabled(node, disabled) {
+        if (!node) return;
+        node.classList.toggle('dpsd-disabled', !!disabled);
+        node.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+
+    function installNetworkHooks() {
+        if (state.installedHooks) return;
+        state.installedHooks = true;
+
+        hookXhr(targetWindow);
+        hookFetch(targetWindow);
+        if (targetWindow !== window) {
+            hookXhr(window);
+            hookFetch(window);
+        }
+    }
+
+    function hookXhr(win) {
+        try {
+            if (!win.XMLHttpRequest || !win.XMLHttpRequest.prototype) return;
+            var proto = win.XMLHttpRequest.prototype;
+            if (proto.open && proto.open.__dpsdPatched) return;
+            var originalOpen = proto.open;
+            var originalSend = proto.send;
+            proto.open = function () {
+                if (arguments.length >= 2) {
+                    this.__dpsdUrl = normalizeUrl(arguments[1]);
+                    recordResourceUrl(arguments[1], 'xhr');
+                }
+                return originalOpen.apply(this, arguments);
+            };
+            proto.send = function () {
+                var xhr = this;
+                if (!xhr.__dpsdMetaHooked) {
+                    xhr.__dpsdMetaHooked = true;
+                    xhr.addEventListener('loadend', function () {
+                        var responseText = '';
+                        try {
+                            if (!xhr.responseType || xhr.responseType === 'text') responseText = xhr.responseText;
+                        } catch (err) {}
+                        inspectMetadataResponse(xhr.__dpsdUrl, responseText);
+                    }, false);
+                }
+                return originalSend.apply(this, arguments);
+            };
+            proto.open.__dpsdPatched = true;
+            debuglog('XHR hook installed');
+        } catch (err) {
+            debuglog('XHR hook failed: ' + err.message);
+        }
+    }
+
+    function hookFetch(win) {
+        try {
+            if (!win.fetch || win.fetch.__dpsdPatched) return;
+            var originalFetch = win.fetch;
+            win.fetch = function () {
+                var url = fetchInputUrl(arguments[0]);
+                recordResourceUrl(url, 'fetch');
+                return originalFetch.apply(this, arguments).then(function (response) {
+                    inspectFetchMetadataResponse(url || response.url, response);
+                    return response;
+                });
+            };
+            win.fetch.__dpsdPatched = true;
+            debuglog('fetch hook installed');
+        } catch (err) {
+            debuglog('fetch hook failed: ' + err.message);
+        }
+    }
+
+    function fetchInputUrl(input) {
+        if (!input) return '';
+        if (typeof input === 'string') return input;
+        if (input.url) return input.url;
+        try { return String(input); } catch (err) { return ''; }
+    }
+
+    function startPerformanceObserver() {
+        scanPerformanceEntries();
+        try {
+            if (!targetWindow.PerformanceObserver) return;
+            state.observer = new targetWindow.PerformanceObserver(function (list) {
+                list.getEntries().forEach(function (entry) {
+                    recordResourceUrl(entry.name, 'performance');
+                });
+            });
+            state.observer.observe({ entryTypes: ['resource'] });
+            debuglog('PerformanceObserver installed');
+        } catch (err) {
+            debuglog('PerformanceObserver failed: ' + err.message);
+        }
+    }
+
+    function scanPerformanceEntries() {
+        try {
+            var perf = targetWindow.performance || window.performance;
+            if (!perf || !perf.getEntriesByType) return;
+            perf.getEntriesByType('resource').forEach(function (entry) {
+                if (state.playbackScanStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackScanStartedAt) return;
+                recordResourceUrl(entry.name, 'performance-scan');
+            });
+        } catch (err) {
+            debuglog('Performance scan failed: ' + err.message);
+        }
+    }
+
+    function recordResourceUrl(rawUrl, source) {
+        var url = normalizeUrl(rawUrl);
+        if (!url || state.seenResourceUrls[url]) return;
+        state.seenResourceUrls[url] = true;
+
+        if (/\.m3u8(?:[?#]|$)/i.test(url)) {
+            queueManifest(url, source);
+        } else if (/\.(?:vtt|webvtt)(?:[?#]|$)/i.test(url)) {
+            addTrack({
+                NAME: inferTrackName(url),
+                LANGUAGE: inferLanguage(url),
+                FORCED: /forced/i.test(url) ? 'YES' : 'NO',
+                URI: url,
+                source: 'direct-vtt',
+                activePlayback: isPlaybackResourceContext()
+            });
+            state.status = 'Ready. Select a subtitle track.';
+            updateUi();
+        }
+    }
+
+    function inspectFetchMetadataResponse(url, response) {
+        if (!shouldInspectMetadataUrl(url) || !response || !response.clone) return;
+        try {
+            response.clone().text().then(function (text) {
+                inspectMetadataResponse(url, text);
+            }).catch(function () {});
+        } catch (err) {}
+    }
+
+    function inspectMetadataResponse(url, text) {
+        if (!shouldInspectMetadataUrl(url) || typeof text !== 'string' || !text) return;
+        if (text.length > 2000000) return;
+
+        var metadata = extractMetadataFromText(text);
+        if (metadata.title || metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber)) {
+            updateMediaMetadata(metadata);
+        }
+    }
+
+    function shouldInspectMetadataUrl(url) {
+        url = normalizeUrl(url);
+        if (!url) return false;
+        if (/\.(m3u8|vtt|mp4|mp4a|m4s|bif|png|jpg|jpeg|webp|woff2?)(?:[?#]|$)/i.test(url)) return false;
+        return /apple|itunes|utscf|tv|playback|video|episode|metadata|uts|umc/i.test(url);
+    }
+
+    function extractMetadataFromText(text) {
+        var metadata = {};
+        var tag = seasonEpisodeTag(text);
+        if (tag) metadata.episodeTag = tag;
+
+        try {
+            collectMetadataFromJson(JSON.parse(text), metadata, '', 0);
+        } catch (err) {}
+
+        return metadata;
+    }
+
+    function collectMetadataFromJson(value, metadata, path, depth) {
+        if (value == null || depth > 12) return;
+
+        if (typeof value === 'string') {
+            var tag = seasonEpisodeTag(value);
+            if (tag && !metadata.episodeTag) metadata.episodeTag = tag;
+            return;
+        }
+
+        if (typeof value !== 'object') return;
+
+        if (Array.isArray(value)) {
+            value.slice(0, 250).forEach(function (item) {
+                collectMetadataFromJson(item, metadata, path, depth + 1);
+            });
+            return;
+        }
+
+        Object.keys(value).forEach(function (key) {
+            var child = value[key];
+            var lower = key.toLowerCase();
+            var nextPath = path ? path + '.' + lower : lower;
+
+            if (typeof child === 'number' || (typeof child === 'string' && /^\d{1,4}$/.test(child))) {
+                var number = parseInt(child, 10);
+                if (number > 0 && number < 1000) {
+                    if (/season/.test(nextPath) && /(number|sequence|seq|index|position|season$)/.test(lower)) {
+                        metadata.seasonNumber = metadata.seasonNumber || number;
+                    }
+                    if (/episode/.test(nextPath) && /(number|sequence|seq|index|position|episode$)/.test(lower)) {
+                        metadata.episodeNumber = metadata.episodeNumber || number;
+                    }
+                }
+            }
+
+            if (typeof child === 'string') {
+                var tag = seasonEpisodeTag(child);
+                if (tag && !metadata.episodeTag) metadata.episodeTag = tag;
+
+                if (!metadata.title && /(series|show|program|collection|franchise).*(title|name)|(?:title|name).*(series|show|program|collection|franchise)/.test(nextPath)) {
+                    metadata.title = child;
+                }
+            }
+
+            collectMetadataFromJson(child, metadata, nextPath, depth + 1);
+        });
+    }
+
+    function updateMediaMetadata(metadata) {
+        if (!metadata) return;
+
+        if (metadata.title) {
+            var title = cleanDisplayTitle(metadata.title);
+            if (title && !/\bS\d{1,2}E\d{1,3}\b/i.test(title)) state.mediaTitle = title;
+        }
+
+        if (metadata.seasonNumber && metadata.episodeNumber) {
+            state.seasonNumber = metadata.seasonNumber;
+            state.episodeNumber = metadata.episodeNumber;
+            state.episodeTag = formatSeasonEpisode(metadata.seasonNumber, metadata.episodeNumber);
+        }
+
+        if (metadata.episodeTag) {
+            state.episodeTag = metadata.episodeTag;
+        }
+    }
+
+    function resetMediaMetadata() {
+        state.mediaTitle = '';
+        state.seasonNumber = null;
+        state.episodeNumber = null;
+        state.episodeTag = '';
+    }
+
+    function resetSubtitleTracks() {
+        state.langs = [];
+        state.langKeys = {};
+        state.seenManifestUrls = {};
+        state.seenResourceUrls = {};
+        state.manifestMeta = {};
+        state.playbackScanStartedAt = performanceNow() - 5000;
+        state.playbackActive = false;
+        state.selectedTrackKey = '';
+        state.userSelectedTrack = false;
+        state.lastError = '';
+    }
+
+    function refreshMediaMetadataFromDom() {
+        updateMediaMetadata({
+            title: displayTitle(),
+            episodeTag: seasonEpisodeTag(playbackInfoText())
+        });
+    }
+
+    function queueManifest(url, source) {
+        if (state.seenManifestUrls[url]) return;
+        state.seenManifestUrls[url] = true;
+        state.manifestMeta[url] = {
+            source: source || '',
+            activePlayback: isPlaybackResourceContext(),
+            queuedAt: performanceNow()
+        };
+        state.status = 'Found manifest via ' + source + '. Reading tracks...';
+        updateUi();
+
+        getText(url).then(function (text) {
+            parseManifest(url, text || '');
+            updateUi();
+        }).catch(function (err) {
+            state.lastError = 'Could not read manifest: ' + err.message;
+            updateUi();
+        });
+    }
+
+    function parseManifest(url, text) {
+        if (!text) return;
+        if (text.indexOf('#EXTM3U') < 0 && text.indexOf('WEBVTT') < 0) return;
+
+        var meta = state.manifestMeta[url] || {};
+        var duration = playlistDurationSeconds(text) || subtitleTextDurationSeconds(text);
+        var lines = text.split(/\r\n|\r|\n/);
+        var subtitleMediaLines = lines.filter(function (line) {
+            return /^#EXT-X-MEDIA:/i.test(line) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(line);
+        });
+
+        subtitleMediaLines.forEach(function (line) {
+            var attrs = parseAttrList(line.replace(/^#EXT-X-MEDIA:/i, ''));
+            if (!attrs.URI) return;
+            addTrack({
+                NAME: trackLabel(attrs, attrs.URI),
+                LANGUAGE: attrs.LANGUAGE || inferLanguage(attrs.URI),
+                FORCED: attrs.FORCED || 'NO',
+                CHARACTERISTICS: attrs.CHARACTERISTICS || '',
+                TYPE: attrs.TYPE || '',
+                URI: absoluteUrl(attrs.URI, url),
+                source: 'master',
+                activePlayback: !!meta.activePlayback,
+                manifestUrl: url
+            });
+        });
+
+        if (looksLikeSubtitlePlaylist(url, text)) {
+            var segments = extractSegmentUrls(text, url);
+            addTrack({
+                NAME: inferTrackName(url),
+                LANGUAGE: inferLanguage(url),
+                FORCED: /forced/i.test(url) ? 'YES' : 'NO',
+                URI: url,
+                source: 'playlist',
+                segments: segments,
+                activePlayback: !!meta.activePlayback,
+                playlistDuration: duration || null,
+                manifestUrl: url
+            });
+        }
+
+        if (state.langs.length > 0) {
+            state.status = 'Ready. Select a subtitle track.';
+        }
+    }
+
+    function parseAttrList(value) {
+        var attrs = {};
+        var re = /([A-Z0-9-]+)=("(?:[^"\\]|\\.)*"|[^,]*)/gi;
+        var match;
+        while ((match = re.exec(value)) !== null) {
+            attrs[match[1].toUpperCase()] = match[2].replace(/^"|"$/g, '');
+        }
+        return attrs;
+    }
+
+    function trackLabel(attrs, uri) {
+        var parts = [];
+        if (attrs.NAME) parts.push(attrs.NAME);
+        if (attrs.LANGUAGE && parts.join(' ').indexOf(attrs.LANGUAGE) < 0) parts.push('[' + attrs.LANGUAGE + ']');
+        if (attrs.FORCED === 'YES') parts.push('(forced)');
+        if (attrs.CHARACTERISTICS && /sdh|transcribes-spoken-dialog/i.test(attrs.CHARACTERISTICS)) parts.push('(CC)');
+        return parts.join(' ') || inferTrackName(uri);
+    }
+
+    function inferTrackName(url) {
+        var decoded = decodeURIComponent(url);
+        var file = decoded.split(/[/?#]/).filter(Boolean).pop() || 'Subtitle';
+        var language = inferLanguage(decoded);
+        var label = language ? language : file.replace(/\.m3u8.*/i, '').replace(/[_-]+/g, ' ');
+        if (/sdh|cc|caption/i.test(decoded) && !/\bcc\b/i.test(label)) label += ' (CC)';
+        if (/forced/i.test(decoded)) label += ' (forced)';
+        return label || 'Subtitle';
+    }
+
+    function inferLanguage(url) {
+        var decoded = decodeURIComponent(url);
+        var match = decoded.match(/(?:^|[\/_-])([a-z]{2,3})(?:[_-](?:SDH|CC|FORCED|MAIN|PRIMARY))?(?:[_-]|\.m3u8|\/)/i);
+        return match ? match[1].toLowerCase() : '';
+    }
+
+    function addTrack(track, fromFrameMessage) {
+        if (!track.URI) return;
+        if (!isTopFrame() && !fromFrameMessage) {
+            forwardTrackToTop(track);
+            return;
+        }
+        var key = trackIdentity(track);
+        var existing = state.langKeys[key];
+        if (existing) {
+            mergeTrack(existing, track);
+            return;
+        }
+        track.key = key;
+        track.identity = key;
+        state.langKeys[key] = track;
+        state.langs.push(track);
+        state.langs.sort(function (a, b) {
+            return a.NAME.localeCompare(b.NAME);
+        });
+        debuglog('Track added: ' + track.NAME);
+    }
+
+    function mergeTrack(existing, incoming) {
+        if (!incoming || !incoming.URI) return;
+        var incomingScore = trackSourceScore(incoming);
+        var existingScore = trackSourceScore(existing);
+
+        if (incomingScore > existingScore) {
+            var uriChanged = existing.URI !== incoming.URI;
+            existing.URI = incoming.URI;
+            existing.source = incoming.source || existing.source;
+            existing.segments = incoming.segments || (uriChanged ? null : existing.segments);
+            existing.activePlayback = !!incoming.activePlayback;
+            existing.playlistDuration = incoming.playlistDuration || (uriChanged ? null : existing.playlistDuration);
+            existing.manifestUrl = incoming.manifestUrl || existing.manifestUrl;
+        } else if (!isShortPreviewTrack(incoming) && incoming.segments && incoming.segments.length && (!existing.segments || !existing.segments.length)) {
+            existing.segments = incoming.segments;
+        }
+
+        if (!existing.LANGUAGE && incoming.LANGUAGE) existing.LANGUAGE = incoming.LANGUAGE;
+        if (!existing.FORCED && incoming.FORCED) existing.FORCED = incoming.FORCED;
+        if (!existing.CHARACTERISTICS && incoming.CHARACTERISTICS) existing.CHARACTERISTICS = incoming.CHARACTERISTICS;
+        if (!existing.TYPE && incoming.TYPE) existing.TYPE = incoming.TYPE;
+        if (!existing.playlistDuration && incoming.playlistDuration) existing.playlistDuration = incoming.playlistDuration;
+        if (!existing.manifestUrl && incoming.manifestUrl) existing.manifestUrl = incoming.manifestUrl;
+        if (!existing.activePlayback && incoming.activePlayback && incomingScore >= existingScore) existing.activePlayback = true;
+        if (isBetterTrackName(incoming.NAME, existing.NAME)) existing.NAME = incoming.NAME;
+        debuglog('Track merged: ' + existing.NAME);
+    }
+
+    function trackSourceScore(track) {
+        var score = 0;
+        if (track.activePlayback) score += 100;
+        if (isShortPreviewTrack(track)) score -= 200;
+        if (looksLikePreviewTrack(track)) score -= 50;
+        if (Number(track.playlistDuration) >= 120) score += 80;
+        if (track.source === 'master') score += 4;
+        if (track.source === 'playlist') score += 2;
+        if (track.segments && track.segments.length) score += 3;
+        if (track.URI) score += 1;
+        return score;
+    }
+
+    function isBetterTrackName(candidate, current) {
+        if (!candidate) return false;
+        if (!current) return true;
+        if (/subtitle/i.test(current) && !/subtitle/i.test(candidate)) return true;
+        if ((current.indexOf('[') < 0) && candidate.indexOf('[') >= 0) return true;
+        return candidate.length > current.length && candidate.length < 80;
+    }
+
+    function trackIdentity(track) {
+        var language = trackLanguage(track);
+        var type = isForcedTrack(track) ? 'forced' : 'main';
+        var captions = isCcTrack(track) ? 'cc' : 'plain';
+        var label = normalizeTrackLabel(track.NAME || inferTrackName(track.URI));
+        return (language || label || track.URI.replace(/[?#].*$/, '')) + '|' + type + '|' + captions;
+    }
+
+    function findTrackByKey(key) {
+        if (!key) return null;
+        for (var i = 0; i < state.langs.length; i++) {
+            if (state.langs[i].key === key) return state.langs[i];
+        }
+        return null;
+    }
+
+    function preferredSelectionKey() {
+        var preferred = findPreferredTrack('ko') || findPreferredTrack('en') || state.langs[0];
+        return preferred ? preferred.key : '';
+    }
+
+    function findPreferredTrack(language) {
+        var candidates = state.langs.filter(function (track) {
+            return trackMatchesLanguage(track, language);
+        });
+        if (!candidates.length) return null;
+
+        var mainTracks = candidates.filter(function (track) {
+            return !isForcedTrack(track);
+        });
+        if (mainTracks.length) candidates = mainTracks;
+
+        candidates.sort(function (a, b) {
+            return trackScore(b, language) - trackScore(a, language) || a.NAME.localeCompare(b.NAME);
+        });
+        return candidates[0];
+    }
+
+    function trackMatchesLanguage(track, language) {
+        var trackCode = languagePrimary(trackLanguage(track));
+        var desiredCode = languagePrimary(language);
+        if (trackCode && desiredCode && trackCode === desiredCode) return true;
+
+        var haystack = ((track.LANGUAGE || '') + ' ' + (track.NAME || '') + ' ' + (track.URI || '')).toLowerCase();
+        if (language === 'ko') {
+            return /\b(ko|kor|kr|korean)\b/.test(haystack) || haystack.indexOf('한국') >= 0;
+        }
+        if (language === 'en') {
+            return /\b(en|eng|english)\b/.test(haystack);
+        }
+        return false;
+    }
+
+    function trackScore(track, language) {
+        var haystack = ((track.LANGUAGE || '') + ' ' + (track.NAME || '') + ' ' + (track.URI || '')).toLowerCase();
+        var score = 0;
+        score += trackSourceScore(track);
+        if (languagePrimary(trackLanguage(track)) === languagePrimary(language)) score += 100;
+        if (language === 'ko') {
+            if (haystack.indexOf('korean') >= 0 || haystack.indexOf('한국') >= 0) score += 50;
+        }
+        if (language === 'en') {
+            if (haystack.indexOf('english') >= 0) score += 50;
+        }
+        if (isCcTrack(track)) score += 8;
+        if (isForcedTrack(track)) score -= 20;
+        return score;
+    }
+
+    function trackLanguage(track) {
+        return normalizeLanguageCode(track.LANGUAGE) ||
+            languageFromTrackName(track.NAME) ||
+            normalizeLanguageCode(inferLanguage(track.URI || ''));
+    }
+
+    function languageFromTrackName(name) {
+        var text = String(name || '').toLowerCase();
+        var bracket = text.match(/\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]/i);
+        if (bracket) return normalizeLanguageCode(bracket[1]);
+        if (/\bkorean\b/.test(text) || text.indexOf('한국') >= 0) return 'ko';
+        if (/\benglish\b/.test(text)) return 'en';
+        var compact = text.match(/^([a-z]{2,3})(?:[-_\s]+|--)(?:forced|cc|sdh|subtitle|caption|\()/i);
+        return compact ? normalizeLanguageCode(compact[1]) : '';
+    }
+
+    function normalizeLanguageCode(value) {
+        var text = String(value || '').toLowerCase().trim().replace(/_/g, '-');
+        var match = text.match(/^([a-z]{2,3})(?:-([a-z0-9]+))?/i);
+        if (!match) return '';
+
+        var primary = match[1];
+        if (primary === 'kor' || primary === 'kr') return 'ko';
+        if (primary === 'eng') return 'en';
+        if (primary === 'ko' || primary === 'en') return primary;
+        return match[2] ? primary + '-' + match[2] : primary;
+    }
+
+    function languagePrimary(value) {
+        return normalizeLanguageCode(value).split('-')[0];
+    }
+
+    function isForcedTrack(track) {
+        return /^yes$/i.test(track.FORCED || '') ||
+            /(?:^|[\s._-])forced(?:$|[\s._-])/i.test(track.NAME || '') ||
+            /(?:^|[\/._-])forced(?:$|[\/._-])/i.test(track.URI || '');
+    }
+
+    function isCcTrack(track) {
+        var text = ((track.NAME || '') + ' ' + (track.CHARACTERISTICS || '') + ' ' + (track.TYPE || '') + ' ' + (track.URI || '')).toLowerCase();
+        return /\bcc\b|sdh|closed captions|caption|transcribes-spoken-dialog|describes-music-and-sound/.test(text);
+    }
+
+    function normalizeTrackLabel(name) {
+        return String(name || '')
+            .toLowerCase()
+            .replace(/\[[^\]]+\]/g, '')
+            .replace(/\((?:cc|forced|sdh)\)/g, '')
+            .replace(/\b(?:cc|forced|sdh|closed captions)\b/g, '')
+            .replace(/[_-]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function looksLikeSubtitlePlaylist(url, text) {
+        return /\.(?:vtt|webvtt)(?:[?#\s]|$)/i.test(text) ||
+            /WEBVTT|SUBTITLE|caption|timedtext/i.test(text) ||
+            /subtitle|webvtt|_sdh_|_cc_|forced/i.test(url);
+    }
+
+    function isShortPreviewTrack(track) {
+        var duration = Number(track && track.playlistDuration);
+        return duration > 0 && duration < 90;
+    }
+
+    function looksLikePreviewTrack(track) {
+        var text = ((track && track.NAME) || '') + ' ' + ((track && track.URI) || '') + ' ' + ((track && track.manifestUrl) || '');
+        return isShortPreviewTrack(track) || /preview|trailer|background-video|autoplay|superhero|teaser|clip/i.test(text);
+    }
+
+    function playlistDurationSeconds(text) {
+        var total = 0;
+        var found = false;
+        String(text || '').split(/\r\n|\r|\n/).forEach(function (line) {
+            var match = line.match(/^#EXTINF:([\d.]+)/i);
+            if (!match) return;
+            var value = parseFloat(match[1]);
+            if (isFinite(value) && value > 0) {
+                total += value;
+                found = true;
+            }
+        });
+        return found ? total : 0;
+    }
+
+    function subtitleTextDurationSeconds(text) {
+        var max = 0;
+        String(text || '').replace(/(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})/g, function (_, start, end) {
+            var seconds = vttTimestampSeconds(end);
+            if (seconds > max) max = seconds;
+            return _;
+        });
+        return max;
+    }
+
+    function vttTimestampSeconds(value) {
+        var parts = String(value || '').split(':');
+        if (parts.length !== 3) return 0;
+        var hours = parseInt(parts[0], 10) || 0;
+        var minutes = parseInt(parts[1], 10) || 0;
+        var seconds = parseFloat(parts[2]) || 0;
+        return hours * 3600 + minutes * 60 + seconds;
+    }
+
+    function extractSegmentUrls(text, baseUrl) {
+        var urls = [];
+        text.split(/\r\n|\r|\n/).forEach(function (line) {
+            line = line.trim();
+            if (!line || line.charAt(0) === '#') return;
+            if (/\.(?:vtt|webvtt)(?:[?#]|$)/i.test(line) || /WEBVTT/i.test(line)) {
+                urls.push(absoluteUrl(line, baseUrl));
+            }
+        });
+        return urls;
+    }
+
+    function downloadAllTracks() {
+        if (state.wait || state.langs.length === 0) return;
+        state.downloadall = true;
+        state.zip = new JSZip();
+        state.wait = true;
+        state.lastError = '';
+        updateUi();
+
+        runSequential(state.langs, function (track) {
+            state.status = 'Downloading ' + track.NAME + '...';
+            updateUi();
+            return buildSubtitleFile(track).then(function (file) {
+                state.zip.file(file.name, file.content);
+            });
+        }).then(function () {
+            return state.zip.generateAsync({ type: 'blob' });
+        }).then(function (blob) {
+            saveAs(blob, safeBaseFilename() + '.subtitles.zip');
+            state.status = 'Downloaded all subtitles.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            state.downloadall = false;
+            updateUi();
+        });
+    }
+
+    function downloadTrack(track) {
+        if (state.wait) return;
+        var tracks = tracksWithForcedCompanion(track);
+        state.wait = true;
+        state.lastError = '';
+        state.selectedTrackKey = track.key;
+        state.status = 'Downloading ' + downloadTrackNames(tracks) + '...';
+        updateUi();
+
+        downloadTrackFiles(tracks, safeBaseFilename() + '.' + safeTrackName(track) + '.with-forced.zip').then(function () {
+            state.status = 'Downloaded ' + downloadTrackNames(tracks) + '.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            updateUi();
+        });
+    }
+
+    function downloadPreferredTrack(language) {
+        var track = findPreferredTrack(language);
+        if (!track) {
+            state.lastError = (language === 'ko' ? 'Korean' : 'English') + ' subtitle was not detected yet.';
+            updateUi();
+            return;
+        }
+        state.selectedTrackKey = track.key;
+        state.userSelectedTrack = true;
+        downloadTrack(track);
+    }
+
+    function downloadEnglishAndKorean() {
+        if (state.wait) return;
+
+        var english = findPreferredTrack('en');
+        var korean = findPreferredTrack('ko');
+        if (!english || !korean) {
+            state.lastError = 'English and Korean subtitles must both be detected before downloading together.';
+            updateUi();
+            return;
+        }
+
+        var tracks = uniqueTracks(tracksWithForcedCompanion(english).concat(tracksWithForcedCompanion(korean)));
+        var zip = new JSZip();
+
+        state.wait = true;
+        state.lastError = '';
+        state.status = 'Downloading English + Korean subtitles' + forcedSummary(tracks) + '...';
+        updateUi();
+
+        Promise.all(tracks.map(function (track) {
+            return buildSubtitleFile(track).then(function (file) {
+                zip.file(file.name, file.content);
+            });
+        })).then(function () {
+            return zip.generateAsync({ type: 'blob' });
+        }).then(function (blob) {
+            saveAs(blob, safeBaseFilename() + '.en-ko.subtitles.zip');
+            state.status = 'Downloaded English + Korean subtitles' + forcedSummary(tracks) + '.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            updateUi();
+        });
+    }
+
+    function downloadTrackFiles(tracks, zipName) {
+        tracks = uniqueTracks(tracks);
+        if (tracks.length === 1) {
+            return buildSubtitleFile(tracks[0]).then(function (file) {
+                saveAs(new Blob([file.content], { type: 'text/vtt;charset=utf-8' }), file.name);
+            });
+        }
+
+        var zip = new JSZip();
+        return Promise.all(tracks.map(function (track) {
+            return buildSubtitleFile(track).then(function (file) {
+                zip.file(file.name, file.content);
+            });
+        })).then(function () {
+            return zip.generateAsync({ type: 'blob' });
+        }).then(function (blob) {
+            saveAs(blob, zipName);
+        });
+    }
+
+    function tracksWithForcedCompanion(track) {
+        var tracks = [track];
+        if (shouldIncludeForcedCompanion(track)) {
+            var forced = findForcedTrackFor(track);
+            if (forced) tracks.push(forced);
+        }
+        return uniqueTracks(tracks);
+    }
+
+    function shouldIncludeForcedCompanion(track) {
+        if (!track || isForcedTrack(track)) return false;
+        var language = languagePrimary(trackLanguage(track));
+        return language === 'en' || language === 'ko';
+    }
+
+    function findForcedTrackFor(track) {
+        var language = languagePrimary(trackLanguage(track));
+        if (!language) return null;
+
+        var candidates = state.langs.filter(function (candidate) {
+            return candidate.key !== track.key &&
+                isForcedTrack(candidate) &&
+                languagePrimary(trackLanguage(candidate)) === language;
+        });
+        if (!candidates.length) return null;
+
+        candidates.sort(function (a, b) {
+            return trackScore(b, language) - trackScore(a, language) || a.NAME.localeCompare(b.NAME);
+        });
+        return candidates[0];
+    }
+
+    function uniqueTracks(tracks) {
+        var seen = {};
+        var output = [];
+        tracks.forEach(function (track) {
+            if (!track) return;
+            var key = track.key || trackIdentity(track);
+            if (seen[key]) return;
+            seen[key] = true;
+            output.push(track);
+        });
+        return output;
+    }
+
+    function downloadTrackNames(tracks) {
+        return uniqueTracks(tracks).map(function (track) {
+            return track.NAME;
+        }).join(' + ');
+    }
+
+    function forcedSummary(tracks) {
+        return uniqueTracks(tracks).some(function (track) {
+            return isForcedTrack(track);
+        }) ? ' + forced' : '';
+    }
+
+    function buildSubtitleFile(track) {
+        return getTrackVtt(track).then(function (vtt) {
+            var output = normalizeVttForDownload(vtt);
+            if (!output.trim()) throw new Error('No subtitle cues found.');
+            return {
+                name: safeBaseFilename() + '.' + safeTrackName(track) + '.vtt',
+                content: output
+            };
+        });
+    }
+
+    function getTrackVtt(track) {
+        return getText(track.URI).then(function (playlist) {
+            if (/^\s*WEBVTT/i.test(playlist)) return playlist;
+
+            var duration = playlistDurationSeconds(playlist) || subtitleTextDurationSeconds(playlist);
+            if (duration && !track.playlistDuration) track.playlistDuration = duration;
+            var segments = track.segments && track.segments.length ? track.segments : extractSegmentUrls(playlist, track.URI);
+            if (!segments.length) throw new Error('No VTT segments found for ' + track.NAME + '.');
+
+            var merged = 'WEBVTT\n\n';
+            var successCount = 0;
+            return runSequential(segments, function (segmentUrl) {
+                return getText(segmentUrl).then(function (segmentText) {
+                    var cleaned = cleanVttSegment(segmentText);
+                    if (cleaned.trim()) {
+                        merged += cleaned.trim() + '\n\n';
+                        successCount++;
+                    }
+                }).catch(function (err) {
+                    debuglog('Segment failed: ' + err.message);
+                });
+            }).then(function () {
+                if (successCount === 0) throw new Error('Failed to download subtitle segments.');
+                return merged;
+            });
+        });
+    }
+
+    function cleanVttSegment(text) {
+        return text
+            .replace(/^\uFEFF/, '')
+            .replace(/^WEBVTT[^\n]*(?:\n|$)/i, '')
+            .replace(/^X-TIMESTAMP-MAP:[^\n]*(?:\n|$)/gmi, '')
+            .replace(/\n{3,}/g, '\n\n');
+    }
+
+    function normalizeVttForDownload(vtt) {
+        var text = String(vtt || '')
+            .replace(/^\uFEFF/, '')
+            .replace(/\r\n|\r|\n/g, '\n')
+            .trim();
+
+        if (!text) return '';
+        if (!/^\s*WEBVTT\b/i.test(text)) {
+            text = 'WEBVTT\n\n' + cleanVttSegment(text).trim();
+        }
+
+        return text.replace(/\n/g, '\r\n') + '\r\n';
+    }
+
+    function vttToSrt(vtt) {
+        var blocks = cleanVttSegment(vtt).replace(/\r/g, '').split(/\n{2,}/);
+        var output = [];
+        var index = 1;
+
+        blocks.forEach(function (block) {
+            var lines = block.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
+            if (!lines.length) return;
+            if (/^(NOTE|STYLE|REGION)\b/i.test(lines[0])) return;
+
+            var timingIndex = -1;
+            for (var i = 0; i < lines.length; i++) {
+                if (lines[i].indexOf('-->') >= 0) {
+                    timingIndex = i;
+                    break;
+                }
+            }
+            if (timingIndex < 0) return;
+
+            var timing = normalizeTiming(lines[timingIndex]);
+            var text = lines.slice(timingIndex + 1).map(stripVttTags).join('\n').trim();
+            if (!timing || !text) return;
+
+            output.push(String(index++));
+            output.push(timing);
+            output.push(text);
+            output.push('');
+        });
+
+        return output.join('\r\n');
+    }
+
+    function normalizeTiming(line) {
+        var parts = line.split(/\s+-->\s+/);
+        if (parts.length < 2) return '';
+        var start = normalizeTimestamp(parts[0]);
+        var end = normalizeTimestamp(parts[1].split(/\s+/)[0]);
+        return start && end ? start + ' --> ' + end : '';
+    }
+
+    function normalizeTimestamp(value) {
+        value = value.trim();
+        var short = value.match(/^(\d{2}):(\d{2})\.(\d{3})$/);
+        if (short) return '00:' + short[1] + ':' + short[2] + ',' + short[3];
+        var long = value.match(/^(\d{2}):(\d{2}):(\d{2})\.(\d{3})$/);
+        if (long) return long[1] + ':' + long[2] + ':' + long[3] + ',' + long[4];
+        return value.replace('.', ',');
+    }
+
+    function stripVttTags(line) {
+        return line
+            .replace(/<\/?c(?:\.[^>]*)?>/g, '')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+    }
+
+    function getText(url, retryCount) {
+        retryCount = retryCount || 0;
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload: function (response) {
+                    if (response.status >= 200 && response.status < 300) {
+                        resolve(response.responseText || '');
+                    } else if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getText(url, retryCount + 1).then(resolve, reject);
+                        }, 150);
+                    } else {
+                        reject(new Error('HTTP ' + response.status + ' for ' + shortUrl(url)));
+                    }
+                },
+                onerror: function () {
+                    if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getText(url, retryCount + 1).then(resolve, reject);
+                        }, 150);
+                    } else {
+                        reject(new Error('Network error for ' + shortUrl(url)));
+                    }
+                },
+                ontimeout: function () {
+                    reject(new Error('Timeout for ' + shortUrl(url)));
+                }
+            });
+        });
+    }
+
+    function runSequential(items, worker) {
+        return items.reduce(function (promise, item) {
+            return promise.then(function () { return worker(item); });
+        }, Promise.resolve());
+    }
+
+    function performanceNow() {
+        try {
+            var perf = targetWindow.performance || window.performance;
+            if (perf && typeof perf.now === 'function') return perf.now();
+        } catch (err) {}
+        return 0;
+    }
+
+    function normalizeUrl(rawUrl) {
+        if (!rawUrl) return '';
+        var value = String(rawUrl);
+        if (value.indexOf('http') !== 0) return '';
+        return value;
+    }
+
+    function absoluteUrl(url, baseUrl) {
+        try { return new URL(url, baseUrl).href; } catch (err) { return url; }
+    }
+
+    function safeBaseFilename() {
+        refreshMediaMetadataFromDom();
+        var title = state.mediaTitle || displayTitle();
+        var episodeTag = state.episodeTag || seasonEpisodeTag(playbackInfoText());
+        if (episodeTag && title.toUpperCase().indexOf(episodeTag) < 0) {
+            title += '.' + episodeTag;
+        }
+        return sanitizeFilename(title);
+    }
+
+    function displayTitle() {
+        var title = document.title || metaContent('og:title') || metaContent('twitter:title') || 'AppleTVPlus';
+        return cleanDisplayTitle(title);
+    }
+
+    function cleanDisplayTitle(title) {
+        return String(title || 'AppleTVPlus')
+            .replace(/^\u200e+/, '')
+            .replace(/\s*보기\s*-\s*Apple.*$/i, '')
+            .replace(/\s*-\s*Apple.*$/i, '')
+            .replace(/\s*\|\s*Apple.*$/i, '')
+            .replace(/\bS\d{1,2}E\d{1,3}\b/ig, '')
+            .replace(/\s+/g, ' ')
+            .trim() || 'AppleTVPlus';
+    }
+
+    function seasonEpisodeTag(text) {
+        text = text || playbackInfoText();
+        var match;
+        var patterns = [
+            /\bS(?:eason)?\s*(\d{1,2})\s*[:._ -]*E(?:p(?:isode)?)?\s*(\d{1,3})\b/i,
+            /\bSeason\s*(\d{1,2}).{0,24}\bEpisode\s*(\d{1,3})\b/i,
+            /\bSeason\s*(\d{1,2}).{0,24}\bEp\.?\s*(\d{1,3})\b/i,
+            /\uC2DC\uC98C\s*(\d{1,2})\s*[:._ -]*(\d{1,3})\s*(?:\uD68C|\uD654|\uC5D0\uD53C\uC18C\uB4DC)/i,
+            /(\d{1,2})\s*\uC2DC\uC98C.{0,24}(\d{1,3})\s*(?:\uD68C|\uD654|\uC5D0\uD53C\uC18C\uB4DC)/i
+        ];
+
+        for (var i = 0; i < patterns.length; i++) {
+            match = text.match(patterns[i]);
+            if (match) return formatSeasonEpisode(match[1], match[2]);
+        }
+
+        return '';
+    }
+
+    function playbackInfoText() {
+        var parts = [
+            document.title || '',
+            metaContent('og:title'),
+            metaContent('twitter:title'),
+            metaContent('description'),
+            document.body ? document.body.innerText : ''
+        ];
+
+        try {
+            Array.prototype.slice.call(document.querySelectorAll('[aria-label],[title]'), 0, 200).forEach(function (node) {
+                parts.push(node.getAttribute('aria-label') || '');
+                parts.push(node.getAttribute('title') || '');
+            });
+        } catch (err) {}
+
+        return parts.filter(Boolean).join('\n');
+    }
+
+    function metaContent(name) {
+        var node = document.querySelector('meta[property="' + name + '"],meta[name="' + name + '"]');
+        return node ? node.getAttribute('content') || '' : '';
+    }
+
+    function formatSeasonEpisode(season, episode) {
+        return 'S' + padNumber(season, 2) + 'E' + padNumber(episode, 2);
+    }
+
+    function padNumber(value, size) {
+        var text = String(parseInt(value, 10) || 0);
+        while (text.length < size) text = '0' + text;
+        return text;
+    }
+
+    function safeTrackName(track) {
+        var name = trackLanguage(track) || track.LANGUAGE || track.NAME || 'subtitle';
+        if (isCcTrack(track) && !/\bcc\b/i.test(name)) name += '_cc';
+        if (isForcedTrack(track) && !/forced/i.test(name)) name += '_forced';
+        return sanitizeFilename(String(name).replace(/\s+/g, '_'));
+    }
+
+    function sanitizeFilename(value) {
+        return String(value || 'subtitle')
+            .replace(/[\\/:*?"<>|]+/g, '_')
+            .replace(/\s+/g, ' ')
+            .replace(/_+/g, '_')
+            .trim()
+            .slice(0, 120) || 'subtitle';
+    }
+
+    function shortUrl(url) {
+        return String(url).slice(0, 96);
+    }
+
+    function debuglog(message) {
+        if (debug) console.log(LOG_PREFIX + ' ' + message);
+    }
+})();

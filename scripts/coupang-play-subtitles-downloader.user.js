@@ -1,0 +1,2051 @@
+// ==UserScript==
+// @name       Coupang Play Subtitles Downloader
+// @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
+// @description Download subtitles from Coupang Play
+// @version    1.0.0
+// @author     Wonmin Jung
+// @license    MIT
+// @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
+// @downloadURL https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/coupang-play-subtitles-downloader.user.js
+// @updateURL  https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/coupang-play-subtitles-downloader.user.js
+// @match      https://www.coupangplay.com/*
+// @match      https://coupangplay.com/*
+// @match      https://*.coupangplay.com/*
+// @grant      GM_xmlhttpRequest
+// @grant      unsafeWindow
+// @connect    *
+// @require    https://cdn.jsdelivr.net/npm/jszip@3.5.0/dist/jszip.min.js
+// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js
+// @run-at     document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    var debug = location.hash === '#debug' || location.hash.indexOf('cpsd_debug') >= 0;
+    var MAX_RETRIES = 5;
+    var LOG_PREFIX = '[Coupang Play Subtitles DL]';
+    var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    var MESSAGE_TYPE_TRACK = 'cpsd-subtitle-track';
+
+    var state = {
+        initialized: false,
+        installedHooks: false,
+        observer: null,
+        oldlocation: null,
+        tracks: [],
+        trackKeys: {},
+        seenResourceUrls: {},
+        seenManifestUrls: {},
+        selectedTrackKey: '',
+        userSelectedTrack: false,
+        mediaTitle: '',
+        mediaTitlePriority: 0,
+        episodeTag: '',
+        episodeTitle: '',
+        seasonNumber: null,
+        episodeNumber: null,
+        episodeConfirmed: false,
+        metadataRequestKey: '',
+        metadataResolvedKey: '',
+        metadataFailedKey: '',
+        metadataPromise: null,
+        playbackActive: false,
+        lastMetadataScanAt: 0,
+        lastPerformanceScanAt: 0,
+        performanceEntryCount: 0,
+        wait: false,
+        status: 'Start playback, then wait for tracks...',
+        lastError: '',
+        zip: null
+    };
+
+    init();
+
+    function init() {
+        if (state.initialized) return;
+        state.initialized = true;
+
+        installNetworkHooks();
+        startPerformanceObserver();
+        if (isTopFrame()) {
+            installStyles();
+            installFrameBridge();
+            scheduleUi();
+            setInterval(tick, 1000);
+            tick();
+        } else if (!state.observer) {
+            setInterval(function () {
+                if (isPlaybackContext()) scanPerformanceEntries();
+            }, 5000);
+        }
+        debuglog('Script loaded');
+    }
+
+    function tick() {
+        var pageKey = isCoupangPlayPage() ? location.href.split('#')[0] : '';
+        var playbackPage = isPlaybackPage();
+        if (state.oldlocation !== pageKey) {
+            state.oldlocation = pageKey;
+            if (playbackPage) {
+                state.playbackActive = true;
+                resetTracks();
+                refreshMediaMetadataFromDom();
+                scanPerformanceEntries();
+                state.lastMetadataScanAt = Date.now();
+                state.lastPerformanceScanAt = Date.now();
+                updateUi();
+            } else {
+                if (state.playbackActive) resetTracks();
+                state.playbackActive = false;
+                hideWidget();
+            }
+        }
+
+        if (!playbackPage) {
+            hideWidget();
+            return;
+        }
+
+        var now = Date.now();
+        ensureStyles();
+        if (now - state.lastPerformanceScanAt >= 5000) {
+            scanPerformanceEntries();
+            state.lastPerformanceScanAt = now;
+        }
+        if (now - state.lastMetadataScanAt >= 3000) {
+            refreshMediaMetadataFromDom();
+            state.lastMetadataScanAt = now;
+        }
+        if (hasPlaybackSurface()) {
+            ensureWidget();
+        } else {
+            hideWidget();
+        }
+    }
+
+    function isCoupangPlayPage() {
+        return isCoupangHost(location.hostname);
+    }
+
+    function isPlaybackPage() {
+        return isCoupangPlayPage() && isPlaybackPath(location.pathname);
+    }
+
+    function isPlaybackPath(pathname) {
+        return /^\/play(?:\/|$)/i.test(pathname || '');
+    }
+
+    function isPlaybackContext() {
+        if (isPlaybackPage()) return true;
+        try {
+            return window.top !== window &&
+                isCoupangHost(window.top.location.hostname) &&
+                isPlaybackPath(window.top.location.pathname);
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function isPlaybackResourceUrl(rawUrl) {
+        var url = normalizeUrl(rawUrl);
+        return /(?:\/play\/|playback|manifest|\.m3u8(?:[?#]|$)|\.mpd(?:[?#]|$)|\.vtt(?:[?#]|$)|\.webvtt(?:[?#]|$)|\.ttml(?:[?#]|$)|\.dfxp(?:[?#]|$)|\.srt(?:[?#]|$)|subtitle|caption|timedtext|texttrack)/i.test(url || '');
+    }
+
+    function shouldObserveNetworkRequest(rawUrl) {
+        return isPlaybackContext() || isPlaybackResourceUrl(rawUrl);
+    }
+
+    function isCoupangHost(hostname) {
+        return hostname === 'www.coupangplay.com' ||
+            hostname === 'coupangplay.com' ||
+            /\.coupangplay\.com$/i.test(hostname || '');
+    }
+
+    function isTopFrame() {
+        try { return window.top === window; } catch (err) { return false; }
+    }
+
+    function hasPlaybackSurface() {
+        if (!isTopFrame()) return false;
+        if (hasPlayableVideo()) return true;
+        return hasVisibleElement('#playerWrapper, [id*="player" i], [class*="playerWrapper"], [class*="Player_playerMain"], .video-js');
+    }
+
+    function hasPlayableVideo() {
+        var videos = collectVideosDeep(document);
+        for (var i = 0; i < videos.length; i++) {
+            var video = videos[i];
+            var rect = video.getBoundingClientRect();
+            if (!rect || rect.width < 240 || rect.height < 160) continue;
+            if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) continue;
+            var style = window.getComputedStyle(video);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+            if (video.currentSrc || video.src || video.readyState > 0 || Number(video.duration) > 0) return true;
+        }
+        return false;
+    }
+
+    function hasVisibleElement(selector) {
+        var nodes = document.querySelectorAll(selector);
+        for (var i = 0; i < nodes.length; i++) {
+            if (isVisibleRect(nodes[i])) return true;
+        }
+        return false;
+    }
+
+    function isVisibleRect(element) {
+        var rect = element.getBoundingClientRect();
+        if (rect.width < 240 || rect.height < 160) return false;
+        if (rect.bottom <= 0 || rect.right <= 0) return false;
+        if (rect.top >= window.innerHeight || rect.left >= window.innerWidth) return false;
+        var style = window.getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    }
+
+    function collectVideosDeep(root) {
+        var videos = [];
+        collectVideosFromRoot(root, videos, 0);
+        return videos;
+    }
+
+    function collectVideosFromRoot(root, videos, depth) {
+        if (!root || depth > 8) return;
+        try {
+            if (root.querySelectorAll) {
+                Array.prototype.forEach.call(root.querySelectorAll('video'), function (video) {
+                    videos.push(video);
+                });
+                Array.prototype.forEach.call(root.querySelectorAll('*'), function (element) {
+                    if (element.shadowRoot) {
+                        collectVideosFromRoot(element.shadowRoot, videos, depth + 1);
+                    }
+                });
+            }
+        } catch (err) {
+            debuglog('Could not inspect video root: ' + err.message);
+        }
+    }
+
+    function installFrameBridge() {
+        window.addEventListener('message', function (event) {
+            var data = event.data;
+            if (!data || data.type !== MESSAGE_TYPE_TRACK || !data.track) return;
+            if (!isTrustedCoupangOrigin(event.origin)) return;
+            addTrack(data.track, true);
+            state.status = 'Ready. Select a subtitle track.';
+            updateUi();
+        });
+    }
+
+    function isTrustedCoupangOrigin(origin) {
+        try {
+            var host = new URL(origin).hostname;
+            return isCoupangHost(host) || /\.coupangplay\.com$/i.test(host);
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function forwardTrackToTop(track) {
+        try {
+            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, track: cloneTrackForMessage(track) }, '*');
+        } catch (err) {
+            debuglog('Could not forward track to top frame: ' + err.message);
+        }
+    }
+
+    function cloneTrackForMessage(track) {
+        return {
+            NAME: track.NAME || '',
+            LANGUAGE: track.LANGUAGE || '',
+            FORCED: track.FORCED || 'NO',
+            CHARACTERISTICS: track.CHARACTERISTICS || '',
+            TYPE: track.TYPE || '',
+            URI: track.URI || '',
+            source: track.source || '',
+            segments: track.segments || null,
+            playlistDuration: track.playlistDuration || null,
+            contentType: track.contentType || ''
+        };
+    }
+
+    function scheduleUi() {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', ensureWidget, false);
+        } else {
+            ensureWidget();
+        }
+    }
+
+    function installStyles() {
+        Array.prototype.forEach.call(document.querySelectorAll('style#cpsd-styles'), function (existing) {
+            existing.parentNode.removeChild(existing);
+        });
+
+        var style = document.createElement('style');
+        style.id = 'cpsd-styles';
+        style.textContent = [
+            '#cpsd-root{position:fixed;display:block;width:300px;top:0;left:calc(50% - 150px);z-index:2147483647;font-family:Arial,sans-serif;color:#fff;font-size:10px;pointer-events:auto}',
+            '#cpsd-root *{box-sizing:border-box}',
+            '#cpsd-menu{list-style:none;position:relative;width:300px;background:#333;color:#fff;padding:0;margin:auto;font-size:12px;z-index:2147483647}',
+            '#cpsd-menu li{padding:10px;min-height:34px;line-height:14px;white-space:normal}',
+            '#cpsd-menu li.cpsd-header{font-weight:bold;cursor:default}',
+            '#cpsd-menu li:not(.cpsd-header){display:none;cursor:pointer}',
+            '#cpsd-root:hover #cpsd-menu li,#cpsd-root:focus-within #cpsd-menu li{display:block}',
+            '#cpsd-menu li:not(.cpsd-header):hover{background:#666}',
+            '#cpsd-menu li.cpsd-info{cursor:default}',
+            '#cpsd-menu li.cpsd-info:hover{background:transparent}',
+            '#cpsd-menu li.cpsd-disabled{opacity:.45;cursor:not-allowed}',
+            '#cpsd-menu li.cpsd-disabled:hover{background:transparent}',
+            '#cpsd-track{width:100%;margin-top:6px;border:1px solid #555;background:#222;color:#fff;padding:4px;font-size:12px}',
+            '#cpsd-status{color:#ddd;word-break:break-word}',
+            '#cpsd-count,#cpsd-selected-name,#cpsd-format{font-weight:normal}'
+        ].join('\n');
+
+        appendWhenPossible(style);
+    }
+
+    function ensureStyles() {
+        if (document.getElementById('cpsd-styles')) return;
+        installStyles();
+    }
+
+    function appendWhenPossible(node) {
+        var parent = document.head || document.documentElement;
+        if (parent) {
+            parent.appendChild(node);
+            return;
+        }
+        setTimeout(function () { appendWhenPossible(node); }, 25);
+    }
+
+    function ensureWidget() {
+        if (!isPlaybackPage()) {
+            hideWidget();
+            return;
+        }
+        if (!document.body) {
+            setTimeout(ensureWidget, 100);
+            return;
+        }
+        ensureStyles();
+        if (!hasPlaybackSurface()) {
+            hideWidget();
+            return;
+        }
+
+        var root = document.getElementById('cpsd-root');
+        if (root) {
+            root.style.display = '';
+            updateUi();
+            return;
+        }
+
+        root = document.createElement('div');
+        root.id = 'cpsd-root';
+        var menu = document.createElement('ol');
+        menu.id = 'cpsd-menu';
+        root.appendChild(menu);
+
+        menu.appendChild(createMenuItem('', 'Coupang Play subtitle downloader', 'cpsd-header'));
+        menu.appendChild(createMenuItem('cpsd-download', 'Download selected subtitle'));
+        menu.appendChild(createMenuItem('cpsd-download-en', 'Download English subtitle'));
+        menu.appendChild(createMenuItem('cpsd-download-ko', 'Download Korean subtitle'));
+        menu.appendChild(createMenuItem('cpsd-download-en-ko', 'Download English + Korean subtitles'));
+        menu.appendChild(createMenuItem('cpsd-download-all', 'Download all detected subtitles'));
+
+        var selectedItem = createMenuItem('', 'Selected track: ', 'cpsd-info');
+        var selectedName = document.createElement('span');
+        selectedName.id = 'cpsd-selected-name';
+        selectedName.textContent = 'none';
+        var trackSelect = document.createElement('select');
+        trackSelect.id = 'cpsd-track';
+        selectedItem.appendChild(selectedName);
+        selectedItem.appendChild(trackSelect);
+        menu.appendChild(selectedItem);
+
+        var countItem = createMenuItem('', 'Detected subtitles: ', 'cpsd-info');
+        var countValue = document.createElement('span');
+        countValue.id = 'cpsd-count';
+        countValue.textContent = '0 tracks';
+        countItem.appendChild(countValue);
+        menu.appendChild(countItem);
+
+        var formatItem = createMenuItem('', 'Subtitle format: ', 'cpsd-info');
+        var formatValue = document.createElement('span');
+        formatValue.id = 'cpsd-format';
+        formatValue.textContent = 'WebVTT';
+        formatItem.appendChild(formatValue);
+        menu.appendChild(formatItem);
+
+        menu.appendChild(createMenuItem('cpsd-rescan', 'Rescan playback resources'));
+
+        var statusItem = createMenuItem('', 'Status: ', 'cpsd-info');
+        var statusValue = document.createElement('span');
+        statusValue.id = 'cpsd-status';
+        statusValue.textContent = state.status;
+        statusItem.appendChild(statusValue);
+        menu.appendChild(statusItem);
+
+        document.body.appendChild(root);
+
+        bindMenuAction('cpsd-rescan', function () {
+            state.status = 'Rescanning playback resources...';
+            scanPerformanceEntries(true);
+            updateUi();
+        });
+        document.getElementById('cpsd-track').addEventListener('change', function () {
+            state.selectedTrackKey = this.value;
+            state.userSelectedTrack = true;
+            updateUi();
+        });
+        bindMenuAction('cpsd-download', function () {
+            if (state.wait || state.tracks.length === 0) return;
+            var select = document.getElementById('cpsd-track');
+            state.selectedTrackKey = select.value;
+            state.userSelectedTrack = true;
+            var track = findTrackByKey(select.value);
+            if (track) downloadTrack(track);
+        });
+        bindMenuAction('cpsd-download-all', downloadAllTracks);
+        bindMenuAction('cpsd-download-en', function () {
+            downloadPreferredTrack('en');
+        });
+        bindMenuAction('cpsd-download-ko', function () {
+            downloadPreferredTrack('ko');
+        });
+        bindMenuAction('cpsd-download-en-ko', downloadEnglishAndKorean);
+
+        updateUi();
+    }
+
+    function hideWidget() {
+        var root = document.getElementById('cpsd-root');
+        if (root) root.style.display = 'none';
+    }
+
+    function createMenuItem(id, text, className) {
+        var item = document.createElement('li');
+        if (id) {
+            item.id = id;
+            item.setAttribute('role', 'button');
+            item.setAttribute('tabindex', '0');
+        }
+        if (className) item.className = className;
+        item.appendChild(document.createTextNode(text));
+        return item;
+    }
+
+    function bindMenuAction(id, handler) {
+        var node = document.getElementById(id);
+        if (!node) return;
+        node.addEventListener('click', function () {
+            if (node.classList.contains('cpsd-disabled')) return;
+            handler();
+        });
+        node.addEventListener('keydown', function (event) {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            if (node.classList.contains('cpsd-disabled')) return;
+            handler();
+        });
+    }
+
+    function updateUi() {
+        var root = document.getElementById('cpsd-root');
+        if (!root) return;
+        if (!hasPlaybackSurface()) {
+            hideWidget();
+            return;
+        }
+
+        var select = document.getElementById('cpsd-track');
+        var count = document.getElementById('cpsd-count');
+        var status = document.getElementById('cpsd-status');
+        var download = document.getElementById('cpsd-download');
+        var downloadAll = document.getElementById('cpsd-download-all');
+        var downloadEn = document.getElementById('cpsd-download-en');
+        var downloadKo = document.getElementById('cpsd-download-ko');
+        var downloadEnKo = document.getElementById('cpsd-download-en-ko');
+        var selectedName = document.getElementById('cpsd-selected-name');
+        var preferredEn = findPreferredTrack('en');
+        var preferredKo = findPreferredTrack('ko');
+        var desiredKey = state.userSelectedTrack ? state.selectedTrackKey : preferredSelectionKey();
+
+        select.innerHTML = '';
+        state.tracks.forEach(function (track) {
+            var option = document.createElement('option');
+            option.value = track.key;
+            option.textContent = track.NAME;
+            select.appendChild(option);
+        });
+
+        if (state.tracks.length === 0) {
+            var empty = document.createElement('option');
+            empty.textContent = 'No subtitles detected yet';
+            empty.value = '';
+            select.appendChild(empty);
+        }
+
+        if (!findTrackByKey(desiredKey)) desiredKey = preferredSelectionKey();
+        if (desiredKey) {
+            select.value = desiredKey;
+            state.selectedTrackKey = desiredKey;
+        }
+
+        count.textContent = state.tracks.length + (state.tracks.length === 1 ? ' track' : ' tracks');
+        selectedName.textContent = findTrackByKey(select.value) ? findTrackByKey(select.value).NAME : 'none';
+        status.textContent = state.lastError || state.status;
+        setMenuItemDisabled(download, state.wait || state.tracks.length === 0);
+        setMenuItemDisabled(downloadAll, state.wait || state.tracks.length === 0);
+        setMenuItemDisabled(downloadEn, state.wait || !preferredEn);
+        setMenuItemDisabled(downloadKo, state.wait || !preferredKo);
+        setMenuItemDisabled(downloadEnKo, state.wait || !preferredEn || !preferredKo);
+        downloadEn.title = preferredEn ? preferredEn.NAME : 'No English subtitle detected yet';
+        downloadKo.title = preferredKo ? preferredKo.NAME : 'No Korean subtitle detected yet';
+        downloadEnKo.title = preferredEn && preferredKo ? preferredEn.NAME + ' + ' + preferredKo.NAME : 'English and Korean subtitles are both required';
+    }
+
+    function setMenuItemDisabled(node, disabled) {
+        if (!node) return;
+        node.classList.toggle('cpsd-disabled', !!disabled);
+        node.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+
+    function installNetworkHooks() {
+        if (state.installedHooks) return;
+        state.installedHooks = true;
+
+        hookXhr(targetWindow);
+        hookFetch(targetWindow);
+        if (targetWindow !== window) {
+            hookXhr(window);
+            hookFetch(window);
+        }
+    }
+
+    function hookXhr(win) {
+        try {
+            if (!win.XMLHttpRequest || !win.XMLHttpRequest.prototype) return;
+            var proto = win.XMLHttpRequest.prototype;
+            if (proto.open && proto.open.__cpsdPatched) return;
+            var originalOpen = proto.open;
+            var originalSend = proto.send;
+            proto.open = function () {
+                if (arguments.length >= 2) {
+                    this.__cpsdUrl = normalizeUrl(arguments[1]);
+                    this.__cpsdObserve = shouldObserveNetworkRequest(arguments[1]);
+                    if (this.__cpsdObserve) recordResourceUrl(arguments[1], 'xhr');
+                }
+                return originalOpen.apply(this, arguments);
+            };
+            proto.send = function () {
+                var xhr = this;
+                if (xhr.__cpsdObserve && !xhr.__cpsdMetaHooked) {
+                    xhr.__cpsdMetaHooked = true;
+                    xhr.addEventListener('loadend', function () {
+                        if (!xhr.__cpsdObserve) return;
+                        var responseText = '';
+                        try {
+                            if (!xhr.responseType || xhr.responseType === 'text') responseText = xhr.responseText;
+                        } catch (err) {}
+                        inspectTextForResources(xhr.responseURL || xhr.__cpsdUrl, responseText, 'xhr-text');
+                    }, false);
+                }
+                return originalSend.apply(this, arguments);
+            };
+            proto.open.__cpsdPatched = true;
+            debuglog('XHR hook installed');
+        } catch (err) {
+            debuglog('XHR hook failed: ' + err.message);
+        }
+    }
+
+    function hookFetch(win) {
+        try {
+            if (!win.fetch || win.fetch.__cpsdPatched) return;
+            var originalFetch = win.fetch;
+            win.fetch = function () {
+                var url = fetchInputUrl(arguments[0]);
+                if (!shouldObserveNetworkRequest(url)) {
+                    return originalFetch.apply(this, arguments);
+                }
+                recordResourceUrl(url, 'fetch');
+                return originalFetch.apply(this, arguments).then(function (response) {
+                    inspectFetchResponse(url || response.url, response);
+                    return response;
+                });
+            };
+            win.fetch.__cpsdPatched = true;
+            debuglog('fetch hook installed');
+        } catch (err) {
+            debuglog('fetch hook failed: ' + err.message);
+        }
+    }
+
+    function fetchInputUrl(input) {
+        if (!input) return '';
+        if (typeof input === 'string') return input;
+        if (input.url) return input.url;
+        try { return String(input); } catch (err) { return ''; }
+    }
+
+    function startPerformanceObserver() {
+        if (isPlaybackContext()) scanPerformanceEntries();
+        try {
+            if (!targetWindow.PerformanceObserver) return;
+            state.observer = new targetWindow.PerformanceObserver(function (list) {
+                list.getEntries().forEach(function (entry) {
+                    if (isPlaybackResourceUrl(entry.name)) {
+                        recordResourceUrl(entry.name, 'performance');
+                    }
+                });
+            });
+            state.observer.observe({ entryTypes: ['resource'] });
+            debuglog('PerformanceObserver installed');
+        } catch (err) {
+            debuglog('PerformanceObserver failed: ' + err.message);
+        }
+    }
+
+    function scanPerformanceEntries(rescanAll) {
+        try {
+            var perf = targetWindow.performance || window.performance;
+            if (!perf || !perf.getEntriesByType) return;
+            var entries = perf.getEntriesByType('resource');
+            var start = rescanAll || entries.length < state.performanceEntryCount ? 0 : state.performanceEntryCount;
+            for (var i = start; i < entries.length; i++) {
+                if (isPlaybackResourceUrl(entries[i].name)) {
+                    recordResourceUrl(entries[i].name, 'performance-scan');
+                }
+            }
+            state.performanceEntryCount = entries.length;
+        } catch (err) {
+            debuglog('Performance scan failed: ' + err.message);
+        }
+    }
+
+    function inspectFetchResponse(url, response) {
+        if (!response || !response.clone) return;
+        if (!shouldInspectResponse(url, response)) return;
+        try {
+            response.clone().text().then(function (text) {
+                inspectTextForResources(url || response.url, text, 'fetch-text');
+            }).catch(function () {});
+        } catch (err) {}
+    }
+
+    function shouldInspectResponse(url, response) {
+        url = normalizeUrl(url || (response && response.url));
+        if (!url) return false;
+        if (/\.(m4s|mp4|mp4a|ts|cmfv|cmfa|jpg|jpeg|png|webp|gif|woff2?|wasm)(?:[?#]|$)/i.test(url)) return false;
+        var contentType = '';
+        try { contentType = response.headers.get('content-type') || ''; } catch (err) {}
+        if (/javascript|json|xml|mpegurl|dash|vtt|ttml|text|octet-stream/i.test(contentType)) return true;
+        return /coupangplay|playback|manifest|m3u8|mpd|vtt|webvtt|ttml|dfxp|srt|subtitle|caption|timedtext/i.test(url);
+    }
+
+    function recordResourceUrl(rawUrl, source) {
+        var url = normalizeUrl(rawUrl);
+        if (!url || state.seenResourceUrls[url]) return;
+        state.seenResourceUrls[url] = true;
+
+        if (isManifestUrl(url)) {
+            queueManifest(url, source);
+        } else if (isSubtitleUrl(url)) {
+            addTrack({
+                NAME: inferTrackName(url),
+                LANGUAGE: inferLanguage(url),
+                FORCED: /forced/i.test(url) ? 'YES' : 'NO',
+                URI: url,
+                source: 'direct',
+                contentType: inferContentType(url)
+            });
+            state.status = 'Ready. Select a subtitle track.';
+            updateUi();
+        }
+    }
+
+    function inspectTextForResources(baseUrl, text, source) {
+        if (!text || typeof text !== 'string') return;
+        if (text.length > 5000000) return;
+
+        baseUrl = normalizeUrl(baseUrl);
+        var trimmed = text.replace(/^\uFEFF/, '').trim();
+        if (baseUrl && isManifestUrl(baseUrl)) {
+            parseManifest(baseUrl, trimmed);
+        } else if (baseUrl && isSubtitleUrl(baseUrl)) {
+            addTrack({
+                NAME: inferTrackName(baseUrl),
+                LANGUAGE: inferLanguage(baseUrl),
+                FORCED: /forced/i.test(baseUrl) ? 'YES' : 'NO',
+                URI: baseUrl,
+                source: source || 'direct',
+                contentType: inferContentType(baseUrl),
+                playlistDuration: subtitleTextDurationSeconds(trimmed) || null
+            });
+        } else if (baseUrl && looksLikeSubtitleText(trimmed)) {
+            addTrack({
+                NAME: inferTrackName(baseUrl),
+                LANGUAGE: inferLanguage(baseUrl),
+                FORCED: /forced/i.test(baseUrl) ? 'YES' : 'NO',
+                URI: baseUrl,
+                source: source || 'direct-text',
+                contentType: inferTextContentType(trimmed),
+                text: trimmed,
+                playlistDuration: subtitleTextDurationSeconds(trimmed) || null
+            });
+        } else if (/^\s*#EXTM3U/i.test(trimmed) || /^\s*<MPD[\s>]/i.test(trimmed)) {
+            parseManifest(baseUrl || location.href, trimmed);
+        }
+
+        extractUrlsFromText(trimmed, baseUrl).forEach(function (url) {
+            recordResourceUrl(url, source || 'text-url');
+        });
+
+        try {
+            collectSubtitleUrlsFromJson(JSON.parse(trimmed), baseUrl, '', 0);
+        } catch (err) {}
+    }
+
+    function extractUrlsFromText(text, baseUrl) {
+        var urls = {};
+        var normalized = text
+            .replace(/\\u002[fF]/g, '/')
+            .replace(/\\\//g, '/')
+            .replace(/&amp;/g, '&');
+        var re = /https?:\/\/[^"'\s<>\\]+|\/\/[^"'\s<>\\]+|(?:[A-Za-z0-9._~!$&'()*+,;=:@%-]+\/)+(?:[^"'\s<>\\]*)(?:\.m3u8|\.mpd|\.vtt|\.webvtt|\.ttml|\.dfxp|\.srt)(?:[^"'\s<>\\]*)?/gi;
+        var match;
+        while ((match = re.exec(normalized)) !== null) {
+            var url = match[0].replace(/[),.]+$/, '');
+            if (/^(?:https?:)?\/\//i.test(url)) {
+                if (url.indexOf('//') === 0) url = location.protocol + url;
+            } else {
+                url = absoluteUrl(url, baseUrl || location.href);
+            }
+            if (isManifestUrl(url) || isSubtitleUrl(url)) urls[url] = true;
+        }
+        return Object.keys(urls);
+    }
+
+    function collectSubtitleUrlsFromJson(value, baseUrl, path, depth) {
+        if (value == null || depth > 12) return;
+        if (typeof value === 'string') {
+            extractUrlsFromText(value, baseUrl).forEach(function (url) {
+                recordResourceUrl(url, 'json-string');
+            });
+            return;
+        }
+        if (typeof value !== 'object') return;
+
+        if (Array.isArray(value)) {
+            value.slice(0, 500).forEach(function (item) {
+                collectSubtitleUrlsFromJson(item, baseUrl, path, depth + 1);
+            });
+            return;
+        }
+
+        var possibleUrl = '';
+        var language = '';
+        var label = '';
+        var forced = 'NO';
+        var type = '';
+
+        Object.keys(value).forEach(function (key) {
+            var child = value[key];
+            var lower = key.toLowerCase();
+            var nextPath = path ? path + '.' + lower : lower;
+
+            if (typeof child === 'string') {
+                if (/(?:url|uri|src|href|path|file|location)$/.test(lower)) possibleUrl = child;
+                if (/(?:language|lang|locale|srclang)$/.test(lower)) language = child;
+                if (/(?:label|name|title|displayname)$/.test(lower)) label = child;
+                if (/forced/.test(lower) && /true|yes|forced/i.test(child)) forced = 'YES';
+                if (/(?:kind|type|format|mime|contenttype)$/.test(lower)) type = child;
+            } else if (typeof child === 'boolean' && /forced/.test(lower) && child) {
+                forced = 'YES';
+            }
+
+            collectSubtitleUrlsFromJson(child, baseUrl, nextPath, depth + 1);
+        });
+
+        if (possibleUrl) {
+            var url = absoluteUrl(cleanJsonUrl(possibleUrl), baseUrl || location.href);
+            if (isManifestUrl(url)) {
+                recordResourceUrl(url, 'json-object');
+            } else if (isSubtitleUrl(url) || /subtitle|caption|texttrack|timedtext/i.test(path + ' ' + type + ' ' + label)) {
+                addTrack({
+                    NAME: buildTrackName(label, language, forced, type, url),
+                    LANGUAGE: language || inferLanguage(url),
+                    FORCED: forced,
+                    TYPE: type || '',
+                    URI: url,
+                    source: 'json',
+                    contentType: inferContentType(url)
+                });
+            }
+        }
+    }
+
+    function cleanJsonUrl(url) {
+        return String(url || '').replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    }
+
+    function isManifestUrl(url) {
+        return /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url || '');
+    }
+
+    function isSubtitleUrl(url) {
+        return /\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#]|$)/i.test(url || '') ||
+            /(?:subtitle|caption|timedtext|texttrack).*(?:vtt|ttml|dfxp|srt)/i.test(url || '');
+    }
+
+    function inferContentType(url) {
+        if (/\.srt(?:[?#]|$)/i.test(url)) return 'srt';
+        if (/\.(?:ttml|dfxp)(?:[?#]|$)/i.test(url)) return 'ttml';
+        if (/\.(?:vtt|webvtt)(?:[?#]|$)/i.test(url)) return 'vtt';
+        if (/\.mpd(?:[?#]|$)/i.test(url)) return 'mpd';
+        if (/\.m3u8(?:[?#]|$)/i.test(url)) return 'm3u8';
+        return '';
+    }
+
+    function looksLikeSubtitleText(text) {
+        return /^\s*WEBVTT\b/i.test(text || '') ||
+            /^\s*<\?xml[\s\S]{0,200}<tt[\s>]/i.test(text || '') ||
+            /^\s*<tt[\s>]/i.test(text || '') ||
+            looksLikeSrt(text || '');
+    }
+
+    function inferTextContentType(text) {
+        if (/^\s*WEBVTT\b/i.test(text || '')) return 'vtt';
+        if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(text || '')) return 'ttml';
+        if (looksLikeSrt(text || '')) return 'srt';
+        return '';
+    }
+
+    function queueManifest(url, source) {
+        if (state.seenManifestUrls[url]) return;
+        state.seenManifestUrls[url] = true;
+        state.status = 'Found manifest via ' + source + '. Reading tracks...';
+        updateUi();
+
+        getText(url).then(function (text) {
+            parseManifest(url, text || '');
+            updateUi();
+        }).catch(function (err) {
+            state.lastError = 'Could not read manifest: ' + err.message;
+            updateUi();
+        });
+    }
+
+    function parseManifest(url, text) {
+        if (!text) return;
+        if (/^\s*#EXTM3U/i.test(text)) {
+            parseHlsManifest(url, text);
+        } else if (/^\s*<MPD[\s>]/i.test(text)) {
+            parseDashManifest(url, text);
+        }
+        if (state.tracks.length > 0) state.status = 'Ready. Select a subtitle track.';
+    }
+
+    function parseHlsManifest(url, text) {
+        var lines = text.split(/\r\n|\r|\n/);
+        var subtitleMediaLines = lines.filter(function (line) {
+            return /^#EXT-X-MEDIA:/i.test(line) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(line);
+        });
+
+        subtitleMediaLines.forEach(function (line) {
+            var attrs = parseAttrList(line.replace(/^#EXT-X-MEDIA:/i, ''));
+            if (!attrs.URI) return;
+            var trackUrl = absoluteUrl(attrs.URI, url);
+            addTrack({
+                NAME: trackLabel(attrs, trackUrl),
+                LANGUAGE: attrs.LANGUAGE || inferLanguage(trackUrl),
+                FORCED: attrs.FORCED || 'NO',
+                CHARACTERISTICS: attrs.CHARACTERISTICS || '',
+                TYPE: attrs.TYPE || '',
+                URI: trackUrl,
+                source: 'hls-master',
+                contentType: inferContentType(trackUrl)
+            });
+        });
+
+        if (looksLikeSubtitlePlaylist(url, text)) {
+            addTrack({
+                NAME: inferTrackName(url),
+                LANGUAGE: inferLanguage(url),
+                FORCED: /forced/i.test(url) ? 'YES' : 'NO',
+                URI: url,
+                source: 'hls-playlist',
+                segments: extractSegmentUrls(text, url),
+                playlistDuration: playlistDurationSeconds(text) || null,
+                contentType: 'm3u8'
+            });
+        }
+    }
+
+    function parseDashManifest(url, text) {
+        var doc;
+        try {
+            doc = new DOMParser().parseFromString(text, 'application/xml');
+        } catch (err) {
+            return;
+        }
+        var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
+        nodes.filter(function (node) {
+            return localName(node) === 'AdaptationSet' && isTextAdaptation(node);
+        }).forEach(function (adaptation) {
+            var language = adaptation.getAttribute('lang') || adaptation.getAttribute('xml:lang') || '';
+            var label = adaptation.getAttribute('label') || adaptation.getAttribute('contentType') || 'Subtitle';
+            var mimeType = adaptation.getAttribute('mimeType') || '';
+            var base = firstChildText(adaptation, 'BaseURL');
+            var representations = childElements(adaptation, 'Representation');
+            if (!representations.length) representations = [adaptation];
+
+            representations.forEach(function (representation) {
+                var repBase = firstChildText(representation, 'BaseURL') || base;
+                var repLang = representation.getAttribute('lang') || representation.getAttribute('xml:lang') || language;
+                var repMime = representation.getAttribute('mimeType') || mimeType;
+                var repLabel = representation.getAttribute('label') || label;
+                if (repBase) {
+                    addTrack({
+                        NAME: buildTrackName(repLabel, repLang, 'NO', repMime, repBase),
+                        LANGUAGE: repLang || inferLanguage(repBase),
+                        FORCED: /forced/i.test(repLabel + ' ' + repBase) ? 'YES' : 'NO',
+                        TYPE: repMime,
+                        URI: absoluteUrl(repBase, url),
+                        source: 'dash',
+                        contentType: inferContentType(repBase)
+                    });
+                }
+
+                var template = firstChildElement(representation, 'SegmentTemplate') || firstChildElement(adaptation, 'SegmentTemplate');
+                var templateSegments = template ? dashTemplateSegments(template, representation, url) : [];
+                if (templateSegments.length) {
+                    addTrack({
+                        NAME: buildTrackName(repLabel, repLang, 'NO', repMime, templateSegments[0]),
+                        LANGUAGE: repLang || inferLanguage(templateSegments[0]),
+                        FORCED: /forced/i.test(repLabel + ' ' + templateSegments[0]) ? 'YES' : 'NO',
+                        TYPE: repMime,
+                        URI: url,
+                        source: 'dash-template',
+                        segments: templateSegments,
+                        contentType: inferContentType(templateSegments[0])
+                    });
+                }
+            });
+        });
+    }
+
+    function localName(node) {
+        return node.localName || String(node.nodeName || '').replace(/^.*:/, '');
+    }
+
+    function childElements(parent, name) {
+        return Array.prototype.slice.call(parent.children || []).filter(function (child) {
+            return localName(child) === name;
+        });
+    }
+
+    function firstChildElement(parent, name) {
+        var items = childElements(parent, name);
+        return items.length ? items[0] : null;
+    }
+
+    function firstChildText(parent, name) {
+        var node = firstChildElement(parent, name);
+        return node ? node.textContent.trim() : '';
+    }
+
+    function isTextAdaptation(node) {
+        var text = [
+            node.getAttribute('contentType') || '',
+            node.getAttribute('mimeType') || '',
+            node.getAttribute('codecs') || '',
+            node.getAttribute('label') || '',
+            node.textContent.slice(0, 500)
+        ].join(' ').toLowerCase();
+        return /text|subtitle|caption|webvtt|vtt|ttml|dfxp|stpp/.test(text);
+    }
+
+    function dashTemplateSegments(template, representation, baseUrl) {
+        var media = template.getAttribute('media') || '';
+        if (!media || !/\.(?:vtt|webvtt|ttml|dfxp|xml|srt)(?:[?#]|$)/i.test(media)) return [];
+
+        var representationId = representation.getAttribute('id') || '';
+        var startNumber = parseInt(template.getAttribute('startNumber') || '1', 10);
+        var timeline = firstChildElement(template, 'SegmentTimeline');
+        var numbers = [];
+
+        if (timeline) {
+            var current = 0;
+            childElements(timeline, 'S').forEach(function (s) {
+                var repeat = parseInt(s.getAttribute('r') || '0', 10);
+                var time = s.getAttribute('t');
+                if (time != null) current = parseInt(time, 10) || current;
+                for (var i = 0; i <= repeat; i++) {
+                    numbers.push(current);
+                    current += parseInt(s.getAttribute('d') || '0', 10) || 0;
+                }
+            });
+        } else {
+            for (var n = startNumber; n < startNumber + 600; n++) numbers.push(n);
+        }
+
+        return numbers.slice(0, 1200).map(function (value, index) {
+            var url = media
+                .replace(/\$RepresentationID\$/g, representationId)
+                .replace(/\$Number(?:%0\d+d)?\$/g, String(startNumber + index))
+                .replace(/\$Time\$/g, String(value));
+            return absoluteUrl(url, baseUrl);
+        });
+    }
+
+    function parseAttrList(value) {
+        var attrs = {};
+        var re = /([A-Z0-9-]+)=("(?:[^"\\]|\\.)*"|[^,]*)/gi;
+        var match;
+        while ((match = re.exec(value)) !== null) {
+            attrs[match[1].toUpperCase()] = match[2].replace(/^"|"$/g, '');
+        }
+        return attrs;
+    }
+
+    function trackLabel(attrs, uri) {
+        return buildTrackName(attrs.NAME || '', attrs.LANGUAGE || inferLanguage(uri), attrs.FORCED || 'NO', attrs.CHARACTERISTICS || attrs.TYPE || '', uri);
+    }
+
+    function buildTrackName(label, language, forced, type, uri) {
+        var parts = [];
+        if (label) parts.push(label);
+        if (language && parts.join(' ').toLowerCase().indexOf(String(language).toLowerCase()) < 0) parts.push('[' + language + ']');
+        if (/^yes$/i.test(forced || '') || /forced/i.test(label + ' ' + uri)) parts.push('(forced)');
+        if (/sdh|cc|caption|closed|transcribes/i.test(type + ' ' + label + ' ' + uri)) parts.push('(CC)');
+        return parts.join(' ') || inferTrackName(uri);
+    }
+
+    function inferTrackName(url) {
+        var decoded = decodeURIComponent(url || '');
+        var language = inferLanguage(decoded);
+        var file = decoded.split(/[/?#]/).filter(Boolean).pop() || 'Subtitle';
+        var label = language ? language : file.replace(/\.(?:m3u8|mpd|vtt|webvtt|ttml|dfxp|srt).*/i, '').replace(/[_-]+/g, ' ');
+        if (/sdh|cc|caption/i.test(decoded) && !/\bcc\b/i.test(label)) label += ' (CC)';
+        if (/forced/i.test(decoded)) label += ' (forced)';
+        return label || 'Subtitle';
+    }
+
+    function inferLanguage(url) {
+        var decoded = decodeURIComponent(url || '');
+        var match = decoded.match(/(?:^|[\/._-])([a-z]{2,3}(?:[-_][a-z0-9]+)?)(?:[_-](?:SDH|CC|FORCED|MAIN|PRIMARY))?(?:[_-]|\.|\/|$)/i);
+        return match ? normalizeLanguageCode(match[1]) : '';
+    }
+
+    function addTrack(track, fromFrameMessage) {
+        if (!track || !track.URI) return;
+        if (!isTopFrame() && !fromFrameMessage) {
+            forwardTrackToTop(track);
+            return;
+        }
+        track.LANGUAGE = track.LANGUAGE || inferLanguage(track.URI);
+        track.NAME = track.NAME || inferTrackName(track.URI);
+        track.key = trackIdentity(track);
+
+        var existing = state.trackKeys[track.key];
+        if (existing) {
+            mergeTrack(existing, track);
+            return;
+        }
+
+        state.trackKeys[track.key] = track;
+        state.tracks.push(track);
+        state.tracks.sort(function (a, b) {
+            return a.NAME.localeCompare(b.NAME);
+        });
+        state.status = 'Ready. Select a subtitle track.';
+        debuglog('Track added: ' + track.NAME);
+        updateUi();
+    }
+
+    function mergeTrack(existing, incoming) {
+        var incomingScore = trackScoreForSource(incoming);
+        var existingScore = trackScoreForSource(existing);
+        if (incomingScore > existingScore) {
+            existing.URI = incoming.URI;
+            existing.source = incoming.source || existing.source;
+            existing.segments = incoming.segments || null;
+            existing.contentType = incoming.contentType || existing.contentType;
+            existing.playlistDuration = incoming.playlistDuration || existing.playlistDuration;
+        } else if (incoming.segments && incoming.segments.length && (!existing.segments || !existing.segments.length)) {
+            existing.segments = incoming.segments;
+        }
+        if (!existing.LANGUAGE && incoming.LANGUAGE) existing.LANGUAGE = incoming.LANGUAGE;
+        if (!existing.FORCED && incoming.FORCED) existing.FORCED = incoming.FORCED;
+        if (!existing.TYPE && incoming.TYPE) existing.TYPE = incoming.TYPE;
+        if (!existing.CHARACTERISTICS && incoming.CHARACTERISTICS) existing.CHARACTERISTICS = incoming.CHARACTERISTICS;
+        if (isBetterTrackName(incoming.NAME, existing.NAME)) existing.NAME = incoming.NAME;
+        debuglog('Track merged: ' + existing.NAME);
+    }
+
+    function trackScoreForSource(track) {
+        var score = 0;
+        if (track.source === 'json') score += 5;
+        if (/master|dash/.test(track.source || '')) score += 4;
+        if (/playlist/.test(track.source || '')) score += 3;
+        if (track.segments && track.segments.length) score += 3;
+        if (track.playlistDuration && track.playlistDuration > 120) score += 5;
+        if (isShortPreviewTrack(track)) score -= 20;
+        if (track.URI) score += 1;
+        return score;
+    }
+
+    function isBetterTrackName(candidate, current) {
+        if (!candidate) return false;
+        if (!current) return true;
+        if (/subtitle/i.test(current) && !/subtitle/i.test(candidate)) return true;
+        if ((current.indexOf('[') < 0) && candidate.indexOf('[') >= 0) return true;
+        return candidate.length > current.length && candidate.length < 100;
+    }
+
+    function trackIdentity(track) {
+        var language = trackLanguage(track);
+        var type = isForcedTrack(track) ? 'forced' : 'main';
+        var captions = isCcTrack(track) ? 'cc' : 'plain';
+        var label = normalizeTrackLabel(track.NAME || inferTrackName(track.URI));
+        if (language) return language + '|' + type + '|' + captions + '|' + label;
+        return (label || track.URI.replace(/[?#].*$/, '')) + '|' + type + '|' + captions;
+    }
+
+    function findTrackByKey(key) {
+        if (!key) return null;
+        for (var i = 0; i < state.tracks.length; i++) {
+            if (state.tracks[i].key === key) return state.tracks[i];
+        }
+        return null;
+    }
+
+    function preferredSelectionKey() {
+        var preferred = findPreferredTrack('ko') || findPreferredTrack('en') || state.tracks[0];
+        return preferred ? preferred.key : '';
+    }
+
+    function findPreferredTrack(language) {
+        var candidates = state.tracks.filter(function (track) {
+            return trackMatchesLanguage(track, language);
+        });
+        if (!candidates.length) return null;
+
+        var mainTracks = candidates.filter(function (track) {
+            return !isForcedTrack(track);
+        });
+        if (mainTracks.length) candidates = mainTracks;
+
+        candidates.sort(function (a, b) {
+            return trackScore(b, language) - trackScore(a, language) || a.NAME.localeCompare(b.NAME);
+        });
+        return candidates[0];
+    }
+
+    function trackMatchesLanguage(track, language) {
+        var trackCode = languagePrimary(trackLanguage(track));
+        var desiredCode = languagePrimary(language);
+        if (trackCode && desiredCode && trackCode === desiredCode) return true;
+
+        var haystack = ((track.LANGUAGE || '') + ' ' + (track.NAME || '') + ' ' + (track.URI || '')).toLowerCase();
+        if (language === 'ko') return /\b(ko|kor|kr|korean)\b/.test(haystack) || haystack.indexOf('한국') >= 0;
+        if (language === 'en') return /\b(en|eng|english)\b/.test(haystack);
+        return false;
+    }
+
+    function trackScore(track, language) {
+        var haystack = ((track.LANGUAGE || '') + ' ' + (track.NAME || '') + ' ' + (track.URI || '')).toLowerCase();
+        var score = trackScoreForSource(track);
+        if (languagePrimary(trackLanguage(track)) === languagePrimary(language)) score += 100;
+        if (language === 'ko' && (haystack.indexOf('korean') >= 0 || haystack.indexOf('한국') >= 0)) score += 50;
+        if (language === 'en' && haystack.indexOf('english') >= 0) score += 50;
+        if (isCcTrack(track)) score += 8;
+        if (isForcedTrack(track)) score -= 20;
+        return score;
+    }
+
+    function trackLanguage(track) {
+        return normalizeLanguageCode(track.LANGUAGE) ||
+            languageFromTrackName(track.NAME) ||
+            normalizeLanguageCode(inferLanguage(track.URI || ''));
+    }
+
+    function languageFromTrackName(name) {
+        var text = String(name || '').toLowerCase();
+        var bracket = text.match(/\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]/i);
+        if (bracket) return normalizeLanguageCode(bracket[1]);
+        if (/\bkorean\b/.test(text) || text.indexOf('한국') >= 0) return 'ko';
+        if (/\benglish\b/.test(text)) return 'en';
+        var compact = text.match(/^([a-z]{2,3})(?:[-_\s]+|--)(?:forced|cc|sdh|subtitle|caption|\()/i);
+        return compact ? normalizeLanguageCode(compact[1]) : '';
+    }
+
+    function normalizeLanguageCode(value) {
+        var text = String(value || '').toLowerCase().trim().replace(/_/g, '-');
+        var match = text.match(/^([a-z]{2,3})(?:-([a-z0-9]+))?/i);
+        if (!match) return '';
+        var primary = match[1];
+        if (primary === 'kor' || primary === 'kr') return 'ko';
+        if (primary === 'eng') return 'en';
+        if (primary === 'ko' || primary === 'en') return primary;
+        return match[2] ? primary + '-' + match[2] : primary;
+    }
+
+    function languagePrimary(value) {
+        return normalizeLanguageCode(value).split('-')[0];
+    }
+
+    function isForcedTrack(track) {
+        return /^yes$/i.test(track.FORCED || '') ||
+            /(?:^|[\s._-])forced(?:$|[\s._-])/i.test(track.NAME || '') ||
+            /(?:^|[\/._-])forced(?:$|[\/._-])/i.test(track.URI || '');
+    }
+
+    function isCcTrack(track) {
+        var text = ((track.NAME || '') + ' ' + (track.CHARACTERISTICS || '') + ' ' + (track.TYPE || '') + ' ' + (track.URI || '')).toLowerCase();
+        return /\bcc\b|sdh|closed captions|caption|transcribes-spoken-dialog|describes-music-and-sound/.test(text);
+    }
+
+    function normalizeTrackLabel(name) {
+        return String(name || '')
+            .toLowerCase()
+            .replace(/\[[^\]]+\]/g, '')
+            .replace(/\((?:cc|forced|sdh)\)/g, '')
+            .replace(/\b(?:cc|forced|sdh|closed captions)\b/g, '')
+            .replace(/[_-]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function looksLikeSubtitlePlaylist(url, text) {
+        return /\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#\s]|$)/i.test(text) ||
+            /WEBVTT|TTML|SUBTITLE|caption|timedtext/i.test(text) ||
+            /subtitle|webvtt|_sdh_|_cc_|forced|timedtext/i.test(url);
+    }
+
+    function extractSegmentUrls(text, baseUrl) {
+        var urls = [];
+        text.split(/\r\n|\r|\n/).forEach(function (line) {
+            line = line.trim();
+            if (!line || line.charAt(0) === '#') return;
+            if (/\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#]|$)/i.test(line) || /WEBVTT|TTML/i.test(line)) {
+                urls.push(absoluteUrl(line, baseUrl));
+            }
+        });
+        return urls;
+    }
+
+    function isShortPreviewTrack(track) {
+        var duration = Number(track && track.playlistDuration);
+        return duration > 0 && duration < 90;
+    }
+
+    function playlistDurationSeconds(text) {
+        var total = 0;
+        var found = false;
+        String(text || '').split(/\r\n|\r|\n/).forEach(function (line) {
+            var match = line.match(/^#EXTINF:([\d.]+)/i);
+            if (!match) return;
+            var value = parseFloat(match[1]);
+            if (isFinite(value) && value > 0) {
+                total += value;
+                found = true;
+            }
+        });
+        return found ? total : 0;
+    }
+
+    function subtitleTextDurationSeconds(text) {
+        var max = 0;
+        String(text || '').replace(/(\d{2}:\d{2}:\d{2}[\.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[\.,]\d{3})/g, function (_, start, end) {
+            var seconds = timestampSeconds(end);
+            if (seconds > max) max = seconds;
+            return _;
+        });
+        return max;
+    }
+
+    function downloadAllTracks() {
+        if (state.wait || state.tracks.length === 0) return;
+        state.zip = new JSZip();
+        state.wait = true;
+        state.lastError = '';
+        updateUi();
+
+        runSequential(state.tracks, function (track) {
+            state.status = 'Downloading ' + track.NAME + '...';
+            updateUi();
+            return buildSubtitleFile(track).then(function (file) {
+                state.zip.file(file.name, file.content);
+            });
+        }).then(function () {
+            return state.zip.generateAsync({ type: 'blob' });
+        }).then(function (blob) {
+            saveAs(blob, safeBaseFilename() + '.subtitles.zip');
+            state.status = 'Downloaded all subtitles.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            updateUi();
+        });
+    }
+
+    function downloadTrack(track) {
+        if (state.wait) return;
+        state.wait = true;
+        state.lastError = '';
+        state.selectedTrackKey = track.key;
+        state.status = 'Downloading ' + track.NAME + '...';
+        updateUi();
+
+        buildSubtitleFile(track).then(function (file) {
+            saveAs(new Blob([file.content], { type: 'text/vtt;charset=utf-8' }), file.name);
+            state.status = 'Downloaded ' + track.NAME + '.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            updateUi();
+        });
+    }
+
+    function downloadPreferredTrack(language) {
+        var track = findPreferredTrack(language);
+        if (!track) {
+            state.lastError = (language === 'ko' ? 'Korean' : 'English') + ' subtitle was not detected yet.';
+            updateUi();
+            return;
+        }
+        state.selectedTrackKey = track.key;
+        state.userSelectedTrack = true;
+        downloadTrack(track);
+    }
+
+    function downloadEnglishAndKorean() {
+        if (state.wait) return;
+        var english = findPreferredTrack('en');
+        var korean = findPreferredTrack('ko');
+        if (!english || !korean) {
+            state.lastError = 'English and Korean subtitles must both be detected before downloading together.';
+            updateUi();
+            return;
+        }
+
+        var tracks = uniqueTracks([english, korean]);
+        var zip = new JSZip();
+        state.wait = true;
+        state.lastError = '';
+        state.status = 'Downloading English + Korean subtitles...';
+        updateUi();
+
+        Promise.all(tracks.map(function (track) {
+            return buildSubtitleFile(track).then(function (file) {
+                zip.file(file.name, file.content);
+            });
+        })).then(function () {
+            return zip.generateAsync({ type: 'blob' });
+        }).then(function (blob) {
+            saveAs(blob, safeBaseFilename() + '.en-ko.subtitles.zip');
+            state.status = 'Downloaded English + Korean subtitles.';
+        }).catch(function (err) {
+            state.lastError = 'Download failed: ' + err.message;
+        }).then(function () {
+            state.wait = false;
+            updateUi();
+        });
+    }
+
+    function uniqueTracks(tracks) {
+        var seen = {};
+        var output = [];
+        tracks.forEach(function (track) {
+            if (!track) return;
+            var key = track.key || trackIdentity(track);
+            if (seen[key]) return;
+            seen[key] = true;
+            output.push(track);
+        });
+        return output;
+    }
+
+    function buildSubtitleFile(track) {
+        return ensureMediaMetadata().then(function () {
+            return getTrackVtt(track);
+        }).then(function (vtt) {
+            var output = normalizeVttForDownload(vtt);
+            if (!output.trim()) throw new Error('No subtitle cues found.');
+            return {
+                name: safeBaseFilename() + '.' + safeTrackName(track) + '.vtt',
+                content: output
+            };
+        });
+    }
+
+    function getTrackVtt(track) {
+        if (track.text) return Promise.resolve(textToVtt(track.text, track));
+        if (track.segments && track.segments.length) return mergeSegments(track);
+
+        return getText(track.URI).then(function (text) {
+            if (/^\s*WEBVTT/i.test(text)) return text;
+            if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(text)) return ttmlToVtt(text);
+            if (looksLikeSrt(text)) return srtToVtt(text);
+            if (/^\s*#EXTM3U/i.test(text)) {
+                var segments = extractSegmentUrls(text, track.URI);
+                track.playlistDuration = playlistDurationSeconds(text) || track.playlistDuration;
+                if (!segments.length) throw new Error('No subtitle segments found for ' + track.NAME + '.');
+                track.segments = segments;
+                return mergeSegments(track);
+            }
+            if (/^\s*<MPD[\s>]/i.test(text)) {
+                parseDashManifest(track.URI, text);
+                throw new Error('DASH manifest was parsed. Select a detected text track and retry.');
+            }
+            return textToVtt(text, track);
+        });
+    }
+
+    function mergeSegments(track) {
+        var merged = 'WEBVTT\n\n';
+        var successCount = 0;
+        return runSequential(track.segments, function (segmentUrl) {
+            return getText(segmentUrl).then(function (segmentText) {
+                var cleaned = textToVtt(segmentText, track);
+                cleaned = cleanVttSegment(cleaned);
+                if (cleaned.trim()) {
+                    merged += cleaned.trim() + '\n\n';
+                    successCount++;
+                }
+            }).catch(function (err) {
+                debuglog('Segment failed: ' + err.message);
+            });
+        }).then(function () {
+            if (successCount === 0) throw new Error('Failed to download subtitle segments.');
+            return merged;
+        });
+    }
+
+    function textToVtt(text, track) {
+        var value = String(text || '').replace(/^\uFEFF/, '');
+        if (/^\s*WEBVTT/i.test(value)) return value;
+        if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(value) || track.contentType === 'ttml') return ttmlToVtt(value);
+        if (looksLikeSrt(value) || track.contentType === 'srt') return srtToVtt(value);
+        return value;
+    }
+
+    function cleanVttSegment(text) {
+        return String(text || '')
+            .replace(/^\uFEFF/, '')
+            .replace(/^WEBVTT[^\n]*(?:\n|$)/i, '')
+            .replace(/^X-TIMESTAMP-MAP:[^\n]*(?:\n|$)/gmi, '')
+            .replace(/\n{3,}/g, '\n\n');
+    }
+
+    function normalizeVttForDownload(vtt) {
+        var text = String(vtt || '')
+            .replace(/^\uFEFF/, '')
+            .replace(/\r\n|\r|\n/g, '\n')
+            .trim();
+        if (!text) return '';
+        if (!/^\s*WEBVTT\b/i.test(text)) text = 'WEBVTT\n\n' + cleanVttSegment(text).trim();
+        return text.replace(/\n/g, '\r\n') + '\r\n';
+    }
+
+    function looksLikeSrt(text) {
+        return /\d+\s*\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}/.test(text || '');
+    }
+
+    function srtToVtt(srt) {
+        return 'WEBVTT\n\n' + String(srt || '')
+            .replace(/^\uFEFF/, '')
+            .replace(/\r\n|\r/g, '\n')
+            .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
+            .replace(/^\d+\s*\n/gm, '')
+            .trim() + '\n';
+    }
+
+    function ttmlToVtt(ttml) {
+        var doc;
+        try {
+            doc = new DOMParser().parseFromString(ttml, 'application/xml');
+        } catch (err) {
+            return '';
+        }
+        var paragraphs = Array.prototype.slice.call(doc.getElementsByTagName('*')).filter(function (node) {
+            return localName(node) === 'p';
+        });
+        var cues = [];
+        paragraphs.forEach(function (p) {
+            var begin = p.getAttribute('begin') || p.getAttribute('start') || '';
+            var end = p.getAttribute('end') || '';
+            var dur = p.getAttribute('dur') || '';
+            var startSeconds = ttmlTimeSeconds(begin);
+            var endSeconds = end ? ttmlTimeSeconds(end) : startSeconds + ttmlTimeSeconds(dur);
+            var text = p.textContent.replace(/\s+/g, ' ').trim();
+            if (text && endSeconds > startSeconds) {
+                cues.push(formatVttTime(startSeconds) + ' --> ' + formatVttTime(endSeconds) + '\n' + text);
+            }
+        });
+        return 'WEBVTT\n\n' + cues.join('\n\n') + '\n';
+    }
+
+    function ttmlTimeSeconds(value) {
+        value = String(value || '').trim();
+        if (!value) return 0;
+        if (/^\d+(?:\.\d+)?s$/.test(value)) return parseFloat(value);
+        if (/^\d+(?:\.\d+)?ms$/.test(value)) return parseFloat(value) / 1000;
+        return timestampSeconds(value);
+    }
+
+    function timestampSeconds(value) {
+        var parts = String(value || '').replace(',', '.').split(':');
+        if (parts.length === 3) {
+            return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60 + (parseFloat(parts[2]) || 0);
+        }
+        if (parts.length === 2) {
+            return (parseInt(parts[0], 10) || 0) * 60 + (parseFloat(parts[1]) || 0);
+        }
+        return parseFloat(value) || 0;
+    }
+
+    function formatVttTime(seconds) {
+        seconds = Math.max(0, Number(seconds) || 0);
+        var hours = Math.floor(seconds / 3600);
+        var minutes = Math.floor((seconds % 3600) / 60);
+        var secs = Math.floor(seconds % 60);
+        var ms = Math.round((seconds - Math.floor(seconds)) * 1000);
+        if (ms === 1000) {
+            ms = 0;
+            secs++;
+        }
+        return pad2(hours) + ':' + pad2(minutes) + ':' + pad2(secs) + '.' + pad3(ms);
+    }
+
+    function pad2(value) {
+        return value < 10 ? '0' + value : String(value);
+    }
+
+    function pad3(value) {
+        if (value < 10) return '00' + value;
+        if (value < 100) return '0' + value;
+        return String(value);
+    }
+
+    function runSequential(items, iterator) {
+        var index = 0;
+        function next() {
+            if (index >= items.length) return Promise.resolve();
+            var item = items[index++];
+            return Promise.resolve(iterator(item, index - 1)).then(next);
+        }
+        return next();
+    }
+
+    function getText(url, retryCount, headers) {
+        retryCount = retryCount || 0;
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                headers: headers || undefined,
+                responseType: 'text',
+                onload: function (response) {
+                    if (response.status >= 200 && response.status < 400) {
+                        resolve(response.responseText || '');
+                    } else if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getText(url, retryCount + 1, headers).then(resolve, reject);
+                        }, 300);
+                    } else {
+                        reject(new Error('HTTP ' + response.status + ' for ' + url));
+                    }
+                },
+                onerror: function () {
+                    if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getText(url, retryCount + 1, headers).then(resolve, reject);
+                        }, 300);
+                    } else {
+                        reject(new Error('Network error for ' + url));
+                    }
+                }
+            });
+        });
+    }
+
+    function resetTracks() {
+        state.tracks = [];
+        state.trackKeys = {};
+        state.seenResourceUrls = {};
+        state.seenManifestUrls = {};
+        state.selectedTrackKey = '';
+        state.userSelectedTrack = false;
+        state.mediaTitle = '';
+        state.mediaTitlePriority = 0;
+        state.episodeTag = '';
+        state.episodeTitle = '';
+        state.seasonNumber = null;
+        state.episodeNumber = null;
+        state.episodeConfirmed = false;
+        state.metadataRequestKey = '';
+        state.metadataResolvedKey = '';
+        state.metadataFailedKey = '';
+        state.metadataPromise = null;
+        state.lastError = '';
+        state.status = 'Scanning playback...';
+    }
+
+    function refreshMediaMetadataFromDom() {
+        mergeMediaMetadata(mediaMetadataFromDom(), 1);
+        scheduleDiscoverMetadata();
+    }
+
+    function ensureMediaMetadata() {
+        refreshMediaMetadataFromDom();
+        return (state.metadataPromise || Promise.resolve()).then(function () {
+            mergeMediaMetadata(mediaMetadataFromDom(), 1);
+        });
+    }
+
+    function mediaMetadataFromDom() {
+        var bodyText = document.body ? document.body.innerText : '';
+        var title = displayTitle();
+        var fromTitle = episodeMetadataFromTitle(title);
+        var fromText = episodeMetadataFromText(bodyText);
+        var seasonNumber = fromTitle.seasonNumber || fromText.seasonNumber || null;
+        var episodeNumber = fromTitle.episodeNumber || fromText.episodeNumber || null;
+        return {
+            title: fromTitle.title || fromText.title || title,
+            episodeTitle: fromTitle.episodeTitle || fromText.episodeTitle || '',
+            seasonNumber: seasonNumber,
+            episodeNumber: episodeNumber,
+            episodeTag: formatSeasonEpisodeTag(seasonNumber, episodeNumber),
+            episodeConfirmed: false
+        };
+    }
+
+    function mergeMediaMetadata(metadata, priority) {
+        if (!metadata) return;
+        priority = priority || 1;
+        if (metadata.title && priority >= state.mediaTitlePriority) {
+            state.mediaTitle = cleanDisplayTitle(metadata.title);
+            state.mediaTitlePriority = priority;
+        }
+        if (metadata.episodeConfirmed) {
+            if (metadata.episodeTitle) state.episodeTitle = cleanDisplayTitle(metadata.episodeTitle);
+            if (metadata.seasonNumber) state.seasonNumber = metadata.seasonNumber;
+            if (metadata.episodeNumber) state.episodeNumber = metadata.episodeNumber;
+            state.episodeConfirmed = !!formatSeasonEpisodeTag(state.seasonNumber, state.episodeNumber);
+            state.episodeTag = state.episodeConfirmed ? formatSeasonEpisodeTag(state.seasonNumber, state.episodeNumber) : '';
+        }
+    }
+
+    function scheduleDiscoverMetadata() {
+        var identifiers = playbackIdentifiers();
+        if (!identifiers.titleId) return null;
+
+        var requestKey = [identifiers.titleId, identifiers.parentId].join('|');
+        if (state.metadataResolvedKey === requestKey || state.metadataFailedKey === requestKey) return state.metadataPromise;
+        if (state.metadataRequestKey === requestKey && state.metadataPromise) return state.metadataPromise;
+
+        state.metadataRequestKey = requestKey;
+        state.metadataPromise = fetchDiscoverMetadata(identifiers).then(function (metadata) {
+            mergeMediaMetadata(metadata, 2);
+            state.metadataResolvedKey = requestKey;
+            updateUi();
+            return metadata;
+        }).catch(function (err) {
+            state.metadataFailedKey = requestKey;
+            debuglog('Discover metadata failed: ' + err.message);
+        }).then(function (metadata) {
+            state.metadataPromise = null;
+            return metadata;
+        });
+        return state.metadataPromise;
+    }
+
+    function fetchDiscoverMetadata(identifiers) {
+        var metadata = {};
+        return loadTitleMetadata(identifiers, metadata)
+            .then(function () {
+                if (!isEpisodePlayback(identifiers)) return Promise.resolve();
+                return loadEpisodeLocationMetadata(identifiers, metadata);
+            })
+            .then(function () {
+                if (!isEpisodePlayback(identifiers)) return Promise.resolve();
+                return loadEpisodeListMetadata(identifiers, metadata);
+            })
+            .then(function () {
+                return metadata;
+            });
+    }
+
+    function loadTitleMetadata(identifiers, metadata) {
+        if (!identifiers.titleId) return Promise.resolve();
+
+        if (!isEpisodePlayback(identifiers)) {
+            return getJson(discoverTitleUrl(identifiers.titleId)).then(function (json) {
+                var data = json && json.data;
+                if (data && data.title) metadata.title = cleanDisplayTitle(data.title);
+            }).catch(function (err) {
+                debuglog('Title metadata failed: ' + err.message);
+            });
+        }
+
+        return getJson(discoverTitleUrl(identifiers.titleId)).then(function (json) {
+            mergeEpisodeDetailMetadata(json && json.data, identifiers, metadata);
+        }).catch(function (err) {
+            debuglog('Episode title metadata failed: ' + err.message);
+        }).then(function () {
+            if (!identifiers.parentId) return;
+            return getJson(discoverTitleUrl(identifiers.parentId)).then(function (json) {
+                var data = json && json.data;
+                if (data && data.title) metadata.title = cleanDisplayTitle(data.title);
+            }).catch(function (err) {
+                debuglog('Parent title metadata failed: ' + err.message);
+            });
+        });
+    }
+
+    function mergeEpisodeDetailMetadata(data, identifiers, metadata) {
+        if (!data || typeof data !== 'object') return;
+
+        var parentId = data.parent_id || data.parentId || '';
+        if (parentId) identifiers.parentId = String(parentId);
+
+        var season = parseOptionalNumber(data.season);
+        var episodeNumber = parseOptionalNumber(data.episode);
+        var rawTitle = cleanDisplayTitle(data.title || data.title_canonical || '');
+        var parsedTitle = episodeMetadataFromTitle(rawTitle);
+
+        if (season) metadata.seasonNumber = season;
+        if (episodeNumber) metadata.episodeNumber = episodeNumber;
+        if (!metadata.episodeNumber && parsedTitle.episodeNumber) metadata.episodeNumber = parsedTitle.episodeNumber;
+        if (parsedTitle.episodeTitle) {
+            metadata.episodeTitle = parsedTitle.episodeTitle;
+        } else if (rawTitle) {
+            metadata.episodeTitle = rawTitle;
+        }
+        metadata.episodeConfirmed = !!formatSeasonEpisodeTag(metadata.seasonNumber, metadata.episodeNumber);
+    }
+
+    function isEpisodePlayback(identifiers) {
+        return identifiers && (identifiers.type === 'episode' || !!identifiers.parentId);
+    }
+
+    function loadEpisodeLocationMetadata(identifiers, metadata) {
+        if (!identifiers.titleId) return Promise.resolve();
+        return getJson(discoverEpisodeLocationUrl(identifiers.titleId)).then(function (json) {
+            var targetSeason = json && json.data && json.data.location && json.data.location.targetSeason;
+            var season = targetSeason && parseOptionalNumber(targetSeason.season);
+            if (season) metadata.seasonNumber = season;
+        }).catch(function (err) {
+            debuglog('Episode location metadata failed: ' + err.message);
+        });
+    }
+
+    function loadEpisodeListMetadata(identifiers, metadata) {
+        if (!identifiers.parentId || !identifiers.titleId) return Promise.resolve();
+
+        var urls = [];
+        if (metadata.seasonNumber) urls.push(discoverEpisodesUrl(identifiers.parentId, metadata.seasonNumber));
+        urls.push(discoverEpisodesUrl(identifiers.parentId, null));
+
+        return runSequential(urls, function (url) {
+            if (metadata.episodeNumber && metadata.seasonNumber && metadata.episodeTitle) return Promise.resolve();
+            return getJson(url).then(function (json) {
+                var episode = findEpisodeObject(json, identifiers.titleId);
+                if (!episode) return;
+                mergeEpisodeObjectMetadata(episode, metadata);
+            }).catch(function (err) {
+                debuglog('Episode list metadata failed: ' + err.message);
+            });
+        });
+    }
+
+    function mergeEpisodeObjectMetadata(episode, metadata) {
+        if (!episode || typeof episode !== 'object') return;
+        var season = parseOptionalNumber(episode.season);
+        var episodeNumber = parseOptionalNumber(episode.episode);
+        var parsedTitle = episodeMetadataFromTitle(episode.title || episode.title_canonical || '');
+        if (season) metadata.seasonNumber = season;
+        if (episodeNumber) metadata.episodeNumber = episodeNumber;
+        if (parsedTitle.episodeNumber && !metadata.episodeNumber) metadata.episodeNumber = parsedTitle.episodeNumber;
+        if (parsedTitle.episodeTitle) metadata.episodeTitle = parsedTitle.episodeTitle;
+        metadata.episodeConfirmed = !!formatSeasonEpisodeTag(metadata.seasonNumber, metadata.episodeNumber);
+    }
+
+    function findEpisodeObject(value, episodeId) {
+        if (!value || !episodeId) return null;
+        if (Array.isArray(value)) {
+            for (var i = 0; i < value.length; i++) {
+                var found = findEpisodeObject(value[i], episodeId);
+                if (found) return found;
+            }
+            return null;
+        }
+        if (typeof value !== 'object') return null;
+        if (String(value.id || value.asset_id || '') === episodeId) return value;
+        var keys = Object.keys(value);
+        for (var j = 0; j < keys.length; j++) {
+            var child = value[keys[j]];
+            if (child && typeof child === 'object') {
+                var nested = findEpisodeObject(child, episodeId);
+                if (nested) return nested;
+            }
+        }
+        return null;
+    }
+
+    function getJson(url) {
+        return getText(url, 0, {
+            'accept': 'application/json,text/plain,*/*',
+            'x-platform': 'WEBCLIENT'
+        }).then(function (text) {
+            return JSON.parse(text || '{}');
+        });
+    }
+
+    function discoverTitleUrl(titleId) {
+        return 'https://www.coupangplay.com/api-discover/v1/discover/titles/' + encodeURIComponent(titleId) +
+            '?platform=WEBCLIENT&locale=ko&filterRestrictedContent=false';
+    }
+
+    function discoverEpisodeLocationUrl(episodeId) {
+        return 'https://www.coupangplay.com/api-discover/v1/discover/titles/episodes/' + encodeURIComponent(episodeId) +
+            '/location?episodeId=' + encodeURIComponent(episodeId) + '&locale=ko&platform=WEBCLIENT';
+    }
+
+    function discoverEpisodesUrl(parentId, seasonNumber) {
+        var query = 'titleId=' + encodeURIComponent(parentId) +
+            '&locale=ko&perPage=100&page=1&includeChannelContents=true&platform=WEBCLIENT&sort=true';
+        if (seasonNumber) query += '&seasonRange=' + encodeURIComponent(seasonNumber + '~' + seasonNumber);
+        return 'https://www.coupangplay.com/api-discover/v2/discover/titles/' + encodeURIComponent(parentId) + '/episodes?' + query;
+    }
+
+    function playbackIdentifiers() {
+        var params = new URLSearchParams(location.search || '');
+        var pathMatch = location.pathname.match(/\/play\/([^/]+)\/([^/?#]+)/i);
+        return {
+            titleId: params.get('titleId') || (pathMatch ? pathMatch[1] : ''),
+            parentId: params.get('parentId') || '',
+            type: (params.get('type') || (pathMatch ? pathMatch[2] : '')).toLowerCase()
+        };
+    }
+
+    function episodeMetadataFromText(text) {
+        var metadata = seasonEpisodeNumbers(text);
+        var lines = String(text || '').split(/\n+/);
+        for (var i = 0; i < lines.length; i++) {
+            if (!isUsableMetadataLine(lines[i])) continue;
+            var parsed = episodeMetadataFromTitle(lines[i]);
+            if (parsed.title || parsed.episodeTitle || parsed.episodeNumber) {
+                return {
+                    title: parsed.title,
+                    episodeTitle: parsed.episodeTitle,
+                    seasonNumber: parsed.seasonNumber || metadata.seasonNumber,
+                    episodeNumber: parsed.episodeNumber || metadata.episodeNumber
+                };
+            }
+        }
+        return metadata;
+    }
+
+    function episodeMetadataFromTitle(title) {
+        var text = cleanDisplayTitle(title);
+        var match;
+        if (!text) return {};
+        if (!isUsableMetadataLine(text)) return {};
+
+        match = text.match(/^(.+?)\s+S(?:eason)?\s*(\d{1,3})\s*E(?:pisode)?\s*(\d{1,3})\s*[-:.)]?\s*(.*)$/i) ||
+            text.match(/^(.+?)\s+\bS(\d{1,3})E(\d{1,3})\b\s*[-:.)]?\s*(.*)$/i);
+        if (match) {
+            return {
+                title: cleanDisplayTitle(match[1]),
+                seasonNumber: parseOptionalNumber(match[2]),
+                episodeNumber: parseOptionalNumber(match[3]),
+                episodeTitle: cleanDisplayTitle(match[4])
+            };
+        }
+
+        match = text.match(/^(.+?)\s*[:：]\s*(?:시즌\s*(\d{1,3})\s*)?(\d{1,3})\s*[.\-_:)]\s*(.+)$/i);
+        if (match) {
+            return {
+                title: cleanDisplayTitle(match[1]),
+                seasonNumber: parseOptionalNumber(match[2]),
+                episodeNumber: parseOptionalNumber(match[3]),
+                episodeTitle: cleanDisplayTitle(match[4])
+            };
+        }
+
+        match = text.match(/^(\d{1,3})\s*[.\-_:)]\s*(.+)$/i);
+        if (match) {
+            return {
+                episodeNumber: parseOptionalNumber(match[1]),
+                episodeTitle: cleanDisplayTitle(match[2])
+            };
+        }
+
+        return {};
+    }
+
+    function displayTitle() {
+        var candidates = [];
+        var selectors = [
+            '[class*="title" i]',
+            '[data-testid*="title" i]',
+            'h1',
+            'h2'
+        ];
+        selectors.forEach(function (selector) {
+            Array.prototype.forEach.call(document.querySelectorAll(selector), function (node) {
+                var text = cleanDisplayTitle(node.innerText || node.textContent || '');
+                if (isUsableTitle(text)) candidates.push(text);
+            });
+        });
+
+        if (document.body) {
+            document.body.innerText.split(/\n+/).forEach(function (line) {
+                var text = cleanDisplayTitle(line);
+                if (isUsableTitle(text)) candidates.push(text);
+            });
+        }
+
+        return candidates[0] || titleFromUrl() || 'CoupangPlay';
+    }
+
+    function isUsableTitle(text) {
+        if (!text || text.length < 2 || text.length > 80) return false;
+        if (/쿠팡플레이|coupang play subtitle downloader|subtitle downloader|콘텐츠 제공사|등급분류번호|시청할 수 있습니다|자막|음성|현재 시간|다음화|이전화|duration|loaded|stream type/i.test(text)) return false;
+        if (isPlaybackTimeText(text)) return false;
+        return true;
+    }
+
+    function isUsableMetadataLine(text) {
+        text = cleanDisplayTitle(text);
+        if (!text || text.length > 100) return false;
+        if (isPlaybackTimeText(text)) return false;
+        if (/콘텐츠 제공사|등급분류번호|시청할 수 있습니다|자막|음성|현재 시간|duration|loaded|stream type/i.test(text)) return false;
+        return true;
+    }
+
+    function isPlaybackTimeText(text) {
+        return /^\d{1,2}:\d{2}(?::\d{2})?\s*\/\s*\d{1,2}:\d{2}(?::\d{2})?/.test(cleanDisplayTitle(text));
+    }
+
+    function titleFromUrl() {
+        var match = location.pathname.match(/\/play\/([^/]+)/i);
+        return match ? match[1] : '';
+    }
+
+    function cleanDisplayTitle(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function seasonEpisodeTag(text) {
+        var numbers = seasonEpisodeNumbers(text);
+        return formatSeasonEpisodeTag(numbers.seasonNumber, numbers.episodeNumber);
+    }
+
+    function seasonEpisodeNumbers(text) {
+        text = String(text || '');
+        var match = text.match(/시즌\s*(\d{1,3}).{0,20}?(\d{1,3})\s*(?:화|회|episode|에피소드)/i) ||
+            text.match(/S(?:eason)?\s*(\d{1,3}).{0,20}?E(?:pisode)?\s*(\d{1,3})/i) ||
+            text.match(/\bS(\d{1,3})E(\d{1,3})\b/i);
+        if (match) {
+            return {
+                seasonNumber: parseOptionalNumber(match[1]),
+                episodeNumber: parseOptionalNumber(match[2])
+            };
+        }
+
+        match = text.match(/(?:에피소드|episode)\s*(\d{1,3})/i) ||
+            text.match(/(\d{1,3})\s*(?:화|회)\b/i);
+        return {
+            seasonNumber: null,
+            episodeNumber: match ? parseOptionalNumber(match[1]) : null
+        };
+    }
+
+    function formatSeasonEpisodeTag(seasonNumber, episodeNumber) {
+        seasonNumber = parseOptionalNumber(seasonNumber);
+        episodeNumber = parseOptionalNumber(episodeNumber);
+        if (seasonNumber && episodeNumber) return 'S' + pad2(seasonNumber) + 'E' + pad2(episodeNumber);
+        if (episodeNumber) return 'E' + pad2(episodeNumber);
+        return '';
+    }
+
+    function parseOptionalNumber(value) {
+        var number = parseInt(value, 10);
+        return Number.isFinite(number) && number > 0 ? number : null;
+    }
+
+    function safeBaseFilename() {
+        var metadata = mediaMetadataFromDom();
+        mergeMediaMetadata(metadata, 1);
+        var title = state.mediaTitle || metadata.title || displayTitle();
+        var episode = state.episodeConfirmed ? formatSeasonEpisodeTag(state.seasonNumber, state.episodeNumber) : '';
+        var episodeTitle = state.episodeConfirmed ? state.episodeTitle : '';
+        return sanitizeFilename(uniqueFilenameParts([title, episode, episodeTitle]).join('.')) || 'CoupangPlay.Subtitle';
+    }
+
+    function uniqueFilenameParts(parts) {
+        var seen = {};
+        var output = [];
+        parts.forEach(function (part) {
+            part = cleanDisplayTitle(part);
+            if (!part) return;
+            var key = part.toLowerCase();
+            if (seen[key]) return;
+            seen[key] = true;
+            output.push(part);
+        });
+        return output;
+    }
+
+    function safeTrackName(track) {
+        var language = trackLanguage(track) || 'subtitle';
+        var parts = [language];
+        if (isForcedTrack(track)) parts.push('forced');
+        if (isCcTrack(track)) parts.push('cc');
+        var label = normalizeTrackLabel(track.NAME);
+        if (label && label !== language) parts.push(label);
+        return sanitizeFilename(parts.join('.'));
+    }
+
+    function sanitizeFilename(value) {
+        return String(value || '')
+            .replace(/[\\/:*?"<>|]+/g, '_')
+            .replace(/\s+/g, ' ')
+            .replace(/^\.+|\.+$/g, '')
+            .trim()
+            .slice(0, 180);
+    }
+
+    function normalizeUrl(url) {
+        if (!url) return '';
+        try {
+            return new URL(String(url), location.href).href;
+        } catch (err) {
+            return String(url || '');
+        }
+    }
+
+    function absoluteUrl(url, baseUrl) {
+        if (!url) return '';
+        try {
+            return new URL(url, baseUrl || location.href).href;
+        } catch (err) {
+            return url;
+        }
+    }
+
+    function debuglog(message) {
+        if (!debug) return;
+        try { console.log(LOG_PREFIX + ' ' + message); } catch (err) {}
+    }
+})();
