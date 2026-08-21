@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.1
+// @version    1.0.2
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -62,6 +62,7 @@ class ProgressBar {
 }
 
 const STOP_THE_DOWNLOAD = 'NETFLIX_SUBTITLE_DOWNLOADER_STOP_THE_DOWNLOAD';
+const DOWNLOAD_TIMEOUT = 'NETFLIX_SUBTITLE_DOWNLOADER_DOWNLOAD_TIMEOUT';
 
 const WEBVTT = 'webvtt-lssdh-ios8';
 const DFXP = 'dfxp-ls-sdh';
@@ -471,11 +472,19 @@ const getTitleFromCache = () => {
   return [safeTitle(titleParts.join('.')), safeTitle(title.title)];
 };
 
+const isUsableFormatCandidate = candidate => {
+  if(!Array.isArray(candidate) || candidate.length < 2 || !Array.isArray(candidate[0]))
+    return false;
+  if(typeof candidate[1] !== 'string' || candidate[1].length === 0)
+    return false;
+  return candidate[0].some(url => typeof url === 'string' && url.length > 0);
+};
+
 const pickFormat = formats => {
   const preferred = (subFormat === DFXP ? ALL_FORMATS : ALL_FORMATS_prefer_vtt);
 
   for(let format of preferred) {
-    if(typeof formats[format] !== 'undefined')
+    if(typeof formats[format] !== 'undefined' && isUsableFormatCandidate(formats[format]))
       return formats[format];
   }
 };
@@ -508,34 +517,52 @@ const _download = async _zip => {
   let stop = false;
   for(const lang of filteredLangs) {
     const selectedFormat = pickFormat(subs[lang]);
-    if(!selectedFormat)
+    if(!selectedFormat) {
+      progress.increment();
       continue;
+    }
     const [cachedUrls, extension] = selectedFormat;
-    const urls = cachedUrls.slice();
+    const urls = cachedUrls.filter(url => typeof url === 'string' && url.length > 0);
     while(urls.length > 0) {
-      let url = popRandomElement(urls);
-      const resultPromise = fetch(url, {mode: "cors"});
+      const url = popRandomElement(urls);
       let result;
       try {
-        // Promise.any isn't supported in all browsers, use Promise.race instead
-        result = await Promise.race([resultPromise, progress.stop, asyncSleep(30, STOP_THE_DOWNLOAD)]);
+        result = await Promise.race([
+          fetch(url, {mode: "cors"}),
+          progress.stop,
+          asyncSleep(30, DOWNLOAD_TIMEOUT)
+        ]);
       }
-      catch(e) {
-        // the only promise that can be rejected is the one from fetch
-        // if that happens we want to stop the download anyway
-        result = STOP_THE_DOWNLOAD;
+      catch(error) {
+        console.warn('[Netflix Subtitle Downloader] subtitle fetch failed, trying another URL', url, error);
+        continue;
       }
       if(result === STOP_THE_DOWNLOAD) {
         stop = true;
         break;
       }
-      progress.increment();
-      const data = await result.text();
+      if(result === DOWNLOAD_TIMEOUT) {
+        console.warn('[Netflix Subtitle Downloader] subtitle fetch timed out, trying another URL', url);
+        continue;
+      }
+      if(!result || result.ok !== true) {
+        console.warn('[Netflix Subtitle Downloader] subtitle HTTP request failed, trying another URL', url, result && result.status);
+        continue;
+      }
+      let data;
+      try {
+        data = await result.text();
+      }
+      catch(error) {
+        console.warn('[Netflix Subtitle Downloader] subtitle response could not be read, trying another URL', url, error);
+        continue;
+      }
       if(data.length > 0) {
         downloaded.push({lang, data, extension});
         break;
       }
     }
+    progress.increment();
     if(stop)
       break;
   }
