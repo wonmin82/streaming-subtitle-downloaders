@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.2
+// @version    1.0.3
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -24,6 +24,7 @@
 
     var debug = location.hash === '#debug' || location.hash.indexOf('cpsd_debug') >= 0;
     var MAX_RETRIES = 5;
+    var MAX_DASH_TEMPLATE_SEGMENTS = 10000;
     var LOG_PREFIX = '[Coupang Play Subtitles DL]';
     var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     var MESSAGE_TYPE_TRACK = 'cpsd-subtitle-track';
@@ -1141,53 +1142,71 @@
     function parseDashManifest(url, text) {
         var doc;
         try {
-            doc = new DOMParser().parseFromString(text, 'application/xml');
+  doc = new DOMParser().parseFromString(text, 'application/xml');
         } catch (err) {
-            return;
+  return;
         }
         var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
+        var mpd = nodes.filter(function (node) { return localName(node) === 'MPD'; })[0] || null;
+        var mpdBaseText = mpd ? firstChildText(mpd, 'BaseURL') : '';
+        var mpdBaseUrl = dashResolveBaseUrl(url, mpdBaseText);
+
         nodes.filter(function (node) {
-            return localName(node) === 'AdaptationSet' && isTextAdaptation(node);
+  return localName(node) === 'AdaptationSet' && isTextAdaptation(node);
         }).forEach(function (adaptation) {
-            var language = adaptation.getAttribute('lang') || adaptation.getAttribute('xml:lang') || '';
-            var label = adaptation.getAttribute('label') || adaptation.getAttribute('contentType') || 'Subtitle';
-            var mimeType = adaptation.getAttribute('mimeType') || '';
-            var base = firstChildText(adaptation, 'BaseURL');
-            var representations = childElements(adaptation, 'Representation');
-            if (!representations.length) representations = [adaptation];
+  var period = findAncestorElement(adaptation, 'Period');
+  var periodDuration = dashPeriodDurationSeconds(period, doc);
+  var periodBaseText = period ? firstChildText(period, 'BaseURL') : '';
+  var periodBaseUrl = dashResolveBaseUrl(mpdBaseUrl, periodBaseText);
+  var adaptationBaseText = firstChildText(adaptation, 'BaseURL');
+  var adaptationBaseUrl = dashResolveBaseUrl(periodBaseUrl, adaptationBaseText);
+  var adaptationTemplate = firstChildElement(adaptation, 'SegmentTemplate');
+  var periodTemplate = period ? firstChildElement(period, 'SegmentTemplate') : null;
+  var language = adaptation.getAttribute('lang') || adaptation.getAttribute('xml:lang') || '';
+  var label = adaptation.getAttribute('label') || adaptation.getAttribute('contentType') || 'Subtitle';
+  var mimeType = adaptation.getAttribute('mimeType') || '';
+  var representations = childElements(adaptation, 'Representation');
+  if (!representations.length) representations = [adaptation];
 
-            representations.forEach(function (representation) {
-                var repBase = firstChildText(representation, 'BaseURL') || base;
-                var repLang = representation.getAttribute('lang') || representation.getAttribute('xml:lang') || language;
-                var repMime = representation.getAttribute('mimeType') || mimeType;
-                var repLabel = representation.getAttribute('label') || label;
-                if (repBase) {
-                    addTrack({
-                        NAME: buildTrackName(repLabel, repLang, 'NO', repMime, repBase),
-                        LANGUAGE: repLang || inferLanguage(repBase),
-                        FORCED: /forced/i.test(repLabel + ' ' + repBase) ? 'YES' : 'NO',
-                        TYPE: repMime,
-                        URI: absoluteUrl(repBase, url),
-                        source: 'dash',
-                        contentType: inferContentType(repBase)
-                    });
-                }
+  representations.forEach(function (representation) {
+      var representationBaseText = representation === adaptation ? '' : firstChildText(representation, 'BaseURL');
+      var representationBaseUrl = dashResolveBaseUrl(adaptationBaseUrl, representationBaseText);
+      var repLang = representation.getAttribute('lang') || representation.getAttribute('xml:lang') || language;
+      var repMime = representation.getAttribute('mimeType') || mimeType;
+      var repLabel = representation.getAttribute('label') || label;
+      var directBaseText = representationBaseText || adaptationBaseText;
+      if (directBaseText) {
+          addTrack({
+              NAME: buildTrackName(repLabel, repLang, 'NO', repMime, representationBaseUrl),
+              LANGUAGE: repLang || inferLanguage(representationBaseUrl),
+              FORCED: /forced/i.test(repLabel + ' ' + representationBaseUrl) ? 'YES' : 'NO',
+              TYPE: repMime,
+              URI: representationBaseUrl,
+              source: 'dash',
+              contentType: inferContentType(representationBaseUrl)
+          });
+      }
 
-                var template = firstChildElement(representation, 'SegmentTemplate') || firstChildElement(adaptation, 'SegmentTemplate');
-                var templateSegments = template ? dashTemplateSegments(template, representation, url) : [];
-                if (templateSegments.length) {
-                    addTrack({
-                        NAME: buildTrackName(repLabel, repLang, 'NO', repMime, templateSegments[0]),
-                        LANGUAGE: repLang || inferLanguage(templateSegments[0]),
-                        FORCED: /forced/i.test(repLabel + ' ' + templateSegments[0]) ? 'YES' : 'NO',
-                        TYPE: repMime,
-                        URI: url,
-                        source: 'dash-template',
-                        segments: templateSegments,
-                        contentType: inferContentType(templateSegments[0])
-                    });
-                }
-            });
+      var representationTemplate = representation === adaptation ? null : firstChildElement(representation, 'SegmentTemplate');
+      var templateLayers = [];
+      if (representationTemplate) templateLayers.push(representationTemplate);
+      if (adaptationTemplate) templateLayers.push(adaptationTemplate);
+      if (periodTemplate) templateLayers.push(periodTemplate);
+      var templateSegments = templateLayers.length ? dashTemplateSegments(templateLayers, representation, representationBaseUrl, periodDuration) : [];
+      if (templateSegments.length) {
+          addTrack({
+              NAME: buildTrackName(repLabel, repLang, 'NO', repMime, templateSegments[0]),
+              LANGUAGE: repLang || inferLanguage(templateSegments[0]),
+              FORCED: /forced/i.test(repLabel + ' ' + templateSegments[0]) ? 'YES' : 'NO',
+              TYPE: repMime,
+              URI: url,
+              source: 'dash-template',
+              segments: templateSegments,
+              playlistDuration: periodDuration || null,
+              contentType: inferContentType(templateSegments[0])
+          });
+      }
+  });
         });
     }
 
@@ -1211,6 +1230,115 @@
         return node ? node.textContent.trim() : '';
     }
 
+    function findAncestorElement(node, name) {
+        var current = node && (node.parentElement || node.parentNode);
+        while (current) {
+  if (localName(current) === name) return current;
+  current = current.parentElement || current.parentNode;
+        }
+        return null;
+    }
+
+    function dashResolveBaseUrl(parentUrl, childBase) {
+        return childBase ? absoluteUrl(childBase, parentUrl) : parentUrl;
+    }
+
+    function parseDashDurationSeconds(value) {
+        var match = String(value || '').trim().match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
+        if (!match) return null;
+        return (Number(match[1]) || 0) * 86400 +
+  (Number(match[2]) || 0) * 3600 +
+  (Number(match[3]) || 0) * 60 +
+  (Number(match[4]) || 0);
+    }
+
+    function dashPeriodStartSeconds(period, periods, index) {
+        if (!period) return null;
+        var explicit = parseDashDurationSeconds(period.getAttribute('start'));
+        if (explicit != null) return explicit;
+        var position = 0;
+        for (var i = 0; i < index; i++) {
+  var priorStart = parseDashDurationSeconds(periods[i].getAttribute('start'));
+  if (priorStart != null) position = priorStart;
+  var priorDuration = parseDashDurationSeconds(periods[i].getAttribute('duration'));
+  if (priorDuration == null) return null;
+  position += priorDuration;
+        }
+        return position;
+    }
+
+    function dashPeriodDurationSeconds(period, doc) {
+        if (!period) return null;
+        var direct = parseDashDurationSeconds(period.getAttribute('duration'));
+        if (direct != null) return direct;
+
+        var mpd = findAncestorElement(period, 'MPD');
+        if (!mpd && doc) {
+  var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
+  mpd = nodes.filter(function (node) { return localName(node) === 'MPD'; })[0] || null;
+        }
+        if (!mpd) return null;
+
+        var periods = childElements(mpd, 'Period');
+        var index = periods.indexOf(period);
+        if (index < 0) return null;
+        var start = dashPeriodStartSeconds(period, periods, index);
+        if (start == null) return null;
+
+        if (index + 1 < periods.length) {
+  var nextStart = dashPeriodStartSeconds(periods[index + 1], periods, index + 1);
+  if (nextStart != null && nextStart > start) return nextStart - start;
+        }
+
+        var presentationDuration = parseDashDurationSeconds(mpd.getAttribute('mediaPresentationDuration'));
+        if (presentationDuration != null && presentationDuration > start) return presentationDuration - start;
+        return null;
+    }
+
+    function dashTemplateAttribute(templates, name, fallback) {
+        for (var i = 0; i < templates.length; i++) {
+  var template = templates[i];
+  if (!template || !template.getAttribute) continue;
+  var value = template.getAttribute(name);
+  if (value != null && value !== '') return value;
+        }
+        return fallback;
+    }
+
+    function dashTemplateTimeline(templates) {
+        for (var i = 0; i < templates.length; i++) {
+  var timeline = firstChildElement(templates[i], 'SegmentTimeline');
+  if (timeline) return timeline;
+        }
+        return null;
+    }
+
+    function dashReplaceNumericToken(text, token, value) {
+        var expression = new RegExp('\\$' + token + '(?:%0(\\d+)d)?\\$', 'g');
+        return text.replace(expression, function (_, widthText) {
+  var rendered = String(value);
+  var width = parseInt(widthText || '0', 10) || 0;
+  if (!width || rendered.length >= width) return rendered;
+  var sign = rendered.charAt(0) === '-' ? '-' : '';
+  var digits = sign ? rendered.slice(1) : rendered;
+  while (sign.length + digits.length < width) digits = '0' + digits;
+  return sign + digits;
+        });
+    }
+
+    function dashFormatTemplate(media, representationId, bandwidth, number, time) {
+        var marker = '\uE000';
+        var rendered = String(media || '').replace(/\$\$/g, marker);
+        if (/\$RepresentationID\$/.test(rendered) && !representationId) return '';
+        if (/\$Bandwidth(?:%0\d+d)?\$/.test(rendered) && (bandwidth == null || bandwidth === '')) return '';
+        rendered = rendered.replace(/\$RepresentationID\$/g, representationId || '');
+        rendered = dashReplaceNumericToken(rendered, 'Number', number);
+        rendered = dashReplaceNumericToken(rendered, 'Time', time);
+        rendered = dashReplaceNumericToken(rendered, 'Bandwidth', bandwidth || '');
+        if (/\$[A-Za-z][^$]*\$/.test(rendered)) return '';
+        return rendered.replace(new RegExp(marker, 'g'), '$');
+    }
+
     function isTextAdaptation(node) {
         var text = [
             node.getAttribute('contentType') || '',
@@ -1222,37 +1350,88 @@
         return /text|subtitle|caption|webvtt|vtt|ttml|dfxp|stpp/.test(text);
     }
 
-    function dashTemplateSegments(template, representation, baseUrl) {
-        var media = template.getAttribute('media') || '';
+    function dashTemplateSegments(templates, representation, baseUrl, periodDurationSeconds) {
+        templates = Array.isArray(templates) ? templates.filter(Boolean) : [templates].filter(Boolean);
+        if (!templates.length) return [];
+
+        var media = dashTemplateAttribute(templates, 'media', '');
         if (!media || !/\.(?:vtt|webvtt|ttml|dfxp|xml|srt)(?:[?#]|$)/i.test(media)) return [];
 
         var representationId = representation.getAttribute('id') || '';
-        var startNumber = parseInt(template.getAttribute('startNumber') || '1', 10);
-        var timeline = firstChildElement(template, 'SegmentTimeline');
-        var numbers = [];
+        var bandwidth = representation.getAttribute('bandwidth') || '';
+        var startNumber = parseInt(dashTemplateAttribute(templates, 'startNumber', '1'), 10);
+        if (!isFinite(startNumber)) startNumber = 1;
+        var timescale = Number(dashTemplateAttribute(templates, 'timescale', '1'));
+        if (!(timescale > 0)) timescale = 1;
+        var presentationTimeOffset = Number(dashTemplateAttribute(templates, 'presentationTimeOffset', '0')) || 0;
+        var eptDelta = Number(dashTemplateAttribute(templates, 'eptDelta', '0')) || 0;
+        var timeline = dashTemplateTimeline(templates);
+        var references = [];
 
         if (timeline) {
-            var current = 0;
-            childElements(timeline, 'S').forEach(function (s) {
-                var repeat = parseInt(s.getAttribute('r') || '0', 10);
-                var time = s.getAttribute('t');
-                if (time != null) current = parseInt(time, 10) || current;
-                for (var i = 0; i <= repeat; i++) {
-                    numbers.push(current);
-                    current += parseInt(s.getAttribute('d') || '0', 10) || 0;
-                }
-            });
+  var sNodes = childElements(timeline, 'S');
+  var currentTime = null;
+  var segmentNumber = startNumber;
+  for (var sIndex = 0; sIndex < sNodes.length; sIndex++) {
+      var s = sNodes[sIndex];
+      var duration = Number(s.getAttribute('d'));
+      if (!(duration > 0)) return [];
+
+      var explicitTime = s.getAttribute('t');
+      if (explicitTime != null && explicitTime !== '') {
+          currentTime = Number(explicitTime);
+          if (!isFinite(currentTime)) return [];
+      } else if (currentTime == null) {
+          currentTime = 0;
+      }
+
+      var repeat = parseInt(s.getAttribute('r') || '0', 10);
+      if (!isFinite(repeat)) repeat = 0;
+      var count = repeat >= 0 ? repeat + 1 : 0;
+
+      if (repeat < 0) {
+          if (sIndex + 1 < sNodes.length) {
+              var nextTimeText = sNodes[sIndex + 1].getAttribute('t');
+              if (nextTimeText == null || nextTimeText === '') return [];
+              var nextTime = Number(nextTimeText);
+              if (!isFinite(nextTime) || nextTime <= currentTime) return [];
+              count = Math.ceil((nextTime - currentTime) / duration);
+          } else if (periodDurationSeconds != null && isFinite(periodDurationSeconds) && periodDurationSeconds > 0) {
+              var periodEndTime = presentationTimeOffset + periodDurationSeconds * timescale;
+              count = Math.ceil((periodEndTime - currentTime) / duration);
+          } else {
+              return [];
+          }
+      }
+
+      if (count <= 0 || references.length + count > MAX_DASH_TEMPLATE_SEGMENTS) return [];
+      for (var repeatIndex = 0; repeatIndex < count; repeatIndex++) {
+          references.push({ number: segmentNumber++, time: currentTime });
+          currentTime += duration;
+      }
+  }
         } else {
-            for (var n = startNumber; n < startNumber + 600; n++) numbers.push(n);
+  var simpleDuration = Number(dashTemplateAttribute(templates, 'duration', '0'));
+  if (!(simpleDuration > 0) || periodDurationSeconds == null || !isFinite(periodDurationSeconds) || periodDurationSeconds <= 0) return [];
+  var describedUnits = periodDurationSeconds * timescale - eptDelta;
+  var simpleCount = Math.ceil(describedUnits / simpleDuration);
+  if (simpleCount <= 0 || simpleCount > MAX_DASH_TEMPLATE_SEGMENTS) return [];
+  for (var index = 0; index < simpleCount; index++) {
+      references.push({
+          number: startNumber + index,
+          time: presentationTimeOffset + index * simpleDuration
+      });
+  }
         }
 
-        return numbers.slice(0, 1200).map(function (value, index) {
-            var url = media
-                .replace(/\$RepresentationID\$/g, representationId)
-                .replace(/\$Number(?:%0\d+d)?\$/g, String(startNumber + index))
-                .replace(/\$Time\$/g, String(value));
-            return absoluteUrl(url, baseUrl);
-        });
+        var urls = [];
+        for (var i = 0; i < references.length; i++) {
+  var reference = references[i];
+  var rendered = dashFormatTemplate(media, representationId, bandwidth, reference.number, reference.time);
+  if (!rendered) return [];
+  urls.push(absoluteUrl(rendered, baseUrl));
+        }
+        return urls;
     }
 
     function parseAttrList(value) {
