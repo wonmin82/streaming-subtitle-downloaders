@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.2
+// @version    1.0.3
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -35,6 +35,11 @@
         installedHooks: false,
         observer: null,
         oldlocation: null,
+        playbackSessionSequence: 0,
+        playbackSessionId: '',
+        playbackSessionStartedAt: 0,
+        downloadOperationSequence: 0,
+        activeDownloadOperationId: 0,
         langs: [],
         langKeys: {},
         seenManifestUrls: {},
@@ -62,6 +67,8 @@
         state.initialized = true;
 
         installStyles();
+        installNavigationHooks();
+        tick();
         installNetworkHooks();
         startPerformanceObserver();
         scheduleUi();
@@ -75,6 +82,7 @@
         if (state.oldlocation !== playbackPath) {
             state.oldlocation = playbackPath;
             if (playbackPage) {
+                beginPlaybackSession();
                 state.status = 'Scanning playback...';
                 resetSubtitleTracks();
                 resetMediaMetadata();
@@ -82,6 +90,8 @@
                 scanPerformanceEntries(true);
                 state.lastPerformanceScanAt = Date.now();
                 updateUi();
+            } else {
+                invalidatePlaybackSession();
             }
         }
 
@@ -98,8 +108,60 @@
         }
     }
 
+    function installNavigationHooks() {
+        var historyObject;
+        try {
+            if (window.top !== window) return;
+            historyObject = targetWindow.history || window.history;
+        } catch (err) {
+            return;
+        }
+
+        ['pushState', 'replaceState'].forEach(function (method) {
+            try {
+                if (!historyObject || typeof historyObject[method] !== 'function') return;
+                var original = historyObject[method];
+                if (original.__dpsdSessionPatched) return;
+                var wrapped = function () {
+                    var result = original.apply(this, arguments);
+                    try { tick(); } catch (err) { debuglog('Navigation sync failed: ' + err.message); }
+                    return result;
+                };
+                wrapped.__dpsdSessionPatched = true;
+                historyObject[method] = wrapped;
+            } catch (err) {
+                debuglog('Could not patch history.' + method + ': ' + err.message);
+            }
+        });
+
+        try {
+            targetWindow.addEventListener('popstate', function () {
+                try { tick(); } catch (err) { debuglog('Navigation sync failed: ' + err.message); }
+            }, false);
+        } catch (err) {}
+    }
+
     function isPlaybackPage() {
         return /(?:^|\/)play(?:\/|$)/i.test(location.pathname || '');
+    }
+
+    function beginPlaybackSession() {
+        invalidateDownloadOperation();
+        var initialLookbackMs = state.playbackSessionSequence === 0 ? 5000 : 0;
+        state.playbackSessionSequence++;
+        state.playbackSessionId = 'disney:' + state.playbackSessionSequence + ':' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2);
+        state.playbackSessionStartedAt = Math.max(0, performanceNow() - initialLookbackMs);
+    }
+
+    function invalidatePlaybackSession() {
+        invalidateDownloadOperation();
+        if (!state.playbackSessionId) return;
+        state.playbackSessionId = '';
+        state.playbackSessionStartedAt = performanceNow();
+    }
+
+    function isPlaybackSessionCurrent(sessionId) {
+        return !!sessionId && sessionId === state.playbackSessionId;
     }
 
     function scheduleUi() {
@@ -304,7 +366,8 @@
             proto.open = function () {
                 if (arguments.length >= 2) {
                     this.__dpsdUrl = normalizeUrl(arguments[1]);
-                    recordResourceUrl(arguments[1], 'xhr');
+                    this.__dpsdSessionId = state.playbackSessionId;
+                    recordResourceUrl(arguments[1], 'xhr', this.__dpsdSessionId);
                 }
                 return originalOpen.apply(this, arguments);
             };
@@ -317,7 +380,7 @@
                         try {
                             if (!xhr.responseType || xhr.responseType === 'text') responseText = xhr.responseText;
                         } catch (err) {}
-                        inspectMetadataResponse(xhr.__dpsdUrl, responseText);
+                        inspectMetadataResponse(xhr.__dpsdUrl, responseText, xhr.__dpsdSessionId);
                     }, false);
                 }
                 return originalSend.apply(this, arguments);
@@ -335,9 +398,10 @@
             var originalFetch = win.fetch;
             win.fetch = function () {
                 var url = fetchInputUrl(arguments[0]);
-                recordResourceUrl(url, 'fetch');
+                var sessionId = state.playbackSessionId;
+                recordResourceUrl(url, 'fetch', sessionId);
                 return originalFetch.apply(this, arguments).then(function (response) {
-                    inspectFetchMetadataResponse(url || response.url, response);
+                    inspectFetchMetadataResponse(url || response.url, response, sessionId);
                     return response;
                 });
             };
@@ -362,6 +426,7 @@
             state.observer = new targetWindow.PerformanceObserver(function (list) {
                 if (!isPlaybackPage()) return;
                 list.getEntries().forEach(function (entry) {
+                    if (state.playbackSessionStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackSessionStartedAt) return;
                     if (isDisneyPlaybackResourceUrl(entry.name)) {
                         recordResourceUrl(entry.name, 'performance');
                     }
@@ -399,26 +464,30 @@
         return /\.m3u8(?:[?#]|$)/i.test(url || '');
     }
 
-    function recordResourceUrl(rawUrl, source) {
+    function recordResourceUrl(rawUrl, source, sessionId) {
+        sessionId = sessionId == null ? state.playbackSessionId : sessionId;
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         var url = normalizeUrl(rawUrl);
         if (!url || state.seenResourceUrls[url]) return;
         state.seenResourceUrls[url] = true;
 
         if (/\.m3u8(?:[?#]|$)/i.test(url)) {
-            queueManifest(url, source);
+            queueManifest(url, source, sessionId);
         }
     }
 
-    function inspectFetchMetadataResponse(url, response) {
+    function inspectFetchMetadataResponse(url, response, sessionId) {
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (!shouldInspectMetadataUrl(url) || !response || !response.clone) return;
         try {
             response.clone().text().then(function (text) {
-                inspectMetadataResponse(url, text);
+                inspectMetadataResponse(url, text, sessionId);
             }).catch(function () {});
         } catch (err) {}
     }
 
-    function inspectMetadataResponse(url, text) {
+    function inspectMetadataResponse(url, text, sessionId) {
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (!shouldInspectMetadataUrl(url) || typeof text !== 'string' || !text) return;
         if (text.length > 2000000) return;
 
@@ -526,7 +595,7 @@
         state.langKeys = {};
         state.seenManifestUrls = {};
         state.seenResourceUrls = {};
-        state.playbackScanStartedAt = performanceNow() - 5000;
+        state.playbackScanStartedAt = state.playbackSessionStartedAt || performanceNow();
         state.performanceEntryCount = 0;
         state.lastPerformanceScanAt = 0;
         state.selectedTrackKey = '';
@@ -541,22 +610,27 @@
         });
     }
 
-    function queueManifest(url, source) {
+    function queueManifest(url, source, sessionId) {
+        sessionId = sessionId == null ? state.playbackSessionId : sessionId;
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (state.seenManifestUrls[url]) return;
         state.seenManifestUrls[url] = true;
         state.status = 'Found manifest via ' + source + '. Reading tracks...';
         updateUi();
 
         getText(url).then(function (text) {
-            parseManifest(url, text || '');
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
             state.lastError = 'Could not read manifest: ' + err.message;
             updateUi();
         });
     }
 
-    function parseManifest(url, text) {
+    function parseManifest(url, text, sessionId) {
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (!text) return;
         if (text.indexOf('#EXTM3U') < 0 && text.indexOf('WEBVTT') < 0) return;
 
@@ -853,36 +927,76 @@
         return entries;
     }
 
+    function beginDownloadOperation() {
+        var operation = {
+            id: ++state.downloadOperationSequence,
+            sessionId: state.playbackSessionId,
+            baseFilename: safeBaseFilename()
+        };
+        state.activeDownloadOperationId = operation.id;
+        return operation;
+    }
+
+    function isDownloadOperationCurrent(operation) {
+        return !!operation && operation.id === state.activeDownloadOperationId && isPlaybackSessionCurrent(operation.sessionId);
+    }
+
+    function assertDownloadOperationCurrent(operation) {
+        if (!isDownloadOperationCurrent(operation)) throw new Error('Playback changed while downloading subtitles.');
+    }
+
+    function invalidateDownloadOperation() {
+        state.activeDownloadOperationId = 0;
+        state.wait = false;
+        state.downloadall = false;
+        state.zip = null;
+    }
+
+    function finishDownloadOperation(operation) {
+        if (!isDownloadOperationCurrent(operation)) return false;
+        state.activeDownloadOperationId = 0;
+        state.wait = false;
+        state.downloadall = false;
+        state.zip = null;
+        return true;
+    }
+
     function downloadAllTracks() {
         if (state.wait || state.langs.length === 0) return;
+        var operation = beginDownloadOperation();
+        var tracks = state.langs.slice();
+        var zip = new JSZip();
         state.downloadall = true;
-        state.zip = new JSZip();
+        state.zip = zip;
         state.wait = true;
         state.lastError = '';
         updateUi();
 
-        runSequential(state.langs, function (track) {
+        runSequential(tracks, function (track) {
+            assertDownloadOperationCurrent(operation);
             state.status = 'Downloading ' + track.NAME + '...';
             updateUi();
-            return buildSubtitleFile(track).then(function (file) {
-                state.zip.file(file.name, file.content);
+            return buildSubtitleFile(track, operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
+                zip.file(file.name, file.content);
             });
         }).then(function () {
-            return state.zip.generateAsync({ type: 'blob' });
+            assertDownloadOperationCurrent(operation);
+            return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
-            saveAs(blob, safeBaseFilename() + '.subtitles.zip');
+            assertDownloadOperationCurrent(operation);
+            saveAs(blob, operation.baseFilename + '.subtitles.zip');
             state.status = 'Downloaded all subtitles.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            state.downloadall = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
     function downloadTrack(track) {
         if (state.wait) return;
+        var operation = beginDownloadOperation();
         var tracks = tracksWithForcedCompanion(track);
         state.wait = true;
         state.lastError = '';
@@ -890,13 +1004,13 @@
         state.status = 'Downloading ' + downloadTrackNames(tracks) + '...';
         updateUi();
 
-        downloadTrackFiles(tracks, safeBaseFilename() + '.' + safeTrackName(track) + '.with-forced.zip').then(function () {
+        downloadTrackFiles(tracks, operation.baseFilename + '.' + safeTrackName(track) + '.with-forced.zip', operation).then(function () {
+            assertDownloadOperationCurrent(operation);
             state.status = 'Downloaded ' + downloadTrackNames(tracks) + '.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
@@ -923,6 +1037,7 @@
             return;
         }
 
+        var operation = beginDownloadOperation();
         var tracks = uniqueTracks(tracksWithForcedCompanion(english).concat(tracksWithForcedCompanion(korean)));
         var zip = new JSZip();
 
@@ -932,38 +1047,44 @@
         updateUi();
 
         Promise.all(tracks.map(function (track) {
-            return buildSubtitleFile(track).then(function (file) {
+            return buildSubtitleFile(track, operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
                 zip.file(file.name, file.content);
             });
         })).then(function () {
+            assertDownloadOperationCurrent(operation);
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
-            saveAs(blob, safeBaseFilename() + '.en-ko.subtitles.zip');
+            assertDownloadOperationCurrent(operation);
+            saveAs(blob, operation.baseFilename + '.en-ko.subtitles.zip');
             state.status = 'Downloaded English + Korean subtitles' + forcedSummary(tracks) + '.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
-    function downloadTrackFiles(tracks, zipName) {
+    function downloadTrackFiles(tracks, zipName, operation) {
         tracks = uniqueTracks(tracks);
         if (tracks.length === 1) {
-            return buildSubtitleFile(tracks[0]).then(function (file) {
+            return buildSubtitleFile(tracks[0], operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
                 saveAs(new Blob([file.content], { type: 'text/vtt;charset=utf-8' }), file.name);
             });
         }
 
         var zip = new JSZip();
         return Promise.all(tracks.map(function (track) {
-            return buildSubtitleFile(track).then(function (file) {
+            return buildSubtitleFile(track, operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
                 zip.file(file.name, file.content);
             });
         })).then(function () {
+            assertDownloadOperationCurrent(operation);
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
+            assertDownloadOperationCurrent(operation);
             saveAs(blob, zipName);
         });
     }
@@ -1025,12 +1146,14 @@
         }) ? ' + forced' : '';
     }
 
-    function buildSubtitleFile(track) {
+    function buildSubtitleFile(track, operation) {
+        assertDownloadOperationCurrent(operation);
         return getTrackVtt(track).then(function (vtt) {
+            assertDownloadOperationCurrent(operation);
             var output = normalizeVttForDownload(vtt);
             if (!output.trim()) throw new Error('No subtitle cues found.');
             return {
-                name: safeBaseFilename() + '.' + safeTrackName(track) + '.vtt',
+                name: operation.baseFilename + '.' + safeTrackName(track) + '.vtt',
                 content: output
             };
         });
