@@ -1,0 +1,26 @@
+name: Temporary TTML vertical text validation
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: validate/coupang-ttml-vertical-text
+          fetch-depth: 0
+      - run: python3 .github/tmp/patch-ttml-vertical-text.py
+      - run: |
+          node --check scripts/coupang-play-subtitles-downloader.user.js
+          git diff --check
+      - run: node .github/tmp/test-ttml-vertical-text.js
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/coupang-play-subtitles-downloader.user.js
+          git commit -m "Validate TTML vertical text implementation"
+          git push origin HEAD:validate/coupang-ttml-vertical-text
