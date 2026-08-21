@@ -1,0 +1,26 @@
+name: Regression tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check userscript syntax
+        run: |
+          for file in scripts/*.user.js; do
+            node --check "$file"
+          done
+      - name: Check whitespace
+        run: git diff --check HEAD^ HEAD
+      - name: Run regression suite
+        run: node tests/regression.js
