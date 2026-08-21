@@ -2936,11 +2936,20 @@
         return ttmlResolveFontSize(value, specificationDefault, context);
     }
 
+    function ttmlCellFontSizeReference(context) {
+        var cells = context && context.cellResolution;
+        if (!cells || cells[0] <= 0 || cells[1] <= 0) return null;
+        return [100 / cells[0], 100 / cells[1]];
+    }
+
     function ttmlRegionFontSize(regionStyle, doc, context) {
-        var initial = ttmlInitialFontSize(doc, context);
-        if (!initial) return null;
         var value = regionStyle && regionStyle.fontSize || '';
-        return value ? ttmlResolveFontSize(value, initial, context) : initial;
+        if (value) {
+            var cellReference = ttmlCellFontSizeReference(context);
+            if (!cellReference) return null;
+            return ttmlResolveFontSize(value, cellReference, context);
+        }
+        return ttmlInitialFontSize(doc, context);
     }
 
     function ttmlContentFontSize(node, doc, styleMap, regionFontSize, context, depth) {
