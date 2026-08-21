@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.3
+// @version    1.0.4
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1060,14 +1060,13 @@
 
     function looksLikeSubtitleText(text) {
         return /^\s*WEBVTT\b/i.test(text || '') ||
-            /^\s*<\?xml[\s\S]{0,200}<tt[\s>]/i.test(text || '') ||
-            /^\s*<tt[\s>]/i.test(text || '') ||
+            looksLikeTtmlText(text) ||
             looksLikeSrt(text || '');
     }
 
     function inferTextContentType(text) {
         if (/^\s*WEBVTT\b/i.test(text || '')) return 'vtt';
-        if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(text || '')) return 'ttml';
+        if (looksLikeTtmlText(text)) return 'ttml';
         if (looksLikeSrt(text || '')) return 'srt';
         return '';
     }
@@ -1920,7 +1919,7 @@
         return getText(track.URI).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) throw new Error('Playback changed while downloading subtitles.');
             if (/^\s*WEBVTT/i.test(text)) return text;
-            if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(text)) return ttmlToVtt(text);
+            if (looksLikeTtmlText(text)) return ttmlToVtt(text);
             if (looksLikeSrt(text)) return srtToVtt(text);
             if (/^\s*#EXTM3U/i.test(text)) {
                 var hlsSegments = extractHlsSegmentEntries(text, track.URI);
@@ -1976,7 +1975,7 @@
     function textToVtt(text, track) {
         var value = String(text || '').replace(/^\uFEFF/, '');
         if (/^\s*WEBVTT/i.test(value)) return value;
-        if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(value) || track.contentType === 'ttml') return ttmlToVtt(value);
+        if (looksLikeTtmlText(value) || track.contentType === 'ttml') return ttmlToVtt(value);
         if (looksLikeSrt(value) || track.contentType === 'srt') return srtToVtt(value);
         return value;
     }
@@ -2117,6 +2116,14 @@
             .trim() + '\n';
     }
 
+    function looksLikeTtmlText(text) {
+        var value = String(text || '').replace(/^\uFEFF/, '').trim();
+        if (!value) return false;
+        value = value.replace(/^<\?xml[\s\S]*?\?>\s*/i, '');
+        value = value.replace(/^(?:<!--[\s\S]*?-->\s*)+/, '');
+        return /^<(?:[A-Za-z_][\w.-]*:)?tt(?:\s|>)/i.test(value);
+    }
+
     function ttmlToVtt(ttml) {
         var doc;
         try {
@@ -2124,30 +2131,278 @@
         } catch (err) {
             return '';
         }
+        if (!doc || ttmlHasParserError(doc)) return '';
+
+        var context = ttmlTimingContext(doc);
+        if (!context) return '';
         var paragraphs = Array.prototype.slice.call(doc.getElementsByTagName('*')).filter(function (node) {
             return localName(node) === 'p';
         });
         var cues = [];
         paragraphs.forEach(function (p) {
-            var begin = p.getAttribute('begin') || p.getAttribute('start') || '';
-            var end = p.getAttribute('end') || '';
-            var dur = p.getAttribute('dur') || '';
-            var startSeconds = ttmlTimeSeconds(begin);
-            var endSeconds = end ? ttmlTimeSeconds(end) : startSeconds + ttmlTimeSeconds(dur);
-            var text = p.textContent.replace(/\s+/g, ' ').trim();
-            if (text && endSeconds > startSeconds) {
-                cues.push(formatVttTime(startSeconds) + ' --> ' + formatVttTime(endSeconds) + '\n' + text);
+            var timing = ttmlResolveTiming(p, context, 0);
+            var text = ttmlCueText(p);
+            if (timing && text.replace(/\s/g, '') && isFinite(timing.begin) && isFinite(timing.end) && timing.end > timing.begin) {
+                cues.push(formatVttTime(timing.begin) + ' --> ' + formatVttTime(timing.end) + '\n' + text);
             }
         });
         return 'WEBVTT\n\n' + cues.join('\n\n') + '\n';
     }
 
-    function ttmlTimeSeconds(value) {
+    function ttmlHasParserError(doc) {
+        return Array.prototype.slice.call(doc.getElementsByTagName('*')).some(function (node) {
+            return localName(node) === 'parsererror';
+        });
+    }
+
+    function ttmlAttribute(node, name) {
+        if (!node || !node.attributes) return '';
+        for (var i = 0; i < node.attributes.length; i++) {
+            var attribute = node.attributes[i];
+            if (localName(attribute) === name) return attribute.value || '';
+        }
+        return '';
+    }
+
+    function ttmlRootElement(doc) {
+        var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
+        for (var i = 0; i < nodes.length; i++) {
+            if (localName(nodes[i]) === 'tt') return nodes[i];
+        }
+        return null;
+    }
+
+    function ttmlTimingContext(doc) {
+        var root = ttmlRootElement(doc);
+        if (!root) return null;
+        var timeBase = String(ttmlAttribute(root, 'timeBase') || 'media').toLowerCase();
+        if (timeBase !== 'media') return null;
+
+        var frameRateText = ttmlAttribute(root, 'frameRate').trim();
+        var frameRateSpecified = frameRateText !== '';
+        var frameRate = 30;
+        if (frameRateSpecified) {
+            if (!/^\d+$/.test(frameRateText)) return null;
+            frameRate = Number(frameRateText);
+            if (!isFinite(frameRate) || frameRate <= 0) return null;
+        }
+
+        var multiplierText = ttmlAttribute(root, 'frameRateMultiplier').trim();
+        var multiplierNumerator = 1;
+        var multiplierDenominator = 1;
+        if (multiplierText) {
+            var multiplier = multiplierText.split(/\s+/);
+            if (multiplier.length !== 2 || !/^\d+$/.test(multiplier[0]) || !/^\d+$/.test(multiplier[1])) return null;
+            multiplierNumerator = Number(multiplier[0]);
+            multiplierDenominator = Number(multiplier[1]);
+            if (!isFinite(multiplierNumerator) || multiplierNumerator <= 0 ||
+                !isFinite(multiplierDenominator) || multiplierDenominator <= 0) return null;
+        }
+
+        var effectiveFrameRate = frameRate * multiplierNumerator / multiplierDenominator;
+        var subFrameRateText = ttmlAttribute(root, 'subFrameRate').trim();
+        var subFrameRate = 1;
+        if (subFrameRateText) {
+            if (!/^\d+$/.test(subFrameRateText)) return null;
+            subFrameRate = Number(subFrameRateText);
+            if (!isFinite(subFrameRate) || subFrameRate <= 0) return null;
+        }
+
+        var tickRateText = ttmlAttribute(root, 'tickRate').trim();
+        var tickRate;
+        if (tickRateText) {
+            if (!/^\d+$/.test(tickRateText)) return null;
+            tickRate = Number(tickRateText);
+            if (!isFinite(tickRate) || tickRate <= 0) return null;
+        } else {
+            tickRate = frameRateSpecified ? effectiveFrameRate * subFrameRate : 1;
+        }
+
+        return {
+            frameRate: frameRate,
+            effectiveFrameRate: effectiveFrameRate,
+            subFrameRate: subFrameRate,
+            tickRate: tickRate
+        };
+    }
+
+    function ttmlTimeContainer(node) {
+        return String(ttmlAttribute(node, 'timeContainer') || 'par').toLowerCase() === 'seq' ? 'seq' : 'par';
+    }
+
+    function ttmlIsTimedElement(node) {
+        return !!node && node.nodeType === 1 && /^(?:body|div|p|span)$/.test(localName(node));
+    }
+
+    function ttmlTimingParent(node) {
+        var current = node && node.parentNode;
+        while (current) {
+            if (ttmlIsTimedElement(current)) return current;
+            current = current.parentNode;
+        }
+        return null;
+    }
+
+    function ttmlPreviousTimedSibling(node) {
+        var parent = node && node.parentNode;
+        if (!parent || !parent.childNodes) return null;
+        var previous = null;
+        for (var i = 0; i < parent.childNodes.length; i++) {
+            var child = parent.childNodes[i];
+            if (child === node) return previous;
+            if (ttmlIsTimedElement(child)) previous = child;
+        }
+        return null;
+    }
+
+    function ttmlResolveTiming(node, context, depth) {
+        if (!node || depth > 64) return null;
+        var parent = ttmlTimingParent(node);
+        var parentTiming = parent ? ttmlResolveTiming(parent, context, depth + 1) : { begin: 0, end: Infinity };
+        if (!parentTiming) return null;
+
+        var referenceBegin = parentTiming.begin;
+        if (parent && ttmlTimeContainer(parent) === 'seq') {
+            var previous = ttmlPreviousTimedSibling(node);
+            if (previous) {
+                if (!ttmlAttribute(previous, 'end') && !ttmlAttribute(previous, 'dur')) return null;
+                var previousTiming = ttmlResolveTiming(previous, context, depth + 1);
+                if (!previousTiming || !isFinite(previousTiming.end)) return null;
+                referenceBegin = previousTiming.end;
+            }
+        }
+
+        var beginText = ttmlAttribute(node, 'begin') || ttmlAttribute(node, 'start');
+        var beginOffset = beginText ? ttmlTimeSeconds(beginText, context) : 0;
+        if (!isFinite(beginOffset) || beginOffset < 0) return null;
+        var begin = referenceBegin + beginOffset;
+        var end = parentTiming.end;
+
+        var endText = ttmlAttribute(node, 'end');
+        if (endText) {
+            var endOffset = ttmlTimeSeconds(endText, context);
+            if (!isFinite(endOffset) || endOffset < 0) return null;
+            end = Math.min(end, referenceBegin + endOffset);
+        }
+
+        var durText = ttmlAttribute(node, 'dur');
+        if (durText) {
+            var duration = ttmlTimeSeconds(durText, context);
+            if (!isFinite(duration) || duration < 0) return null;
+            end = Math.min(end, begin + duration);
+        }
+
+        if (isFinite(parentTiming.end)) end = Math.min(end, parentTiming.end);
+        if (end < begin) return null;
+        return { begin: begin, end: end };
+    }
+
+    function ttmlTimeSeconds(value, context) {
         value = String(value || '').trim();
-        if (!value) return 0;
-        if (/^\d+(?:\.\d+)?s$/.test(value)) return parseFloat(value);
-        if (/^\d+(?:\.\d+)?ms$/.test(value)) return parseFloat(value) / 1000;
-        return timestampSeconds(value);
+        if (!value) return NaN;
+        context = context || { frameRate: 30, effectiveFrameRate: 30, subFrameRate: 1, tickRate: 1 };
+
+        var frameClock = value.match(/^(\d+):([0-5]?\d):([0-5]?\d):(\d+)(?:\.(\d+))?$/);
+        if (frameClock) {
+            var frames = Number(frameClock[4]);
+            var subFrames = Number(frameClock[5] || '0');
+            if (frames >= context.frameRate || subFrames >= context.subFrameRate) return NaN;
+            return Number(frameClock[1]) * 3600 +
+                Number(frameClock[2]) * 60 +
+                Number(frameClock[3]) +
+                (frames + subFrames / context.subFrameRate) / context.effectiveFrameRate;
+        }
+
+        var clock = value.match(/^(\d+):([0-5]?\d):([0-5]?\d(?:\.\d+)?)$/);
+        if (clock) {
+            return Number(clock[1]) * 3600 + Number(clock[2]) * 60 + Number(clock[3]);
+        }
+
+        var offset = value.match(/^(\d+(?:\.\d+)?)(ms|h|m|s|f|t)$/i);
+        if (!offset) return NaN;
+        var amount = Number(offset[1]);
+        var unit = offset[2].toLowerCase();
+        if (unit === 'h') return amount * 3600;
+        if (unit === 'm') return amount * 60;
+        if (unit === 's') return amount;
+        if (unit === 'ms') return amount / 1000;
+        if (unit === 'f') return amount / context.effectiveFrameRate;
+        if (unit === 't') return amount / context.tickRate;
+        return NaN;
+    }
+
+    function ttmlSpaceMode(node, inherited) {
+        var value = String(ttmlAttribute(node, 'space') || '').toLowerCase();
+        if (value === 'preserve' || value === 'default') return value;
+        return inherited || 'default';
+    }
+
+    function ttmlCueText(node) {
+        var state = { text: '', pendingSpace: false };
+        ttmlAppendCueText(node, ttmlInheritedSpaceMode(node), state);
+        return state.text.replace(/\r\n|\r/g, '\n');
+    }
+
+    function ttmlInheritedSpaceMode(node) {
+        var ancestors = [];
+        var current = node;
+        while (current && current.nodeType === 1) {
+            ancestors.push(current);
+            current = current.parentNode;
+        }
+        var mode = 'default';
+        for (var i = ancestors.length - 1; i >= 0; i--) {
+            mode = ttmlSpaceMode(ancestors[i], mode);
+        }
+        return mode;
+    }
+
+    function ttmlAppendCueText(node, inheritedSpace, state) {
+        if (!node) return;
+        var mode = inheritedSpace;
+        if (node.nodeType === 1) {
+            mode = ttmlSpaceMode(node, inheritedSpace);
+            if (localName(node) === 'br') {
+                state.pendingSpace = false;
+                state.text += '\n';
+                return;
+            }
+        }
+
+        if (node.nodeType === 3 || node.nodeType === 4) {
+            var value = String(node.nodeValue || '').replace(/\r\n|\r/g, '\n');
+            if (mode === 'preserve') {
+                if (state.pendingSpace && state.text && value && !/^\s/.test(value) && !/\s$/.test(state.text)) {
+                    state.text += ' ';
+                }
+                state.pendingSpace = false;
+                state.text += value;
+            } else {
+                ttmlAppendDefaultText(value, state);
+            }
+            return;
+        }
+
+        var children = node.childNodes || [];
+        for (var i = 0; i < children.length; i++) {
+            ttmlAppendCueText(children[i], mode, state);
+        }
+    }
+
+    function ttmlAppendDefaultText(value, state) {
+        var normalized = String(value || '').replace(/\s+/g, ' ');
+        if (!normalized) return;
+        var leadingSpace = normalized.charAt(0) === ' ';
+        var trailingSpace = normalized.charAt(normalized.length - 1) === ' ';
+        var content = normalized.trim();
+
+        if (leadingSpace && state.text) state.pendingSpace = true;
+        if (content) {
+            if (state.pendingSpace && state.text && !/\s$/.test(state.text)) state.text += ' ';
+            state.pendingSpace = false;
+            state.text += content;
+        }
+        if (trailingSpace && state.text) state.pendingSpace = true;
     }
 
     function timestampSeconds(value) {
