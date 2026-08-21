@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.6
+// @version    1.0.7
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1941,7 +1941,8 @@
         var segments = track.hlsSegments && track.hlsSegments.length ? track.hlsSegments : (track.segments || []).map(function (url) {
             return { url: url, map: null };
         });
-        var merged = 'WEBVTT\n\n';
+        var merged = '';
+        var headerState = createHlsVttHeaderState();
         var timestampState = createHlsTimestampState();
         var mapCache = {};
         var seenBlocks = {};
@@ -1953,6 +1954,8 @@
                 getHlsInitText(segment.map, mapCache)
             ]).then(function (values) {
                 var converted = textToVtt(values[0], track);
+                collectHlsVttHeaderMetadata(values[1], headerState);
+                collectHlsVttHeaderMetadata(values[0], headerState);
                 var cleaned = normalizeHlsVttSegment(converted, timestampState, values[1]);
                 var uniqueBody = uniqueHlsVttBody(cleaned, seenBlocks);
                 if (uniqueBody) {
@@ -1968,7 +1971,7 @@
                 throw new Error('Failed to download ' + failedSegments.length + ' of ' + segments.length + ' subtitle segments; refusing to save an incomplete subtitle.');
             }
             if (cueCount === 0) throw new Error('No subtitle cues found in downloaded segments.');
-            return merged;
+            return buildMergedHlsVtt(headerState, merged);
         });
     }
 
@@ -1980,13 +1983,62 @@
         return value;
     }
 
-    function cleanVttSegment(text) {
-        return String(text || '')
+    function createHlsVttHeaderState() {
+        return { blocks: [], seen: {}, locked: false };
+    }
+
+    function hlsVttBlocks(text) {
+        var value = String(text || '')
             .replace(/^\uFEFF/, '')
             .replace(/\r\n|\r/g, '\n')
             .replace(/^WEBVTT[^\n]*(?:\n|$)/i, '')
             .replace(/^X-TIMESTAMP-MAP\s*=\s*[^\n]*(?:\n|$)/gmi, '')
-            .replace(/\n{3,}/g, '\n\n');
+            .trim();
+        return value ? value.split(/\n{2,}/) : [];
+    }
+
+    function isHlsVttCueBlock(block) {
+        return /(?:^|\n)[ \t]*(?:(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})[ \t]+-->/.test(block || '');
+    }
+
+    function isHlsVttHeaderMetadataBlock(block) {
+        return /^(?:STYLE|REGION)(?:[ \t]|\n|$)/i.test(String(block || '').trim());
+    }
+
+    function collectHlsVttHeaderMetadata(text, state) {
+        if (!state || state.locked) return;
+        var beforeFirstCue = true;
+        var sawCue = false;
+        hlsVttBlocks(text).forEach(function (block) {
+            block = block.trim();
+            if (!block) return;
+            if (isHlsVttCueBlock(block)) {
+                beforeFirstCue = false;
+                sawCue = true;
+            }
+            if (!beforeFirstCue || !isHlsVttHeaderMetadataBlock(block) || state.seen[block]) return;
+            state.seen[block] = true;
+            state.blocks.push(block);
+        });
+        if (sawCue) state.locked = true;
+    }
+
+    function buildMergedHlsVtt(headerState, body) {
+        var metadata = headerState && headerState.blocks.length ? headerState.blocks.join('\n\n') + '\n\n' : '';
+        return 'WEBVTT\n\n' + metadata + String(body || '');
+    }
+
+    function cleanVttSegment(text) {
+        var output = [];
+        var beforeFirstCue = true;
+        hlsVttBlocks(text).forEach(function (block) {
+            block = block.trim();
+            if (!block) return;
+            if (isHlsVttCueBlock(block)) beforeFirstCue = false;
+            if (beforeFirstCue && isHlsVttHeaderMetadataBlock(block)) return;
+            output.push(block);
+        });
+        return output.join('\n\n');
     }
 
     function createHlsTimestampState() {
