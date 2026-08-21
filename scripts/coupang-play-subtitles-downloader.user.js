@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.12
+// @version    1.0.13
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -27,6 +27,7 @@
     var RETRY_BASE_DELAY_MS = 250;
     var RETRY_MAX_DELAY_MS = 4000;
     var MAX_DASH_TEMPLATE_SEGMENTS = 10000;
+    var MAX_TTML_CUE_BOUNDARIES = 2048;
     var LOG_PREFIX = '[Coupang Play Subtitles DL]';
     var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     var MESSAGE_TYPE_TRACK = 'cpsd-subtitle-track';
@@ -2506,12 +2507,10 @@
         });
         var cues = [];
         paragraphs.forEach(function (p) {
-            var timing = ttmlResolveTiming(p, context, 0);
-            var text = ttmlCueText(p, doc);
-            var settings = ttmlCueSettings(p, doc);
-            if (timing && text.replace(/\s/g, '') && isFinite(timing.begin) && isFinite(timing.end) && timing.end > timing.begin) {
-                cues.push(formatVttTime(timing.begin) + ' --> ' + formatVttTime(timing.end) + (settings ? ' ' + settings : '') + '\n' + text);
-            }
+            var intervals = ttmlParagraphCueIntervals(p, doc, context);
+            intervals.forEach(function (cue) {
+                cues.push(formatVttTime(cue.begin) + ' --> ' + formatVttTime(cue.end) + (cue.settings ? ' ' + cue.settings : '') + '\n' + cue.text);
+            });
         });
         return 'WEBVTT\n\n' + cues.join('\n\n') + '\n';
     }
@@ -2904,9 +2903,60 @@
         return inherited || 'default';
     }
 
-    function ttmlCueText(node, doc) {
+    function ttmlParagraphCueIntervals(node, doc, timingContext) {
+        var timing = ttmlResolveTiming(node, timingContext, 0);
+        if (!timing || !isFinite(timing.begin) || !isFinite(timing.end) || timing.end <= timing.begin) return [];
+
+        var boundaries = [timing.begin, timing.end];
+        var descendants = node.getElementsByTagName ? node.getElementsByTagName('*') : [];
+        for (var i = 0; i < descendants.length; i++) {
+            var descendant = descendants[i];
+            if (!ttmlIsTimedElement(descendant)) continue;
+            var descendantTiming = ttmlResolveTiming(descendant, timingContext, 0);
+            if (!descendantTiming) return [];
+            if (isFinite(descendantTiming.begin) && descendantTiming.begin > timing.begin && descendantTiming.begin < timing.end) {
+                boundaries.push(descendantTiming.begin);
+            }
+            if (isFinite(descendantTiming.end) && descendantTiming.end > timing.begin && descendantTiming.end < timing.end) {
+                boundaries.push(descendantTiming.end);
+            }
+            if (boundaries.length > MAX_TTML_CUE_BOUNDARIES) return [];
+        }
+
+        boundaries.sort(function (a, b) { return a - b; });
+        var unique = [];
+        boundaries.forEach(function (value) {
+            if (!unique.length || Math.abs(value - unique[unique.length - 1]) > 0.000001) unique.push(value);
+        });
+
+        var settings = ttmlCueSettings(node, doc);
+        var styleMap = ttmlStyleMap(doc);
+        var intervals = [];
+        for (var j = 0; j + 1 < unique.length; j++) {
+            var begin = unique[j];
+            var end = unique[j + 1];
+            if (!(end > begin)) continue;
+            var sampleTime = begin + (end - begin) / 2;
+            var cueText = ttmlCueText(node, doc, timingContext, sampleTime, styleMap);
+            if (!cueText.replace(/\s/g, '')) continue;
+
+            var previous = intervals.length ? intervals[intervals.length - 1] : null;
+            if (previous && previous.text === cueText && previous.settings === settings && Math.abs(previous.end - begin) <= 0.000001) {
+                previous.end = end;
+            } else {
+                intervals.push({ begin: begin, end: end, text: cueText, settings: settings });
+            }
+        }
+        return intervals;
+    }
+
+    function ttmlCueText(node, doc, timingContext, activeTime, styleMap) {
         var state = { text: '', pendingSpace: false };
-        var context = { styleMap: ttmlStyleMap(doc) };
+        var context = {
+            styleMap: styleMap || ttmlStyleMap(doc),
+            timingContext: timingContext || null,
+            activeTime: typeof activeTime === 'number' && isFinite(activeTime) ? activeTime : null
+        };
         ttmlAppendCueText(node, ttmlInheritedSpaceMode(node), state, context);
         return state.text.replace(/\r\n|\r/g, '\n');
     }
@@ -2927,6 +2977,10 @@
 
     function ttmlAppendCueText(node, inheritedSpace, state, context) {
         if (!node) return;
+        if (node.nodeType === 1 && context && context.activeTime !== null && context.timingContext && ttmlIsTimedElement(node)) {
+            var activeTiming = ttmlResolveTiming(node, context.timingContext, 0);
+            if (!activeTiming || context.activeTime < activeTiming.begin || context.activeTime >= activeTiming.end) return;
+        }
         var mode = inheritedSpace;
         if (node.nodeType === 1) {
             mode = ttmlSpaceMode(node, inheritedSpace);
