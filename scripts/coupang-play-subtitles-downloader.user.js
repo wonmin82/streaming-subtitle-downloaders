@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.7
+// @version    1.0.8
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1693,6 +1693,8 @@
             return /^#EXTINF:/i.test(line.trim());
         });
         var currentMap = null;
+        var pendingByteRange = null;
+        var previousSegment = null;
 
         lines.forEach(function (rawLine) {
             var line = rawLine.trim();
@@ -1701,22 +1703,85 @@
             var mapMatch = line.match(/^#EXT-X-MAP:(.*)$/i);
             if (mapMatch) {
                 var attrs = parseAttrList(mapMatch[1]);
-                currentMap = attrs.URI ? {
-                    url: absoluteUrl(attrs.URI, baseUrl),
-                    byterange: attrs.BYTERANGE || ''
-                } : null;
+                if (!attrs.URI) {
+                    currentMap = null;
+                    return;
+                }
+                var mapUrl = absoluteUrl(attrs.URI, baseUrl);
+                var mapByteRange = null;
+                if (Object.prototype.hasOwnProperty.call(attrs, 'BYTERANGE')) {
+                    var parsedMapRange = parseHlsByteRange(attrs.BYTERANGE, true);
+                    if (!parsedMapRange) {
+                        throw new Error('Invalid EXT-X-MAP BYTERANGE; an explicit offset is required.');
+                    }
+                    mapByteRange = resolveHlsByteRange(parsedMapRange, mapUrl, null);
+                }
+                currentMap = {
+                    url: mapUrl,
+                    byterange: mapByteRange
+                };
+                return;
+            }
+
+            var byteRangeMatch = line.match(/^#EXT-X-BYTERANGE:(.*)$/i);
+            if (byteRangeMatch) {
+                if (pendingByteRange !== null) throw new Error('Duplicate EXT-X-BYTERANGE before a media segment URI.');
+                pendingByteRange = parseHlsByteRange(byteRangeMatch[1], false);
+                if (!pendingByteRange) throw new Error('Invalid EXT-X-BYTERANGE.');
                 return;
             }
 
             if (line.charAt(0) === '#') return;
             if (isMediaPlaylist || /\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#]|$)/i.test(line)) {
+                var segmentUrl = absoluteUrl(line, baseUrl);
+                var segmentByteRange = pendingByteRange === null ? null :
+                    resolveHlsByteRange(pendingByteRange, segmentUrl, previousSegment);
                 entries.push({
-                    url: absoluteUrl(line, baseUrl),
-                    map: currentMap
+                    url: segmentUrl,
+                    map: currentMap,
+                    byterange: segmentByteRange
                 });
+                previousSegment = {
+                    url: segmentUrl,
+                    byterange: segmentByteRange
+                };
+                pendingByteRange = null;
             }
         });
+
+        if (pendingByteRange !== null) throw new Error('EXT-X-BYTERANGE is missing its media segment URI.');
         return entries;
+    }
+
+    function parseHlsByteRange(value, requireOffset) {
+        var match = String(value || '').trim().match(/^(\d+)(?:@(\d+))?$/);
+        if (!match) return null;
+        var length = Number(match[1]);
+        var offset = match[2] == null ? null : Number(match[2]);
+        if (!isSafeHlsByteInteger(length) || length <= 0) return null;
+        if (offset !== null && !isSafeHlsByteInteger(offset)) return null;
+        if (requireOffset && offset === null) return null;
+        return { length: length, offset: offset };
+    }
+
+    function isSafeHlsByteInteger(value) {
+        return isFinite(value) && value >= 0 && Math.floor(value) === value && value <= 9007199254740991;
+    }
+
+    function resolveHlsByteRange(parsed, url, previousSegment) {
+        if (!parsed) throw new Error('Invalid HLS byte range.');
+        var offset = parsed.offset;
+        if (offset === null) {
+            if (!previousSegment || previousSegment.url !== url || !previousSegment.byterange) {
+                throw new Error('Implicit EXT-X-BYTERANGE offset requires a previous byte range on the same URI.');
+            }
+            offset = previousSegment.byterange.offset + previousSegment.byterange.length;
+        }
+        var end = offset + parsed.length - 1;
+        if (!isSafeHlsByteInteger(offset) || !isSafeHlsByteInteger(end)) {
+            throw new Error('HLS byte range exceeds the safe integer range.');
+        }
+        return { offset: offset, length: parsed.length };
     }
 
     function isShortPreviewTrack(track) {
@@ -1950,7 +2015,7 @@
         var cueCount = 0;
         return runSequential(segments, function (segment) {
             return Promise.all([
-                getText(segment.url),
+                getHlsResourceText(segment.url, segment.byterange),
                 getHlsInitText(segment.map, mapCache)
             ]).then(function (values) {
                 var converted = textToVtt(values[0], track);
@@ -2060,15 +2125,82 @@
         return cleanVttSegment(value);
     }
 
+    function getHlsResourceText(url, byterange, retryCount) {
+        if (!byterange) return getText(url);
+        retryCount = retryCount || 0;
+        var end = byterange.offset + byterange.length - 1;
+        var rangeHeader = 'bytes=' + byterange.offset + '-' + end;
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                headers: { Range: rangeHeader },
+                responseType: 'text',
+                onload: function (response) {
+                    if (response.status === 206) {
+                        if (!hlsContentRangeMatches(response.responseHeaders, byterange)) {
+                            reject(new Error('Missing or unexpected Content-Range for ' + url));
+                            return;
+                        }
+                        resolve(response.responseText || '');
+                        return;
+                    }
+                    if (hlsShouldRetryRangeStatus(response.status) && retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
+                        }, 200);
+                        return;
+                    }
+                    if (response.status === 200) {
+                        reject(new Error('Server ignored HLS byte range for ' + url));
+                        return;
+                    }
+                    reject(new Error('HTTP ' + response.status + ' for HLS byte range ' + url));
+                },
+                onerror: function () {
+                    if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
+                        }, 200);
+                    } else {
+                        reject(new Error('Network error for HLS byte range ' + url));
+                    }
+                },
+                ontimeout: function () {
+                    if (retryCount < MAX_RETRIES) {
+                        setTimeout(function () {
+                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
+                        }, 200);
+                    } else {
+                        reject(new Error('Timeout for HLS byte range ' + url));
+                    }
+                }
+            });
+        });
+    }
+
+    function hlsShouldRetryRangeStatus(status) {
+        return status === 408 || status === 429 || status >= 500;
+    }
+
+    function hlsContentRangeMatches(headers, byterange) {
+        var match = String(headers || '').match(/(?:^|\r?\n)\s*Content-Range\s*:\s*bytes\s+(\d+)-(\d+)\/(?:\d+|\*)/i);
+        if (!match) return false;
+        return Number(match[1]) === byterange.offset &&
+            Number(match[2]) === byterange.offset + byterange.length - 1;
+    }
+
+    function hlsByteRangeCacheKey(url, byterange) {
+        return url + '|' + (byterange ? byterange.offset + ':' + byterange.length : 'all');
+    }
+
     function getHlsInitText(mapInfo, cache) {
         if (!mapInfo || !mapInfo.url) return Promise.resolve('');
-        if (mapInfo.byterange) {
-            return Promise.reject(new Error('EXT-X-MAP BYTERANGE is not supported for ' + shortUrl(mapInfo.url)));
+        var key = hlsByteRangeCacheKey(mapInfo.url, mapInfo.byterange);
+        if (!cache[key]) {
+            cache[key] = getHlsResourceText(mapInfo.url, mapInfo.byterange);
         }
-        if (!cache[mapInfo.url]) {
-            cache[mapInfo.url] = getText(mapInfo.url);
-        }
-        return cache[mapInfo.url];
+        return cache[key];
     }
 
     function parseHlsTimestampMap(text) {
