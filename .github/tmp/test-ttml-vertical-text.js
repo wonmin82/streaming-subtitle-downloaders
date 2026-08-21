@@ -7,12 +7,14 @@ if (!source.includes("'textCombine', 'textOrientation'")) throw new Error('verti
 if (!source.includes("::cue(.ttml-combine) { text-combine-upright: all; }")) throw new Error('WebVTT combine STYLE missing');
 if (source.includes('text-orientation:')) throw new Error('unsupported WebVTT text-orientation must not be emitted');
 
+const docStart = source.indexOf('    function ttmlVttDocument(');
+const docEnd = source.indexOf('    function ttmlHasParserError(');
 const start = source.indexOf('    function ttmlAttribute(');
 const end = source.indexOf('    function timestampSeconds(');
-if (start < 0 || end <= start) throw new Error('could not isolate TTML helper block');
+if (docStart < 0 || docEnd <= docStart || start < 0 || end <= start) throw new Error('could not isolate TTML helper blocks');
 const ctx = { console, MAX_TTML_CUE_BOUNDARIES: 2048 };
 vm.createContext(ctx);
-vm.runInContext(`function localName(n){return String(n&&(n.localName||n.nodeName||n.name)||'').split(':').pop();}\n${source.slice(start,end)}`, ctx);
+vm.runInContext(`function localName(n){return String(n&&(n.localName||n.nodeName||n.name)||'').split(':').pop();}\n${source.slice(docStart,docEnd)}\n${source.slice(start,end)}`, ctx);
 
 function attr(name, value) { return { name, localName: name.split(':').pop(), value: String(value) }; }
 function el(name, attrs = {}, parent = null) {
@@ -43,7 +45,7 @@ const child = el('span', {}, span); textNode('A', child);
 const inherited = ctx.ttmlComputedPresentationStyle(child, styles);
 if (inherited.textCombine !== 'all' || inherited.textOrientation !== 'upright') throw new Error('vertical text style inheritance incorrect');
 
-const set = el('set', { begin:'1s', dur:'1s', 'tts:textCombine':'none', 'tts:textOrientation':'sideways' }, span);
+el('set', { begin:'1s', dur:'1s', 'tts:textCombine':'none', 'tts:textOrientation':'sideways' }, span);
 const timing = {frameRate:30,effectiveFrameRate:30,subFrameRate:1,tickRate:1};
 const at15 = ctx.ttmlComputedPresentationStyleAtTime(span, styles, timing, 1.5);
 if (at15.textCombine !== 'none' || at15.textOrientation !== 'sideways') throw new Error('timed vertical text style override incorrect');
