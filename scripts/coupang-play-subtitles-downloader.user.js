@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.15
+// @version    1.0.16
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2828,6 +2828,86 @@
         return [first, second];
     }
 
+    function ttmlRootPixelExtent(doc) {
+        var root = ttmlRootElement(doc);
+        if (!root) return null;
+        var match = String(ttmlAttribute(root, 'extent') || '').trim().match(/^([+]?(?:\d+(?:\.\d+)?|\.\d+))px\s+([+]?(?:\d+(?:\.\d+)?|\.\d+))px$/i);
+        if (!match) return null;
+        var width = Number(match[1]);
+        var height = Number(match[2]);
+        if (!isFinite(width) || !isFinite(height) || width <= 0 || height <= 0) return null;
+        return [width, height];
+    }
+
+    function ttmlCellResolution(doc) {
+        var root = ttmlRootElement(doc);
+        if (!root) return null;
+        var value = String(ttmlAttribute(root, 'cellResolution') || '').trim();
+        if (!value) return [32, 15];
+        var match = value.match(/^(\d+)\s+(\d+)$/);
+        if (!match) return null;
+        var columns = Number(match[1]);
+        var rows = Number(match[2]);
+        if (!isFinite(columns) || !isFinite(rows) || columns <= 0 || rows <= 0) return null;
+        return [columns, rows];
+    }
+
+    function ttmlLayoutContext(doc) {
+        return {
+            rootPixelExtent: ttmlRootPixelExtent(doc),
+            cellResolution: ttmlCellResolution(doc)
+        };
+    }
+
+    function ttmlLengthToPercentage(value, axis, context) {
+        var match = String(value || '').trim().match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+))(px|c|rw|rh)$/i);
+        if (!match) {
+            var percent = String(value || '').trim().match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+))%$/);
+            if (!percent) return null;
+            var percentValue = Number(percent[1]);
+            return isFinite(percentValue) ? percentValue : null;
+        }
+
+        var amount = Number(match[1]);
+        var unit = match[2].toLowerCase();
+        if (!isFinite(amount)) return null;
+        context = context || {};
+
+        if (unit === 'c') {
+            var cells = context.cellResolution;
+            if (!cells) return null;
+            var divisor = axis === 'h' ? cells[0] : cells[1];
+            return divisor > 0 ? amount * 100 / divisor : null;
+        }
+
+        var root = context.rootPixelExtent;
+        if (unit === 'px') {
+            if (!root) return null;
+            var dimension = axis === 'h' ? root[0] : root[1];
+            return dimension > 0 ? amount * 100 / dimension : null;
+        }
+        if (unit === 'rw') {
+            if (axis === 'h') return amount;
+            if (!root || root[1] <= 0) return null;
+            return amount * root[0] / root[1];
+        }
+        if (unit === 'rh') {
+            if (axis === 'v') return amount;
+            if (!root || root[0] <= 0) return null;
+            return amount * root[1] / root[0];
+        }
+        return null;
+    }
+
+    function ttmlLengthPairToPercentage(value, context) {
+        var tokens = String(value || '').trim().split(/\s+/).filter(Boolean);
+        if (tokens.length !== 2) return null;
+        var first = ttmlLengthToPercentage(tokens[0], 'h', context);
+        var second = ttmlLengthToPercentage(tokens[1], 'v', context);
+        if (first === null || second === null) return null;
+        return [first, second];
+    }
+
     function ttmlLayoutPercentage(value) {
         var rounded = Math.round(Number(value) * 1000) / 1000;
         if (!isFinite(rounded)) return '';
@@ -2842,132 +2922,118 @@
         return percent / 100;
     }
 
-    function ttmlPositionKeywordFactor(value, axis) {
+    function ttmlPositionKeywordOffset(value, axis, extent) {
         value = String(value || '').toLowerCase();
-        if (value === 'center') return 0.5;
+        var remaining = 100 - extent;
+        if (value === 'center') return remaining / 2;
         if (axis === 'h') {
             if (value === 'left') return 0;
-            if (value === 'right') return 1;
+            if (value === 'right') return remaining;
         } else {
             if (value === 'top') return 0;
-            if (value === 'bottom') return 1;
+            if (value === 'bottom') return remaining;
         }
         return null;
     }
 
-    function ttmlPositionEdgeFactor(edge, offset, axis) {
-        var factor = ttmlPositionPercentFactor(offset);
-        if (factor === null) return null;
+    function ttmlPositionLengthOffset(value, axis, extent, context) {
+        var factor = ttmlPositionPercentFactor(value);
+        if (factor !== null) return factor * (100 - extent);
+        return ttmlLengthToPercentage(value, axis, context);
+    }
+
+    function ttmlPositionEdgeOffset(edge, value, axis, extent, context) {
+        var offset = ttmlPositionLengthOffset(value, axis, extent, context);
+        if (offset === null) return null;
         edge = String(edge || '').toLowerCase();
-        if ((axis === 'h' && edge === 'left') || (axis === 'v' && edge === 'top')) return factor;
-        if ((axis === 'h' && edge === 'right') || (axis === 'v' && edge === 'bottom')) return 1 - factor;
+        var remaining = 100 - extent;
+        if ((axis === 'h' && edge === 'left') || (axis === 'v' && edge === 'top')) return offset;
+        if ((axis === 'h' && edge === 'right') || (axis === 'v' && edge === 'bottom')) return remaining - offset;
         return null;
     }
 
-    function ttmlPositionFactors(value) {
+    function ttmlPositionOrigin(value, extentValue, context) {
+        var extent = ttmlLengthPairToPercentage(extentValue, context);
+        if (!extent) return null;
+        var width = extent[0];
+        var height = extent[1];
+        if (width <= 0 || height <= 0 || width > 100 || height > 100) return null;
+
         var tokens = String(value || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
         if (!tokens.length || tokens.length > 4) return null;
-
-        var hKeyword = function (token) { return ttmlPositionKeywordFactor(token, 'h'); };
-        var vKeyword = function (token) { return ttmlPositionKeywordFactor(token, 'v'); };
-        var percent = ttmlPositionPercentFactor;
         var x;
         var y;
+        var hKeyword = function (token) { return ttmlPositionKeywordOffset(token, 'h', width); };
+        var vKeyword = function (token) { return ttmlPositionKeywordOffset(token, 'v', height); };
+        var hLength = function (token) { return ttmlPositionLengthOffset(token, 'h', width, context); };
+        var vLength = function (token) { return ttmlPositionLengthOffset(token, 'v', height, context); };
 
         if (tokens.length === 1) {
-            var singlePercent = percent(tokens[0]);
-            if (singlePercent !== null) return [singlePercent, 0.5];
-            var singleH = hKeyword(tokens[0]);
-            var singleV = vKeyword(tokens[0]);
-            if (tokens[0] === 'center') return [0.5, 0.5];
-            if (singleH !== null) return [singleH, 0.5];
-            if (singleV !== null) return [0.5, singleV];
+            var singleH = hLength(tokens[0]);
+            if (singleH !== null) return [singleH, vKeyword('center')];
+            if (tokens[0] === 'top' || tokens[0] === 'bottom') return [hKeyword('center'), vKeyword(tokens[0])];
+            if (tokens[0] === 'center' || tokens[0] === 'left' || tokens[0] === 'right') return [hKeyword(tokens[0]), vKeyword('center')];
             return null;
         }
 
         if (tokens.length === 2) {
-            var p0 = percent(tokens[0]);
-            var p1 = percent(tokens[1]);
-            if (p0 !== null && p1 !== null) return [p0, p1];
+            var firstHLength = hLength(tokens[0]);
+            var secondVLength = vLength(tokens[1]);
+            if (firstHLength !== null && secondVLength !== null) return [firstHLength, secondVLength];
 
-            if (tokens[0] === 'center') {
-                if (tokens[1] === 'center') return [0.5, 0.5];
-                var secondV = vKeyword(tokens[1]);
-                if (tokens[1] === 'top' || tokens[1] === 'bottom') return [0.5, secondV];
-                var secondH = hKeyword(tokens[1]);
-                if (tokens[1] === 'left' || tokens[1] === 'right') return [secondH, 0.5];
-                if (p1 !== null) return [0.5, p1];
-            }
-
-            if (tokens[0] === 'left' || tokens[0] === 'right') {
-                x = hKeyword(tokens[0]);
-                if (tokens[1] === 'top' || tokens[1] === 'bottom' || tokens[1] === 'center') {
-                    return [x, vKeyword(tokens[1])];
-                }
-                if (p1 !== null) return [x, p1];
-            }
-
-            if (tokens[0] === 'top' || tokens[0] === 'bottom') {
+            if (tokens[0] === 'bottom' || tokens[0] === 'top') {
                 y = vKeyword(tokens[0]);
-                if (tokens[1] === 'left' || tokens[1] === 'right' || tokens[1] === 'center') {
-                    return [hKeyword(tokens[1]), y];
-                }
-                if (p1 !== null) return [p1, y];
+                x = hKeyword(tokens[1]);
+                return x === null || y === null ? null : [x, y];
             }
 
-            if (p0 !== null && (tokens[1] === 'top' || tokens[1] === 'bottom' || tokens[1] === 'center')) {
-                return [p0, vKeyword(tokens[1])];
+            x = hKeyword(tokens[0]);
+            if (x !== null) {
+                y = vKeyword(tokens[1]);
+                if (y === null) y = vLength(tokens[1]);
+                return y === null ? null : [x, y];
             }
-            return null;
+
+            x = hLength(tokens[0]);
+            y = vKeyword(tokens[1]);
+            return x === null || y === null ? null : [x, y];
         }
 
         if (tokens.length === 3) {
-            if ((tokens[0] === 'left' || tokens[0] === 'right') && percent(tokens[1]) !== null) {
-                x = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'h');
+            if (tokens[0] === 'left' || tokens[0] === 'right') {
+                x = ttmlPositionEdgeOffset(tokens[0], tokens[1], 'h', width, context);
                 y = vKeyword(tokens[2]);
                 if (x !== null && y !== null) return [x, y];
             }
-            if ((tokens[0] === 'top' || tokens[0] === 'bottom') && percent(tokens[1]) !== null) {
-                y = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'v');
+            if (tokens[0] === 'top' || tokens[0] === 'bottom') {
+                y = ttmlPositionEdgeOffset(tokens[0], tokens[1], 'v', height, context);
                 x = hKeyword(tokens[2]);
                 if (x !== null && y !== null) return [x, y];
             }
-            if ((tokens[1] === 'left' || tokens[1] === 'right') && percent(tokens[2]) !== null) {
+            if (tokens[1] === 'left' || tokens[1] === 'right') {
                 y = vKeyword(tokens[0]);
-                x = ttmlPositionEdgeFactor(tokens[1], tokens[2], 'h');
+                x = ttmlPositionEdgeOffset(tokens[1], tokens[2], 'h', width, context);
                 if (x !== null && y !== null) return [x, y];
             }
-            if ((tokens[1] === 'top' || tokens[1] === 'bottom') && percent(tokens[2]) !== null) {
+            if (tokens[1] === 'top' || tokens[1] === 'bottom') {
                 x = hKeyword(tokens[0]);
-                y = ttmlPositionEdgeFactor(tokens[1], tokens[2], 'v');
+                y = ttmlPositionEdgeOffset(tokens[1], tokens[2], 'v', height, context);
                 if (x !== null && y !== null) return [x, y];
             }
             return null;
         }
 
-        var firstHorizontalEdge = tokens[0] === 'left' || tokens[0] === 'right';
-        var firstVerticalEdge = tokens[0] === 'top' || tokens[0] === 'bottom';
-        if (firstHorizontalEdge && percent(tokens[1]) !== null && (tokens[2] === 'top' || tokens[2] === 'bottom') && percent(tokens[3]) !== null) {
-            x = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'h');
-            y = ttmlPositionEdgeFactor(tokens[2], tokens[3], 'v');
+        if ((tokens[0] === 'left' || tokens[0] === 'right') && (tokens[2] === 'top' || tokens[2] === 'bottom')) {
+            x = ttmlPositionEdgeOffset(tokens[0], tokens[1], 'h', width, context);
+            y = ttmlPositionEdgeOffset(tokens[2], tokens[3], 'v', height, context);
             return x === null || y === null ? null : [x, y];
         }
-        if (firstVerticalEdge && percent(tokens[1]) !== null && (tokens[2] === 'left' || tokens[2] === 'right') && percent(tokens[3]) !== null) {
-            y = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'v');
-            x = ttmlPositionEdgeFactor(tokens[2], tokens[3], 'h');
+        if ((tokens[0] === 'top' || tokens[0] === 'bottom') && (tokens[2] === 'left' || tokens[2] === 'right')) {
+            y = ttmlPositionEdgeOffset(tokens[0], tokens[1], 'v', height, context);
+            x = ttmlPositionEdgeOffset(tokens[2], tokens[3], 'h', width, context);
             return x === null || y === null ? null : [x, y];
         }
         return null;
-    }
-
-    function ttmlPositionOrigin(value, extentValue) {
-        var extent = ttmlPercentagePair(extentValue);
-        var factors = ttmlPositionFactors(value);
-        if (!extent || !factors) return null;
-        var width = extent[0];
-        var height = extent[1];
-        if (width <= 0 || height <= 0 || width > 100 || height > 100) return null;
-        return [factors[0] * (100 - width), factors[1] * (100 - height)];
     }
 
     function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) {
@@ -3012,11 +3078,12 @@
         if (!region || !supportedWriting) return settings.join(' ');
 
         var nodeStyle = ttmlSpecifiedPresentationStyle(node, styleMap);
+        var layoutContext = ttmlLayoutContext(doc);
         var extentValue = nodeStyle.extent || regionStyle.extent || '';
         var positionValue = nodeStyle.position || regionStyle.position || '';
         var originValue = nodeStyle.origin || regionStyle.origin || '';
-        var extent = ttmlPercentagePair(extentValue);
-        var origin = positionValue ? ttmlPositionOrigin(positionValue, extentValue) : ttmlPercentagePair(originValue);
+        var extent = ttmlLengthPairToPercentage(extentValue, layoutContext);
+        var origin = positionValue ? ttmlPositionOrigin(positionValue, extentValue, layoutContext) : ttmlLengthPairToPercentage(originValue, layoutContext);
         if (!origin || !extent) return settings.join(' ');
 
         var x = origin[0];
