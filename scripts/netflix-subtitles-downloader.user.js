@@ -138,6 +138,7 @@ let idOverrides = {};
 let subCache = {};
 let titleCache = {};
 let subCacheWaitGeneration = 0;
+let batchDownloadInProgress = false;
 
 let batch = null;
 try {
@@ -254,6 +255,18 @@ const popRandomElement = arr => {
   return arr.splice(arr.length * Math.random() << 0, 1)[0];
 };
 
+const handleSubsReady = menu => {
+  if(getSubsFromCache(true) === null || getXFromCache(titleCache, 'title', true) === null)
+    return false;
+  if(!menu || !menu.isConnected)
+    return false;
+
+  menu.style.display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
+  if(batch !== null && batch.length > 0)
+    downloadBatch(true);
+  return true;
+};
+
 const processSubInfo = async result => {
   const tracks = result.timedtexttracks || result.textTracks;
   if(!Array.isArray(tracks))
@@ -303,6 +316,8 @@ const processSubInfo = async result => {
     }
   }
   subCache[result.movieId] = subs;
+  if(handleSubsReady(document.querySelector('#subtitle-downloader-menu')))
+    subCacheWaitGeneration++;
 };
 
 const SUB_CACHE_WAIT_TIMEOUT_MS = 60000;
@@ -321,19 +336,10 @@ const checkSubsCache = async menu => {
   if(generation !== subCacheWaitGeneration || getVideoId() !== videoId)
     return;
 
-  if(getSubsFromCache(true) === null) {
-    console.warn('[Netflix Subtitle Downloader] subtitle cache wait timed out for video', videoId);
+  if(!handleSubsReady(menu)) {
+    if(Date.now() >= deadline)
+      console.warn('[Netflix Subtitle Downloader] subtitle cache wait timed out for video', videoId);
     return;
-  }
-
-  if(!menu || !menu.isConnected)
-    return;
-
-  // show menu if on watch page
-  menu.style.display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
-
-  if(batch !== null && batch.length > 0) {
-    downloadBatch(true);
   }
 };
 
@@ -574,8 +580,14 @@ const readAsBinaryString = blob => new Promise(resolve => {
 });
 
 const downloadBatch = async auto => {
-  const cache = await caches.open('NSD');
-  let zip, title, stop;
+  if(batchDownloadInProgress)
+    return;
+
+  batchDownloadInProgress = true;
+  let keepLockedForNavigation = false;
+  try {
+    const cache = await caches.open('NSD');
+    let zip, title, stop;
   if(auto === true) {
     try {
       const response = await cache.match('/subs.zip');
@@ -603,15 +615,21 @@ const downloadBatch = async auto => {
   const id = parseInt(getVideoId());
   batch = batch.filter(x => x !== id);
 
-  if(stop || batch.length == 0) {
-    await _save(zip, title);
-    await cleanBatch();
+    if(stop || batch.length == 0) {
+      await _save(zip, title);
+      await cleanBatch();
+    }
+    else {
+      setBatch(batch);
+      await cache.put('/subs.zip', new Response(await zip.generateAsync({type:'blob'})));
+      await asyncSleep(batchDelay);
+      keepLockedForNavigation = true;
+      window.location = window.location.origin + '/watch/' + batch[0];
+    }
   }
-  else {
-    setBatch(batch);
-    await cache.put('/subs.zip', new Response(await zip.generateAsync({type:'blob'})));
-    await asyncSleep(batchDelay);
-    window.location = window.location.origin + '/watch/' + batch[0];
+  finally {
+    if(!keepLockedForNavigation)
+      batchDownloadInProgress = false;
   }
 };
 
@@ -761,7 +779,7 @@ const injection = (ALL_FORMATS) => {
       if(!requestUrl.includes('/metadata?'))
         return responsePromise;
 
-      return responsePromise.then(response => {
+      responsePromise.then(response => {
         try {
           response.clone().json().then(data => {
             window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
@@ -772,8 +790,8 @@ const injection = (ALL_FORMATS) => {
         catch(error) {
           console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
         }
-        return response;
-      });
+      }).catch(() => {});
+      return responsePromise;
     };
   })(JSON.parse, JSON.stringify, XMLHttpRequest.prototype.open, window.fetch);
 }
