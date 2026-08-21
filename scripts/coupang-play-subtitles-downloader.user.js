@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.13
+// @version    1.0.14
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2837,12 +2837,24 @@
     function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) {
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
         var value = specified.textAlign || regionStyle.textAlign || '';
+        if (!value && ttmlWebVttVertical(writingMode)) value = 'start';
         return ttmlWebVttAlign(value, writingMode);
+    }
+
+    function ttmlWebVttVertical(writingMode) {
+        writingMode = String(writingMode || '').toLowerCase();
+        if (writingMode === 'tbrl' || writingMode === 'tb') return 'rl';
+        if (writingMode === 'tblr') return 'lr';
+        return '';
     }
 
     function ttmlWebVttAlign(value, writingMode) {
         value = String(value || '').toLowerCase();
         writingMode = String(writingMode || 'lrtb').toLowerCase();
+        if (ttmlWebVttVertical(writingMode)) {
+            if (/^(?:start|center|end|left|right)$/.test(value)) return value;
+            return '';
+        }
         if (/^(?:left|center|right)$/.test(value)) return value;
         if (value === 'start') return /^(?:rltb|rl)$/.test(writingMode) ? 'right' : 'left';
         if (value === 'end') return /^(?:rltb|rl)$/.test(writingMode) ? 'left' : 'right';
@@ -2855,11 +2867,13 @@
         var regionStyle = region ? ttmlRegionPresentationStyle(region, styleMap) : {};
         var writingMode = String(regionStyle.writingMode || 'lrtb').toLowerCase();
         var horizontalWriting = /^(?:lrtb|rltb|lr|rl)$/.test(writingMode);
+        var verticalWriting = ttmlWebVttVertical(writingMode);
+        var supportedWriting = horizontalWriting || !!verticalWriting;
         var settings = [];
-        var align = horizontalWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) : '';
+        if (verticalWriting) settings.push('vertical:' + verticalWriting);
+        var align = supportedWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) : '';
         if (align) settings.push('align:' + align);
-        if (!region) return settings.join(' ');
-        if (!horizontalWriting) return '';
+        if (!region || !supportedWriting) return settings.join(' ');
         if (regionStyle.position) return settings.join(' ');
 
         var origin = ttmlPercentagePair(regionStyle.origin);
@@ -2878,22 +2892,42 @@
         var displayAlign = String(nodeStyle.displayAlign || regionStyle.displayAlign || 'before').toLowerCase();
         var linePosition;
         var lineAlign;
+        if (horizontalWriting) {
+            if (displayAlign === 'before') {
+                linePosition = y;
+                lineAlign = 'start';
+            } else if (displayAlign === 'center') {
+                linePosition = y + height / 2;
+                lineAlign = 'center';
+            } else if (displayAlign === 'after') {
+                linePosition = y + height;
+                lineAlign = 'end';
+            } else {
+                return settings.join(' ');
+            }
+
+            settings.unshift('size:' + ttmlLayoutPercentage(width));
+            settings.unshift('position:' + ttmlLayoutPercentage(x) + ',line-left');
+            settings.unshift('line:' + ttmlLayoutPercentage(linePosition) + ',' + lineAlign);
+            return settings.join(' ');
+        }
+
         if (displayAlign === 'before') {
-            linePosition = y;
+            linePosition = verticalWriting === 'rl' ? x + width : x;
             lineAlign = 'start';
         } else if (displayAlign === 'center') {
-            linePosition = y + height / 2;
+            linePosition = x + width / 2;
             lineAlign = 'center';
         } else if (displayAlign === 'after') {
-            linePosition = y + height;
+            linePosition = verticalWriting === 'rl' ? x : x + width;
             lineAlign = 'end';
         } else {
             return settings.join(' ');
         }
 
-        settings.unshift('size:' + ttmlLayoutPercentage(width));
-        settings.unshift('position:' + ttmlLayoutPercentage(x) + ',line-left');
-        settings.unshift('line:' + ttmlLayoutPercentage(linePosition) + ',' + lineAlign);
+        settings.push('line:' + ttmlLayoutPercentage(linePosition) + ',' + lineAlign);
+        settings.push('position:' + ttmlLayoutPercentage(y) + ',line-left');
+        settings.push('size:' + ttmlLayoutPercentage(height));
         return settings.join(' ');
     }
 
