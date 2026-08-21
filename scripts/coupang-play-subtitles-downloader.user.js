@@ -1142,72 +1142,79 @@
     function parseDashManifest(url, text) {
         var doc;
         try {
-  doc = new DOMParser().parseFromString(text, 'application/xml');
+            doc = new DOMParser().parseFromString(text, 'application/xml');
         } catch (err) {
-  return;
+            return;
         }
         var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
-        var mpd = nodes.filter(function (node) { return localName(node) === 'MPD'; })[0] || null;
+        var mpd =
+            nodes.filter(function (node) {
+                return localName(node) === 'MPD';
+            })[0] || null;
         var mpdBaseText = mpd ? firstChildText(mpd, 'BaseURL') : '';
         var mpdBaseUrl = dashResolveBaseUrl(url, mpdBaseText);
 
-        nodes.filter(function (node) {
-  return localName(node) === 'AdaptationSet' && isTextAdaptation(node);
-        }).forEach(function (adaptation) {
-  var period = findAncestorElement(adaptation, 'Period');
-  var periodDuration = dashPeriodDurationSeconds(period, doc);
-  var periodBaseText = period ? firstChildText(period, 'BaseURL') : '';
-  var periodBaseUrl = dashResolveBaseUrl(mpdBaseUrl, periodBaseText);
-  var adaptationBaseText = firstChildText(adaptation, 'BaseURL');
-  var adaptationBaseUrl = dashResolveBaseUrl(periodBaseUrl, adaptationBaseText);
-  var adaptationTemplate = firstChildElement(adaptation, 'SegmentTemplate');
-  var periodTemplate = period ? firstChildElement(period, 'SegmentTemplate') : null;
-  var language = adaptation.getAttribute('lang') || adaptation.getAttribute('xml:lang') || '';
-  var label = adaptation.getAttribute('label') || adaptation.getAttribute('contentType') || 'Subtitle';
-  var mimeType = adaptation.getAttribute('mimeType') || '';
-  var representations = childElements(adaptation, 'Representation');
-  if (!representations.length) representations = [adaptation];
+        nodes
+            .filter(function (node) {
+                return localName(node) === 'AdaptationSet' && isTextAdaptation(node);
+            })
+            .forEach(function (adaptation) {
+                var period = findAncestorElement(adaptation, 'Period');
+                var periodDuration = dashPeriodDurationSeconds(period, doc);
+                var periodBaseText = period ? firstChildText(period, 'BaseURL') : '';
+                var periodBaseUrl = dashResolveBaseUrl(mpdBaseUrl, periodBaseText);
+                var adaptationBaseText = firstChildText(adaptation, 'BaseURL');
+                var adaptationBaseUrl = dashResolveBaseUrl(periodBaseUrl, adaptationBaseText);
+                var adaptationTemplate = firstChildElement(adaptation, 'SegmentTemplate');
+                var periodTemplate = period ? firstChildElement(period, 'SegmentTemplate') : null;
+                var language = adaptation.getAttribute('lang') || adaptation.getAttribute('xml:lang') || '';
+                var label = adaptation.getAttribute('label') || adaptation.getAttribute('contentType') || 'Subtitle';
+                var mimeType = adaptation.getAttribute('mimeType') || '';
+                var representations = childElements(adaptation, 'Representation');
+                if (!representations.length) representations = [adaptation];
 
-  representations.forEach(function (representation) {
-      var representationBaseText = representation === adaptation ? '' : firstChildText(representation, 'BaseURL');
-      var representationBaseUrl = dashResolveBaseUrl(adaptationBaseUrl, representationBaseText);
-      var repLang = representation.getAttribute('lang') || representation.getAttribute('xml:lang') || language;
-      var repMime = representation.getAttribute('mimeType') || mimeType;
-      var repLabel = representation.getAttribute('label') || label;
-      var directBaseText = representationBaseText || adaptationBaseText;
-      if (directBaseText) {
-          addTrack({
-              NAME: buildTrackName(repLabel, repLang, 'NO', repMime, representationBaseUrl),
-              LANGUAGE: repLang || inferLanguage(representationBaseUrl),
-              FORCED: /forced/i.test(repLabel + ' ' + representationBaseUrl) ? 'YES' : 'NO',
-              TYPE: repMime,
-              URI: representationBaseUrl,
-              source: 'dash',
-              contentType: inferContentType(representationBaseUrl)
-          });
-      }
+                representations.forEach(function (representation) {
+                    var representationBaseText = representation === adaptation ? '' : firstChildText(representation, 'BaseURL');
+                    var representationBaseUrl = dashResolveBaseUrl(adaptationBaseUrl, representationBaseText);
+                    var repLang = representation.getAttribute('lang') || representation.getAttribute('xml:lang') || language;
+                    var repMime = representation.getAttribute('mimeType') || mimeType;
+                    var repLabel = representation.getAttribute('label') || label;
+                    var directBaseText = representationBaseText || adaptationBaseText;
+                    if (directBaseText) {
+                        addTrack({
+                            NAME: buildTrackName(repLabel, repLang, 'NO', repMime, representationBaseUrl),
+                            LANGUAGE: repLang || inferLanguage(representationBaseUrl),
+                            FORCED: /forced/i.test(repLabel + ' ' + representationBaseUrl) ? 'YES' : 'NO',
+                            TYPE: repMime,
+                            URI: representationBaseUrl,
+                            source: 'dash',
+                            contentType: inferContentType(representationBaseUrl)
+                        });
+                    }
 
-      var representationTemplate = representation === adaptation ? null : firstChildElement(representation, 'SegmentTemplate');
-      var templateLayers = [];
-      if (representationTemplate) templateLayers.push(representationTemplate);
-      if (adaptationTemplate) templateLayers.push(adaptationTemplate);
-      if (periodTemplate) templateLayers.push(periodTemplate);
-      var templateSegments = templateLayers.length ? dashTemplateSegments(templateLayers, representation, representationBaseUrl, periodDuration) : [];
-      if (templateSegments.length) {
-          addTrack({
-              NAME: buildTrackName(repLabel, repLang, 'NO', repMime, templateSegments[0]),
-              LANGUAGE: repLang || inferLanguage(templateSegments[0]),
-              FORCED: /forced/i.test(repLabel + ' ' + templateSegments[0]) ? 'YES' : 'NO',
-              TYPE: repMime,
-              URI: url,
-              source: 'dash-template',
-              segments: templateSegments,
-              playlistDuration: periodDuration || null,
-              contentType: inferContentType(templateSegments[0])
-          });
-      }
-  });
-        });
+                    var representationTemplate = representation === adaptation ? null : firstChildElement(representation, 'SegmentTemplate');
+                    var templateLayers = [];
+                    if (representationTemplate) templateLayers.push(representationTemplate);
+                    if (adaptationTemplate) templateLayers.push(adaptationTemplate);
+                    if (periodTemplate) templateLayers.push(periodTemplate);
+                    var templateSegments = templateLayers.length
+                        ? dashTemplateSegments(templateLayers, representation, representationBaseUrl, periodDuration)
+                        : [];
+                    if (templateSegments.length) {
+                        addTrack({
+                            NAME: buildTrackName(repLabel, repLang, 'NO', repMime, templateSegments[0]),
+                            LANGUAGE: repLang || inferLanguage(templateSegments[0]),
+                            FORCED: /forced/i.test(repLabel + ' ' + templateSegments[0]) ? 'YES' : 'NO',
+                            TYPE: repMime,
+                            URI: url,
+                            source: 'dash-template',
+                            segments: templateSegments,
+                            playlistDuration: periodDuration || null,
+                            contentType: inferContentType(templateSegments[0])
+                        });
+                    }
+                });
+            });
     }
 
     function localName(node) {
@@ -1233,8 +1240,8 @@
     function findAncestorElement(node, name) {
         var current = node && (node.parentElement || node.parentNode);
         while (current) {
-  if (localName(current) === name) return current;
-  current = current.parentElement || current.parentNode;
+            if (localName(current) === name) return current;
+            current = current.parentElement || current.parentNode;
         }
         return null;
     }
@@ -1244,12 +1251,11 @@
     }
 
     function parseDashDurationSeconds(value) {
-        var match = String(value || '').trim().match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
+        var match = String(value || '')
+            .trim()
+            .match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
         if (!match) return null;
-        return (Number(match[1]) || 0) * 86400 +
-  (Number(match[2]) || 0) * 3600 +
-  (Number(match[3]) || 0) * 60 +
-  (Number(match[4]) || 0);
+        return (Number(match[1]) || 0) * 86400 + (Number(match[2]) || 0) * 3600 + (Number(match[3]) || 0) * 60 + (Number(match[4]) || 0);
     }
 
     function dashPeriodStartSeconds(period, periods, index) {
@@ -1258,11 +1264,11 @@
         if (explicit != null) return explicit;
         var position = 0;
         for (var i = 0; i < index; i++) {
-  var priorStart = parseDashDurationSeconds(periods[i].getAttribute('start'));
-  if (priorStart != null) position = priorStart;
-  var priorDuration = parseDashDurationSeconds(periods[i].getAttribute('duration'));
-  if (priorDuration == null) return null;
-  position += priorDuration;
+            var priorStart = parseDashDurationSeconds(periods[i].getAttribute('start'));
+            if (priorStart != null) position = priorStart;
+            var priorDuration = parseDashDurationSeconds(periods[i].getAttribute('duration'));
+            if (priorDuration == null) return null;
+            position += priorDuration;
         }
         return position;
     }
@@ -1274,8 +1280,11 @@
 
         var mpd = findAncestorElement(period, 'MPD');
         if (!mpd && doc) {
-  var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
-  mpd = nodes.filter(function (node) { return localName(node) === 'MPD'; })[0] || null;
+            var nodes = Array.prototype.slice.call(doc.getElementsByTagName('*'));
+            mpd =
+                nodes.filter(function (node) {
+                    return localName(node) === 'MPD';
+                })[0] || null;
         }
         if (!mpd) return null;
 
@@ -1286,8 +1295,8 @@
         if (start == null) return null;
 
         if (index + 1 < periods.length) {
-  var nextStart = dashPeriodStartSeconds(periods[index + 1], periods, index + 1);
-  if (nextStart != null && nextStart > start) return nextStart - start;
+            var nextStart = dashPeriodStartSeconds(periods[index + 1], periods, index + 1);
+            if (nextStart != null && nextStart > start) return nextStart - start;
         }
 
         var presentationDuration = parseDashDurationSeconds(mpd.getAttribute('mediaPresentationDuration'));
@@ -1297,18 +1306,18 @@
 
     function dashTemplateAttribute(templates, name, fallback) {
         for (var i = 0; i < templates.length; i++) {
-  var template = templates[i];
-  if (!template || !template.getAttribute) continue;
-  var value = template.getAttribute(name);
-  if (value != null && value !== '') return value;
+            var template = templates[i];
+            if (!template || !template.getAttribute) continue;
+            var value = template.getAttribute(name);
+            if (value != null && value !== '') return value;
         }
         return fallback;
     }
 
     function dashTemplateTimeline(templates) {
         for (var i = 0; i < templates.length; i++) {
-  var timeline = firstChildElement(templates[i], 'SegmentTimeline');
-  if (timeline) return timeline;
+            var timeline = firstChildElement(templates[i], 'SegmentTimeline');
+            if (timeline) return timeline;
         }
         return null;
     }
@@ -1316,13 +1325,13 @@
     function dashReplaceNumericToken(text, token, value) {
         var expression = new RegExp('\\$' + token + '(?:%0(\\d+)d)?\\$', 'g');
         return text.replace(expression, function (_, widthText) {
-  var rendered = String(value);
-  var width = parseInt(widthText || '0', 10) || 0;
-  if (!width || rendered.length >= width) return rendered;
-  var sign = rendered.charAt(0) === '-' ? '-' : '';
-  var digits = sign ? rendered.slice(1) : rendered;
-  while (sign.length + digits.length < width) digits = '0' + digits;
-  return sign + digits;
+            var rendered = String(value);
+            var width = parseInt(widthText || '0', 10) || 0;
+            if (!width || rendered.length >= width) return rendered;
+            var sign = rendered.charAt(0) === '-' ? '-' : '';
+            var digits = sign ? rendered.slice(1) : rendered;
+            while (sign.length + digits.length < width) digits = '0' + digits;
+            return sign + digits;
         });
     }
 
@@ -1339,6 +1348,12 @@
         return rendered.replace(new RegExp(marker, 'g'), '$');
     }
 
+    function dashTemplateHasAddressingToken(media) {
+        var marker = '\uE000';
+        var normalized = String(media || '').replace(/\$\$/g, marker);
+        return /\$(?:Number|Time)(?:%0\d+d)?\$/.test(normalized);
+    }
+
     function isTextAdaptation(node) {
         var text = [
             node.getAttribute('contentType') || '',
@@ -1346,7 +1361,9 @@
             node.getAttribute('codecs') || '',
             node.getAttribute('label') || '',
             node.textContent.slice(0, 500)
-        ].join(' ').toLowerCase();
+        ]
+            .join(' ')
+            .toLowerCase();
         return /text|subtitle|caption|webvtt|vtt|ttml|dfxp|stpp/.test(text);
     }
 
@@ -1356,6 +1373,7 @@
 
         var media = dashTemplateAttribute(templates, 'media', '');
         if (!media || !/\.(?:vtt|webvtt|ttml|dfxp|xml|srt)(?:[?#]|$)/i.test(media)) return [];
+        if (!dashTemplateHasAddressingToken(media)) return [];
 
         var representationId = representation.getAttribute('id') || '';
         var bandwidth = representation.getAttribute('bandwidth') || '';
@@ -1369,67 +1387,67 @@
         var references = [];
 
         if (timeline) {
-  var sNodes = childElements(timeline, 'S');
-  var currentTime = null;
-  var segmentNumber = startNumber;
-  for (var sIndex = 0; sIndex < sNodes.length; sIndex++) {
-      var s = sNodes[sIndex];
-      var duration = Number(s.getAttribute('d'));
-      if (!(duration > 0)) return [];
+            var sNodes = childElements(timeline, 'S');
+            var currentTime = null;
+            var segmentNumber = startNumber;
+            for (var sIndex = 0; sIndex < sNodes.length; sIndex++) {
+                var s = sNodes[sIndex];
+                var duration = Number(s.getAttribute('d'));
+                if (!(duration > 0)) return [];
 
-      var explicitTime = s.getAttribute('t');
-      if (explicitTime != null && explicitTime !== '') {
-          currentTime = Number(explicitTime);
-          if (!isFinite(currentTime)) return [];
-      } else if (currentTime == null) {
-          currentTime = 0;
-      }
+                var explicitTime = s.getAttribute('t');
+                if (explicitTime != null && explicitTime !== '') {
+                    currentTime = Number(explicitTime);
+                    if (!isFinite(currentTime)) return [];
+                } else if (currentTime == null) {
+                    currentTime = 0;
+                }
 
-      var repeat = parseInt(s.getAttribute('r') || '0', 10);
-      if (!isFinite(repeat)) repeat = 0;
-      var count = repeat >= 0 ? repeat + 1 : 0;
+                var repeat = parseInt(s.getAttribute('r') || '0', 10);
+                if (!isFinite(repeat)) repeat = 0;
+                var count = repeat >= 0 ? repeat + 1 : 0;
 
-      if (repeat < 0) {
-          if (sIndex + 1 < sNodes.length) {
-              var nextTimeText = sNodes[sIndex + 1].getAttribute('t');
-              if (nextTimeText == null || nextTimeText === '') return [];
-              var nextTime = Number(nextTimeText);
-              if (!isFinite(nextTime) || nextTime <= currentTime) return [];
-              count = Math.ceil((nextTime - currentTime) / duration);
-          } else if (periodDurationSeconds != null && isFinite(periodDurationSeconds) && periodDurationSeconds > 0) {
-              var periodEndTime = presentationTimeOffset + periodDurationSeconds * timescale;
-              count = Math.ceil((periodEndTime - currentTime) / duration);
-          } else {
-              return [];
-          }
-      }
+                if (repeat < 0) {
+                    if (sIndex + 1 < sNodes.length) {
+                        var nextTimeText = sNodes[sIndex + 1].getAttribute('t');
+                        if (nextTimeText == null || nextTimeText === '') return [];
+                        var nextTime = Number(nextTimeText);
+                        if (!isFinite(nextTime) || nextTime <= currentTime) return [];
+                        count = Math.ceil((nextTime - currentTime) / duration);
+                    } else if (periodDurationSeconds != null && isFinite(periodDurationSeconds) && periodDurationSeconds > 0) {
+                        var periodEndTime = presentationTimeOffset + periodDurationSeconds * timescale;
+                        count = Math.ceil((periodEndTime - currentTime) / duration);
+                    } else {
+                        return [];
+                    }
+                }
 
-      if (count <= 0 || references.length + count > MAX_DASH_TEMPLATE_SEGMENTS) return [];
-      for (var repeatIndex = 0; repeatIndex < count; repeatIndex++) {
-          references.push({ number: segmentNumber++, time: currentTime });
-          currentTime += duration;
-      }
-  }
+                if (count <= 0 || references.length + count > MAX_DASH_TEMPLATE_SEGMENTS) return [];
+                for (var repeatIndex = 0; repeatIndex < count; repeatIndex++) {
+                    references.push({ number: segmentNumber++, time: currentTime });
+                    currentTime += duration;
+                }
+            }
         } else {
-  var simpleDuration = Number(dashTemplateAttribute(templates, 'duration', '0'));
-  if (!(simpleDuration > 0) || periodDurationSeconds == null || !isFinite(periodDurationSeconds) || periodDurationSeconds <= 0) return [];
-  var describedUnits = periodDurationSeconds * timescale - eptDelta;
-  var simpleCount = Math.ceil(describedUnits / simpleDuration);
-  if (simpleCount <= 0 || simpleCount > MAX_DASH_TEMPLATE_SEGMENTS) return [];
-  for (var index = 0; index < simpleCount; index++) {
-      references.push({
-          number: startNumber + index,
-          time: presentationTimeOffset + index * simpleDuration
-      });
-  }
+            var simpleDuration = Number(dashTemplateAttribute(templates, 'duration', '0'));
+            if (!(simpleDuration > 0) || periodDurationSeconds == null || !isFinite(periodDurationSeconds) || periodDurationSeconds <= 0) return [];
+            var describedUnits = periodDurationSeconds * timescale - eptDelta;
+            var simpleCount = Math.ceil(describedUnits / simpleDuration);
+            if (simpleCount <= 0 || simpleCount > MAX_DASH_TEMPLATE_SEGMENTS) return [];
+            for (var index = 0; index < simpleCount; index++) {
+                references.push({
+                    number: startNumber + index,
+                    time: presentationTimeOffset + index * simpleDuration
+                });
+            }
         }
 
         var urls = [];
         for (var i = 0; i < references.length; i++) {
-  var reference = references[i];
-  var rendered = dashFormatTemplate(media, representationId, bandwidth, reference.number, reference.time);
-  if (!rendered) return [];
-  urls.push(absoluteUrl(rendered, baseUrl));
+            var reference = references[i];
+            var rendered = dashFormatTemplate(media, representationId, bandwidth, reference.number, reference.time);
+            if (!rendered) return [];
+            urls.push(absoluteUrl(rendered, baseUrl));
         }
         return urls;
     }
