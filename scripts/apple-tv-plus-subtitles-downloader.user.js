@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.6
+// @version    1.0.7
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1094,6 +1094,7 @@
         getText(url).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             state.seenManifestUrls[url] = 'loaded';
+            if (/^Could not read manifest:/.test(state.lastError || '')) state.lastError = '';
             parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
