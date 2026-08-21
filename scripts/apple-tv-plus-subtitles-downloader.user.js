@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.5
+// @version    1.0.6
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1081,7 +1081,7 @@
         sessionId = sessionId == null ? state.playbackSessionId : sessionId;
         if (!isPlaybackSessionCurrent(sessionId)) return;
         if (state.seenManifestUrls[url]) return;
-        state.seenManifestUrls[url] = true;
+        state.seenManifestUrls[url] = 'pending';
         state.manifestMeta[url] = {
             source: source || '',
             activePlayback: isPlaybackResourceContext(),
@@ -1093,10 +1093,15 @@
 
         getText(url).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
+            state.seenManifestUrls[url] = 'loaded';
             parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
+            if (state.seenManifestUrls[url] === 'pending') {
+                delete state.seenManifestUrls[url];
+                delete state.seenResourceUrls[url];
+            }
             state.lastError = 'Could not read manifest: ' + err.message;
             updateUi();
         });
