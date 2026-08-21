@@ -1,11 +1,9 @@
 name: Temporary TTML em geometry validation
 
 on:
-  push:
-    branches:
-      - fix/coupang-ttml-em-geometry-validation
-    paths:
-      - .github/workflows/tmp-ttml-em-geometry-validation.yml
+  pull_request:
+    types: [opened]
+    branches: [main]
 
 permissions:
   contents: write
