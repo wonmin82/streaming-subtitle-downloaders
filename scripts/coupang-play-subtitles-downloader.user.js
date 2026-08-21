@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.1
+// @version    1.0.2
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -27,12 +27,26 @@
     var LOG_PREFIX = '[Coupang Play Subtitles DL]';
     var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     var MESSAGE_TYPE_TRACK = 'cpsd-subtitle-track';
+    var MESSAGE_TYPE_SESSION = 'cpsd-playback-session';
+    var MESSAGE_TYPE_SESSION_REQUEST = 'cpsd-playback-session-request';
 
     var state = {
         initialized: false,
         installedHooks: false,
         observer: null,
         oldlocation: null,
+        playbackSessionSequence: 0,
+        playbackSessionId: '',
+        playbackSessionStartedAt: 0,
+        playbackSessionEpochMs: 0,
+        topSessionOrigin: '',
+        playbackScanStartedAt: 0,
+        sessionClients: [],
+        pendingSessionObservations: [],
+        pendingSessionObservationBytes: 0,
+        replayingSessionObservations: false,
+        downloadOperationSequence: 0,
+        activeDownloadOperationId: 0,
         tracks: [],
         trackKeys: {},
         seenResourceUrls: {},
@@ -66,6 +80,12 @@
         if (state.initialized) return;
         state.initialized = true;
 
+        installSessionBridge();
+        requestPlaybackSession();
+        if (isTopFrame()) {
+            installNavigationHooks();
+            tick();
+        }
         installNetworkHooks();
         startPerformanceObserver();
         if (isTopFrame()) {
@@ -88,6 +108,7 @@
         if (state.oldlocation !== pageKey) {
             state.oldlocation = pageKey;
             if (playbackPage) {
+                beginPlaybackSession();
                 state.playbackActive = true;
                 resetTracks();
                 refreshMediaMetadataFromDom();
@@ -96,6 +117,7 @@
                 state.lastPerformanceScanAt = Date.now();
                 updateUi();
             } else {
+                invalidatePlaybackSession();
                 if (state.playbackActive) resetTracks();
                 state.playbackActive = false;
                 hideWidget();
@@ -122,6 +144,39 @@
         } else {
             hideWidget();
         }
+    }
+
+    function installNavigationHooks() {
+        if (!isTopFrame()) return;
+        var historyObject;
+        try {
+            historyObject = targetWindow.history || window.history;
+        } catch (err) {
+            historyObject = window.history;
+        }
+
+        ['pushState', 'replaceState'].forEach(function (method) {
+            try {
+                if (!historyObject || typeof historyObject[method] !== 'function') return;
+                var original = historyObject[method];
+                if (original.__cpsdSessionPatched) return;
+                var wrapped = function () {
+                    var result = original.apply(this, arguments);
+                    try { tick(); } catch (err) { debuglog('Navigation sync failed: ' + err.message); }
+                    return result;
+                };
+                wrapped.__cpsdSessionPatched = true;
+                historyObject[method] = wrapped;
+            } catch (err) {
+                debuglog('Could not patch history.' + method + ': ' + err.message);
+            }
+        });
+
+        try {
+            targetWindow.addEventListener('popstate', function () {
+                try { tick(); } catch (err) { debuglog('Navigation sync failed: ' + err.message); }
+            }, false);
+        } catch (err) {}
     }
 
     function isCoupangPlayPage() {
@@ -227,11 +282,180 @@
         }
     }
 
+    function beginPlaybackSession() {
+        invalidateDownloadOperation();
+        var nowEpochMs = Date.now();
+        var initialLookbackMs = state.playbackSessionSequence === 0 ? 5000 : 0;
+        state.playbackSessionSequence++;
+        state.playbackSessionId = 'coupang:' + state.playbackSessionSequence + ':' + nowEpochMs.toString(36) + ':' + Math.random().toString(36).slice(2);
+        state.playbackSessionEpochMs = nowEpochMs - initialLookbackMs;
+        state.playbackSessionStartedAt = Math.max(0, performanceNow() - initialLookbackMs);
+        broadcastPlaybackSession();
+    }
+
+    function invalidatePlaybackSession() {
+        invalidateDownloadOperation();
+        state.playbackSessionId = '';
+        state.playbackSessionEpochMs = 0;
+        state.playbackSessionStartedAt = performanceNow();
+    }
+
+    function adoptPlaybackSession(sessionId, startedAtEpochMs) {
+        if (!sessionId || sessionId === state.playbackSessionId) return;
+        var cutoff = Number(startedAtEpochMs) || 0;
+        var pending = state.pendingSessionObservations.filter(function (observation) {
+            return !cutoff || observation.observedAt >= cutoff;
+        });
+        state.pendingSessionObservations = [];
+        state.pendingSessionObservationBytes = 0;
+        invalidateDownloadOperation();
+        state.playbackSessionId = sessionId;
+        state.playbackSessionEpochMs = cutoff || Date.now();
+        state.playbackSessionStartedAt = performanceNow();
+        resetTracks();
+        state.replayingSessionObservations = true;
+        try {
+            replayPendingSessionObservations(pending, sessionId);
+        } finally {
+            state.replayingSessionObservations = false;
+        }
+        scanPerformanceEntries(true);
+    }
+
+    function isPlaybackSessionCurrent(sessionId) {
+        return !!sessionId && sessionId === state.playbackSessionId;
+    }
+
+    function resolveObservationSession(sessionId, observedAt) {
+        if (isPlaybackSessionCurrent(sessionId)) return sessionId;
+        if (!isTopFrame() && state.playbackSessionId && state.playbackSessionEpochMs && observedAt >= state.playbackSessionEpochMs) {
+            return state.playbackSessionId;
+        }
+        return sessionId;
+    }
+
+    function rememberSessionObservation(observation, observedAt) {
+        if (isTopFrame() || state.replayingSessionObservations || !observation) return false;
+        observation.observedAt = Number(observedAt) || Date.now();
+        observation.size = observation.text ? observation.text.length : 256;
+        if (observation.size > 10000000) return !state.playbackSessionId;
+        while (state.pendingSessionObservations.length &&
+               (state.pendingSessionObservations.length >= 100 || state.pendingSessionObservationBytes + observation.size > 10000000)) {
+            var removed = state.pendingSessionObservations.shift();
+            state.pendingSessionObservationBytes -= removed.size || 0;
+        }
+        state.pendingSessionObservations.push(observation);
+        state.pendingSessionObservationBytes += observation.size;
+        return !state.playbackSessionId;
+    }
+
+    function replayPendingSessionObservations(observations, sessionId) {
+        observations.forEach(function (observation) {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            if (observation.type === 'resource') {
+                recordResourceUrl(observation.rawUrl, observation.source, sessionId, observation.observedAt);
+            } else if (observation.type === 'text') {
+                inspectTextForResources(observation.baseUrl, observation.text, observation.source, sessionId, observation.observedAt);
+            }
+        });
+    }
+
+    function performanceEntryEpochMs(entry) {
+        try {
+            var perf = targetWindow.performance || window.performance;
+            var timeOrigin = Number(perf && perf.timeOrigin);
+            if (isFinite(timeOrigin) && entry && typeof entry.startTime === 'number') return timeOrigin + entry.startTime;
+        } catch (err) {}
+        return Date.now();
+    }
+
+    function registerSessionClient(source, origin) {
+        if (!isTopFrame() || !source || !origin) return;
+        for (var i = 0; i < state.sessionClients.length; i++) {
+            if (state.sessionClients[i].source === source) {
+                state.sessionClients[i].origin = origin;
+                return;
+            }
+        }
+        state.sessionClients.push({ source: source, origin: origin });
+    }
+
+    function isRegisteredSessionClient(source, origin) {
+        if (!isTopFrame()) return false;
+        for (var i = 0; i < state.sessionClients.length; i++) {
+            if (state.sessionClients[i].source === source && state.sessionClients[i].origin === origin) return true;
+        }
+        return false;
+    }
+
+    function installSessionBridge() {
+        window.addEventListener('message', function (event) {
+            var data = event.data;
+            if (!data || !isTrustedCoupangOrigin(event.origin)) return;
+
+            if (data.type === MESSAGE_TYPE_SESSION_REQUEST && isTopFrame()) {
+                if (!event.source || !event.source.postMessage) return;
+                registerSessionClient(event.source, event.origin);
+                if (!state.playbackSessionId) return;
+                try {
+                    event.source.postMessage({
+                        type: MESSAGE_TYPE_SESSION,
+                        sessionId: state.playbackSessionId,
+                        sessionStartedAtEpochMs: state.playbackSessionEpochMs
+                    }, event.origin);
+                } catch (err) {
+                    debuglog('Could not reply with playback session: ' + err.message);
+                }
+                return;
+            }
+
+            if (data.type === MESSAGE_TYPE_SESSION && !isTopFrame()) {
+                if (event.source !== window.top) return;
+                state.topSessionOrigin = event.origin;
+                adoptPlaybackSession(data.sessionId || '', data.sessionStartedAtEpochMs);
+            }
+        });
+    }
+
+    function requestPlaybackSession() {
+        if (isTopFrame()) return;
+        var attempts = 0;
+        function request() {
+            if (state.playbackSessionId || attempts >= 40) return;
+            attempts++;
+            try {
+                window.top.postMessage({ type: MESSAGE_TYPE_SESSION_REQUEST }, '*');
+            } catch (err) {
+                debuglog('Could not request playback session: ' + err.message);
+            }
+            if (!state.playbackSessionId) setTimeout(request, 250);
+        }
+        request();
+    }
+
+    function broadcastPlaybackSession() {
+        if (!isTopFrame() || !state.playbackSessionId) return;
+        var activeClients = [];
+        state.sessionClients.forEach(function (client) {
+            try {
+                client.source.postMessage({
+                    type: MESSAGE_TYPE_SESSION,
+                    sessionId: state.playbackSessionId,
+                    sessionStartedAtEpochMs: state.playbackSessionEpochMs
+                }, client.origin);
+                activeClients.push(client);
+            } catch (err) {}
+        });
+        state.sessionClients = activeClients;
+    }
+
     function installFrameBridge() {
         window.addEventListener('message', function (event) {
             var data = event.data;
             if (!data || data.type !== MESSAGE_TYPE_TRACK || !data.track) return;
             if (!isTrustedCoupangOrigin(event.origin)) return;
+            if (!isRegisteredSessionClient(event.source, event.origin)) return;
+            if (data.sessionId !== state.playbackSessionId) return;
             addTrack(data.track, true);
             state.status = 'Ready. Select a subtitle track.';
             updateUi();
@@ -248,8 +472,9 @@
     }
 
     function forwardTrackToTop(track) {
+        if (!state.playbackSessionId || !state.topSessionOrigin) return;
         try {
-            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, track: cloneTrackForMessage(track) }, '*');
+            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, sessionId: state.playbackSessionId, track: cloneTrackForMessage(track) }, state.topSessionOrigin);
         } catch (err) {
             debuglog('Could not forward track to top frame: ' + err.message);
         }
@@ -536,8 +761,10 @@
             proto.open = function () {
                 if (arguments.length >= 2) {
                     this.__cpsdUrl = normalizeUrl(arguments[1]);
+                    this.__cpsdSessionId = state.playbackSessionId;
+                    this.__cpsdObservedAt = Date.now();
                     this.__cpsdObserve = shouldObserveNetworkRequest(arguments[1]);
-                    if (this.__cpsdObserve) recordResourceUrl(arguments[1], 'xhr');
+                    if (this.__cpsdObserve) recordResourceUrl(arguments[1], 'xhr', this.__cpsdSessionId, this.__cpsdObservedAt);
                 }
                 return originalOpen.apply(this, arguments);
             };
@@ -551,7 +778,7 @@
                         try {
                             if (!xhr.responseType || xhr.responseType === 'text') responseText = xhr.responseText;
                         } catch (err) {}
-                        inspectTextForResources(xhr.responseURL || xhr.__cpsdUrl, responseText, 'xhr-text');
+                        inspectTextForResources(xhr.responseURL || xhr.__cpsdUrl, responseText, 'xhr-text', xhr.__cpsdSessionId, xhr.__cpsdObservedAt);
                     }, false);
                 }
                 return originalSend.apply(this, arguments);
@@ -569,12 +796,14 @@
             var originalFetch = win.fetch;
             win.fetch = function () {
                 var url = fetchInputUrl(arguments[0]);
+                var sessionId = state.playbackSessionId;
+                var observedAt = Date.now();
                 if (!shouldObserveNetworkRequest(url)) {
                     return originalFetch.apply(this, arguments);
                 }
-                recordResourceUrl(url, 'fetch');
+                recordResourceUrl(url, 'fetch', sessionId, observedAt);
                 return originalFetch.apply(this, arguments).then(function (response) {
-                    inspectFetchResponse(url || response.url, response);
+                    inspectFetchResponse(url || response.url, response, sessionId, observedAt);
                     return response;
                 });
             };
@@ -594,12 +823,15 @@
 
     function startPerformanceObserver() {
         if (isPlaybackContext()) scanPerformanceEntries();
+        else if (!isTopFrame() && !state.playbackSessionId) scanPerformanceEntries(true);
         try {
             if (!targetWindow.PerformanceObserver) return;
             state.observer = new targetWindow.PerformanceObserver(function (list) {
                 list.getEntries().forEach(function (entry) {
+                    var observedAt = performanceEntryEpochMs(entry);
+                    if (state.playbackSessionEpochMs && observedAt < state.playbackSessionEpochMs) return;
                     if (isPlaybackResourceUrl(entry.name)) {
-                        recordResourceUrl(entry.name, 'performance');
+                        recordResourceUrl(entry.name, 'performance', state.playbackSessionId, performanceEntryEpochMs(entry));
                     }
                 });
             });
@@ -617,8 +849,10 @@
             var entries = perf.getEntriesByType('resource');
             var start = rescanAll || entries.length < state.performanceEntryCount ? 0 : state.performanceEntryCount;
             for (var i = start; i < entries.length; i++) {
+                var observedAt = performanceEntryEpochMs(entries[i]);
+                if (state.playbackSessionEpochMs && observedAt < state.playbackSessionEpochMs) continue;
                 if (isPlaybackResourceUrl(entries[i].name)) {
-                    recordResourceUrl(entries[i].name, 'performance-scan');
+                    recordResourceUrl(entries[i].name, 'performance-scan', state.playbackSessionId, observedAt);
                 }
             }
             state.performanceEntryCount = entries.length;
@@ -627,12 +861,12 @@
         }
     }
 
-    function inspectFetchResponse(url, response) {
+    function inspectFetchResponse(url, response, sessionId, observedAt) {
         if (!response || !response.clone) return;
         if (!shouldInspectResponse(url, response)) return;
         try {
             response.clone().text().then(function (text) {
-                inspectTextForResources(url || response.url, text, 'fetch-text');
+                inspectTextForResources(url || response.url, text, 'fetch-text', sessionId, observedAt);
             }).catch(function () {});
         } catch (err) {}
     }
@@ -647,20 +881,26 @@
         return /coupangplay|playback|manifest|m3u8|mpd|vtt|webvtt|ttml|dfxp|srt|subtitle|caption|timedtext/i.test(url);
     }
 
-    function recordResourceUrl(rawUrl, source) {
+    function recordResourceUrl(rawUrl, source, sessionId, observedAt) {
+        observedAt = Number(observedAt) || Date.now();
+        var shouldDefer = rememberSessionObservation({ type: 'resource', rawUrl: rawUrl, source: source }, observedAt);
+        sessionId = sessionId == null ? state.playbackSessionId : sessionId;
+        sessionId = resolveObservationSession(sessionId, observedAt);
+        if (!sessionId && shouldDefer) return;
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         var url = normalizeUrl(rawUrl);
         if (!url || state.seenResourceUrls[url]) return;
         state.seenResourceUrls[url] = true;
 
         if (isManifestUrl(url)) {
-            queueManifest(url, source);
+            queueManifest(url, source, sessionId);
         } else if (isSubtitleUrl(url)) {
             addTrack({
                 NAME: inferTrackName(url),
                 LANGUAGE: inferLanguage(url),
                 FORCED: /forced/i.test(url) ? 'YES' : 'NO',
                 URI: url,
-                source: 'direct',
+                source: source || 'direct',
                 contentType: inferContentType(url)
             });
             state.status = 'Ready. Select a subtitle track.';
@@ -668,14 +908,20 @@
         }
     }
 
-    function inspectTextForResources(baseUrl, text, source) {
+    function inspectTextForResources(baseUrl, text, source, sessionId, observedAt) {
         if (!text || typeof text !== 'string') return;
         if (text.length > 5000000) return;
+        observedAt = Number(observedAt) || Date.now();
+        var shouldDefer = rememberSessionObservation({ type: 'text', baseUrl: baseUrl, text: text, source: source }, observedAt);
+        sessionId = sessionId == null ? state.playbackSessionId : sessionId;
+        sessionId = resolveObservationSession(sessionId, observedAt);
+        if (!sessionId && shouldDefer) return;
+        if (!isPlaybackSessionCurrent(sessionId)) return;
 
         baseUrl = normalizeUrl(baseUrl);
         var trimmed = text.replace(/^\uFEFF/, '').trim();
         if (baseUrl && isManifestUrl(baseUrl)) {
-            parseManifest(baseUrl, trimmed);
+            parseManifest(baseUrl, trimmed, sessionId);
         } else if (baseUrl && isSubtitleUrl(baseUrl)) {
             addTrack({
                 NAME: inferTrackName(baseUrl),
@@ -698,15 +944,15 @@
                 playlistDuration: subtitleTextDurationSeconds(trimmed) || null
             });
         } else if (/^\s*#EXTM3U/i.test(trimmed) || /^\s*<MPD[\s>]/i.test(trimmed)) {
-            parseManifest(baseUrl || location.href, trimmed);
+            parseManifest(baseUrl || location.href, trimmed, sessionId);
         }
 
         extractUrlsFromText(trimmed, baseUrl).forEach(function (url) {
-            recordResourceUrl(url, source || 'text-url');
+            recordResourceUrl(url, source || 'text-url', sessionId, observedAt);
         });
 
         try {
-            collectSubtitleUrlsFromJson(JSON.parse(trimmed), baseUrl, '', 0);
+            collectSubtitleUrlsFromJson(JSON.parse(trimmed), baseUrl, '', 0, sessionId, observedAt);
         } catch (err) {}
     }
 
@@ -730,11 +976,11 @@
         return Object.keys(urls);
     }
 
-    function collectSubtitleUrlsFromJson(value, baseUrl, path, depth) {
+    function collectSubtitleUrlsFromJson(value, baseUrl, path, depth, sessionId, observedAt) {
         if (value == null || depth > 12) return;
         if (typeof value === 'string') {
             extractUrlsFromText(value, baseUrl).forEach(function (url) {
-                recordResourceUrl(url, 'json-string');
+                recordResourceUrl(url, 'json-string', sessionId, observedAt);
             });
             return;
         }
@@ -742,7 +988,7 @@
 
         if (Array.isArray(value)) {
             value.slice(0, 500).forEach(function (item) {
-                collectSubtitleUrlsFromJson(item, baseUrl, path, depth + 1);
+                collectSubtitleUrlsFromJson(item, baseUrl, path, depth + 1, sessionId, observedAt);
             });
             return;
         }
@@ -768,13 +1014,13 @@
                 forced = 'YES';
             }
 
-            collectSubtitleUrlsFromJson(child, baseUrl, nextPath, depth + 1);
+            collectSubtitleUrlsFromJson(child, baseUrl, nextPath, depth + 1, sessionId, observedAt);
         });
 
         if (possibleUrl) {
             var url = absoluteUrl(cleanJsonUrl(possibleUrl), baseUrl || location.href);
             if (isManifestUrl(url)) {
-                recordResourceUrl(url, 'json-object');
+                recordResourceUrl(url, 'json-object', sessionId, observedAt);
             } else if (isSubtitleUrl(url) || /subtitle|caption|texttrack|timedtext/i.test(path + ' ' + type + ' ' + label)) {
                 addTrack({
                     NAME: buildTrackName(label, language, forced, type, url),
@@ -825,22 +1071,27 @@
         return '';
     }
 
-    function queueManifest(url, source) {
+    function queueManifest(url, source, sessionId) {
+        sessionId = sessionId == null ? state.playbackSessionId : sessionId;
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (state.seenManifestUrls[url]) return;
         state.seenManifestUrls[url] = true;
         state.status = 'Found manifest via ' + source + '. Reading tracks...';
         updateUi();
 
         getText(url).then(function (text) {
-            parseManifest(url, text || '');
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
             state.lastError = 'Could not read manifest: ' + err.message;
             updateUi();
         });
     }
 
-    function parseManifest(url, text) {
+    function parseManifest(url, text, sessionId) {
+        if (!isPlaybackSessionCurrent(sessionId)) return;
         if (!text) return;
         if (/^\s*#EXTM3U/i.test(text)) {
             parseHlsManifest(url, text);
@@ -1302,48 +1553,87 @@
         return max;
     }
 
+    function beginDownloadOperation() {
+        var operation = {
+            id: ++state.downloadOperationSequence,
+            sessionId: state.playbackSessionId,
+            baseFilename: safeBaseFilename()
+        };
+        state.activeDownloadOperationId = operation.id;
+        return operation;
+    }
+
+    function isDownloadOperationCurrent(operation) {
+        return !!operation && operation.id === state.activeDownloadOperationId && isPlaybackSessionCurrent(operation.sessionId);
+    }
+
+    function assertDownloadOperationCurrent(operation) {
+        if (!isDownloadOperationCurrent(operation)) throw new Error('Playback changed while downloading subtitles.');
+    }
+
+    function invalidateDownloadOperation() {
+        state.activeDownloadOperationId = 0;
+        state.wait = false;
+        state.zip = null;
+    }
+
+    function finishDownloadOperation(operation) {
+        if (!isDownloadOperationCurrent(operation)) return false;
+        state.activeDownloadOperationId = 0;
+        state.wait = false;
+        state.zip = null;
+        return true;
+    }
+
     function downloadAllTracks() {
         if (state.wait || state.tracks.length === 0) return;
-        state.zip = new JSZip();
+        var operation = beginDownloadOperation();
+        var tracks = state.tracks.slice();
+        var zip = new JSZip();
+        state.zip = zip;
         state.wait = true;
         state.lastError = '';
         updateUi();
 
-        runSequential(state.tracks, function (track) {
+        runSequential(tracks, function (track) {
+            assertDownloadOperationCurrent(operation);
             state.status = 'Downloading ' + track.NAME + '...';
             updateUi();
-            return buildSubtitleFile(track).then(function (file) {
-                state.zip.file(file.name, file.content);
+            return buildSubtitleFile(track, operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
+                zip.file(file.name, file.content);
             });
         }).then(function () {
-            return state.zip.generateAsync({ type: 'blob' });
+            assertDownloadOperationCurrent(operation);
+            return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
-            saveAs(blob, safeBaseFilename() + '.subtitles.zip');
+            assertDownloadOperationCurrent(operation);
+            saveAs(blob, operation.baseFilename + '.subtitles.zip');
             state.status = 'Downloaded all subtitles.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
     function downloadTrack(track) {
         if (state.wait) return;
+        var operation = beginDownloadOperation();
         state.wait = true;
         state.lastError = '';
         state.selectedTrackKey = track.key;
         state.status = 'Downloading ' + track.NAME + '...';
         updateUi();
 
-        buildSubtitleFile(track).then(function (file) {
+        buildSubtitleFile(track, operation).then(function (file) {
+            assertDownloadOperationCurrent(operation);
             saveAs(new Blob([file.content], { type: 'text/vtt;charset=utf-8' }), file.name);
             state.status = 'Downloaded ' + track.NAME + '.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
@@ -1369,6 +1659,7 @@
             return;
         }
 
+        var operation = beginDownloadOperation();
         var tracks = uniqueTracks([english, korean]);
         var zip = new JSZip();
         state.wait = true;
@@ -1377,19 +1668,21 @@
         updateUi();
 
         Promise.all(tracks.map(function (track) {
-            return buildSubtitleFile(track).then(function (file) {
+            return buildSubtitleFile(track, operation).then(function (file) {
+                assertDownloadOperationCurrent(operation);
                 zip.file(file.name, file.content);
             });
         })).then(function () {
+            assertDownloadOperationCurrent(operation);
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
-            saveAs(blob, safeBaseFilename() + '.en-ko.subtitles.zip');
+            assertDownloadOperationCurrent(operation);
+            saveAs(blob, operation.baseFilename + '.en-ko.subtitles.zip');
             state.status = 'Downloaded English + Korean subtitles.';
         }).catch(function (err) {
-            state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
         }).then(function () {
-            state.wait = false;
-            updateUi();
+            if (finishDownloadOperation(operation)) updateUi();
         });
     }
 
@@ -1406,24 +1699,29 @@
         return output;
     }
 
-    function buildSubtitleFile(track) {
+    function buildSubtitleFile(track, operation) {
+        assertDownloadOperationCurrent(operation);
         return ensureMediaMetadata().then(function () {
+            assertDownloadOperationCurrent(operation);
             return getTrackVtt(track);
         }).then(function (vtt) {
+            assertDownloadOperationCurrent(operation);
             var output = normalizeVttForDownload(vtt);
             if (!output.trim()) throw new Error('No subtitle cues found.');
             return {
-                name: safeBaseFilename() + '.' + safeTrackName(track) + '.vtt',
+                name: operation.baseFilename + '.' + safeTrackName(track) + '.vtt',
                 content: output
             };
         });
     }
 
     function getTrackVtt(track) {
+        var sessionId = state.playbackSessionId;
         if (track.text) return Promise.resolve(textToVtt(track.text, track));
         if (track.segments && track.segments.length) return mergeSegments(track);
 
         return getText(track.URI).then(function (text) {
+            if (!isPlaybackSessionCurrent(sessionId)) throw new Error('Playback changed while downloading subtitles.');
             if (/^\s*WEBVTT/i.test(text)) return text;
             if (/^\s*<\?xml|^\s*<tt[\s>]/i.test(text)) return ttmlToVtt(text);
             if (looksLikeSrt(text)) return srtToVtt(text);
@@ -1736,6 +2034,7 @@
         state.trackKeys = {};
         state.seenResourceUrls = {};
         state.seenManifestUrls = {};
+        state.playbackScanStartedAt = state.playbackSessionStartedAt || performanceNow();
         state.selectedTrackKey = '';
         state.userSelectedTrack = false;
         state.mediaTitle = '';
@@ -1759,8 +2058,10 @@
     }
 
     function ensureMediaMetadata() {
+        var sessionId = state.playbackSessionId;
         refreshMediaMetadataFromDom();
         return (state.metadataPromise || Promise.resolve()).then(function () {
+            if (!isPlaybackSessionCurrent(sessionId)) throw new Error('Playback changed while reading metadata.');
             mergeMediaMetadata(mediaMetadataFromDom(), 1);
         });
     }
@@ -1802,24 +2103,29 @@
         var identifiers = playbackIdentifiers();
         if (!identifiers.titleId) return null;
 
+        var sessionId = state.playbackSessionId;
         var requestKey = [identifiers.titleId, identifiers.parentId].join('|');
         if (state.metadataResolvedKey === requestKey || state.metadataFailedKey === requestKey) return state.metadataPromise;
         if (state.metadataRequestKey === requestKey && state.metadataPromise) return state.metadataPromise;
 
         state.metadataRequestKey = requestKey;
-        state.metadataPromise = fetchDiscoverMetadata(identifiers).then(function (metadata) {
+        var promise = fetchDiscoverMetadata(identifiers).then(function (metadata) {
+            if (!isPlaybackSessionCurrent(sessionId)) return metadata;
             mergeMediaMetadata(metadata, 2);
             state.metadataResolvedKey = requestKey;
             updateUi();
             return metadata;
         }).catch(function (err) {
-            state.metadataFailedKey = requestKey;
-            debuglog('Discover metadata failed: ' + err.message);
+            if (isPlaybackSessionCurrent(sessionId)) {
+                state.metadataFailedKey = requestKey;
+                debuglog('Discover metadata failed: ' + err.message);
+            }
         }).then(function (metadata) {
-            state.metadataPromise = null;
+            if (state.metadataPromise === promise) state.metadataPromise = null;
             return metadata;
         });
-        return state.metadataPromise;
+        state.metadataPromise = promise;
+        return promise;
     }
 
     function fetchDiscoverMetadata(identifiers) {
