@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.0
+// @version    1.0.1
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -137,6 +137,8 @@ const SUB_TYPES = {
 let idOverrides = {};
 let subCache = {};
 let titleCache = {};
+let subCacheWaitGeneration = 0;
+let batchDownloadInProgress = false;
 
 let batch = null;
 try {
@@ -156,22 +158,22 @@ let subFormat = localStorage.getItem('NSD_sub-format') || WEBVTT;
 let batchDelay = parseFloat(localStorage.getItem('NSD_batch-delay') || '0');
 
 const setEpTitleInFilename = () => {
-  document.querySelector('#subtitle-downloader-menu .ep-title-in-filename > span').innerHTML = (epTitleInFilename ? 'on' : 'off');
+  document.querySelector('#subtitle-downloader-menu .ep-title-in-filename > span').textContent = (epTitleInFilename ? 'on' : 'off');
 };
 const setForceText = () => {
-  document.querySelector('#subtitle-downloader-menu .force-all-lang > span').innerHTML = (forceSubs ? 'on' : 'off');
+  document.querySelector('#subtitle-downloader-menu .force-all-lang > span').textContent = (forceSubs ? 'on' : 'off');
 };
 const setLocaleText = () => {
-  document.querySelector('#subtitle-downloader-menu .pref-locale > span').innerHTML = (prefLocale === '' ? 'disabled' : prefLocale);
+  document.querySelector('#subtitle-downloader-menu .pref-locale > span').textContent = (prefLocale === '' ? 'disabled' : prefLocale);
 };
 const setLangsText = () => {
-  document.querySelector('#subtitle-downloader-menu .lang-setting > span').innerHTML = (langs === '' ? 'all' : langs);
+  document.querySelector('#subtitle-downloader-menu .lang-setting > span').textContent = (langs === '' ? 'all' : langs);
 };
 const setFormatText = () => {
-  document.querySelector('#subtitle-downloader-menu .sub-format > span').innerHTML = FORMAT_NAMES[subFormat];
+  document.querySelector('#subtitle-downloader-menu .sub-format > span').textContent = FORMAT_NAMES[subFormat];
 };
 const setBatchDelayText = () => {
-  document.querySelector('#subtitle-downloader-menu .batch-delay > span').innerHTML = batchDelay;
+  document.querySelector('#subtitle-downloader-menu .batch-delay > span').textContent = batchDelay;
 };
 
 const setBatch = b => {
@@ -253,8 +255,22 @@ const popRandomElement = arr => {
   return arr.splice(arr.length * Math.random() << 0, 1)[0];
 };
 
+const handleSubsReady = menu => {
+  if(getSubsFromCache(true) === null || getXFromCache(titleCache, 'title', true) === null)
+    return false;
+  if(!menu || !menu.isConnected)
+    return false;
+
+  menu.style.display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
+  if(batch !== null && batch.length > 0)
+    downloadBatch(true);
+  return true;
+};
+
 const processSubInfo = async result => {
   const tracks = result.timedtexttracks || result.textTracks;
+  if(!Array.isArray(tracks))
+    return;
   const subs = {};
   let reportError = true;
   for(const track of tracks) {
@@ -268,8 +284,9 @@ const processSubInfo = async result => {
     const lang = track.language + type + variant + (track.isForcedNarrative ? '-forced' : '');
 
     const formats = {};
+    const trackDownloadables = track.ttDownloadables || track.downloadables || {};
     for(let format of ALL_FORMATS) {
-      const downloadables = (track.ttDownloadables || track.downloadables)[format];
+      const downloadables = trackDownloadables[format];
       if(typeof downloadables !== 'undefined') {
         let urls;
         if(typeof downloadables.downloadUrls !== 'undefined')
@@ -299,22 +316,37 @@ const processSubInfo = async result => {
     }
   }
   subCache[result.movieId] = subs;
+  if(handleSubsReady(document.querySelector('#subtitle-downloader-menu')))
+    subCacheWaitGeneration++;
 };
 
+const SUB_CACHE_WAIT_TIMEOUT_MS = 60000;
 const checkSubsCache = async menu => {
-  while(getSubsFromCache(true) === null) {
+  const generation = ++subCacheWaitGeneration;
+  const videoId = getVideoId();
+  const deadline = Date.now() + SUB_CACHE_WAIT_TIMEOUT_MS;
+
+  while(generation === subCacheWaitGeneration &&
+        getVideoId() === videoId &&
+        getSubsFromCache(true) === null &&
+        Date.now() < deadline) {
     await asyncSleep(0.1);
   }
 
-  // show menu if on watch page
-  menu.style.display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
+  if(generation !== subCacheWaitGeneration || getVideoId() !== videoId)
+    return;
 
-  if(batch !== null && batch.length > 0) {
-    downloadBatch(true);
+  if(!handleSubsReady(menu)) {
+    if(Date.now() >= deadline)
+      console.warn('[Netflix Subtitle Downloader] subtitle cache wait timed out for video', videoId);
+    return;
   }
 };
 
 const processMetadata = data => {
+  if(!data || !data.video)
+    return;
+
   // add menu when it's not there
   let menu = document.querySelector('#subtitle-downloader-menu');
   if(menu === null) {
@@ -382,7 +414,7 @@ const processMetadata = data => {
     titleCache[result.id] = {type, title};
   }
   else {
-  	console.debug('[Netflix Subtitle Downloader] unknown video type:', type, result)
+    console.debug('[Netflix Subtitle Downloader] unknown video type:', type, result)
     return;
   }
   checkSubsCache(menu);
@@ -417,6 +449,7 @@ const getXFromCache = (cache, name, silent) => {
 const getSubsFromCache = silent => getXFromCache(subCache, 'subs', silent);
 
 const pad = (number, letter) => `${letter}${number.toString().padStart(2, '0')}`;
+const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const safeTitle = title => title.trim().replace(/[:*?"<>|\\\/]+/g, '_').replace(/ /g, '.');
 
@@ -459,21 +492,14 @@ const _download = async _zip => {
   const downloaded = [];
 
   let filteredLangs;
-  if(langs === '')
+  const requestedLangs = langs.split(',').map(value => value.trim()).filter(Boolean);
+  if(requestedLangs.length === 0)
     filteredLangs = Object.keys(subs);
   else {
-    const regularExpression = new RegExp(
-      '^(' + langs
-        .replace(/\[/g, '\\[')
-        .replace(/\]/g, '\\]')
-        .replace(/\-/g, '\\-')
-        .replace(/\s/g, '')
-        .replace(/,/g, '|')
-      + ')'
-    );
+    const regularExpression = new RegExp('^(' + requestedLangs.map(escapeRegExp).join('|') + ')');
     filteredLangs = [];
     for(const lang of Object.keys(subs)) {
-      if(lang.match(regularExpression))
+      if(regularExpression.test(lang))
         filteredLangs.push(lang);
     }
   }
@@ -481,7 +507,11 @@ const _download = async _zip => {
   const progress = new ProgressBar(filteredLangs.length);
   let stop = false;
   for(const lang of filteredLangs) {
-    const [urls, extension] = pickFormat(subs[lang]);
+    const selectedFormat = pickFormat(subs[lang]);
+    if(!selectedFormat)
+      continue;
+    const [cachedUrls, extension] = selectedFormat;
+    const urls = cachedUrls.slice();
     while(urls.length > 0) {
       let url = popRandomElement(urls);
       const resultPromise = fetch(url, {mode: "cors"});
@@ -529,11 +559,16 @@ const downloadThis = async () => {
 };
 
 const cleanBatch = async () => {
+  batch = null;
   setBatch(null);
-  return;
-  const cache = await caches.open('NSD');
-  cache.delete('/subs.zip');
-  await caches.delete('NSD');
+  try {
+    const cache = await caches.open('NSD');
+    await cache.delete('/subs.zip');
+    await caches.delete('NSD');
+  }
+  catch(error) {
+    console.warn('[Netflix Subtitle Downloader] could not clear batch cache', error);
+  }
 }
 
 const readAsBinaryString = blob => new Promise(resolve => {
@@ -545,8 +580,14 @@ const readAsBinaryString = blob => new Promise(resolve => {
 });
 
 const downloadBatch = async auto => {
-  const cache = await caches.open('NSD');
-  let zip, title, stop;
+  if(batchDownloadInProgress)
+    return;
+
+  batchDownloadInProgress = true;
+  let keepLockedForNavigation = false;
+  try {
+    const cache = await caches.open('NSD');
+    let zip, title, stop;
   if(auto === true) {
     try {
       const response = await cache.match('/subs.zip');
@@ -568,40 +609,48 @@ const downloadBatch = async auto => {
   }
   catch(error) {
     title = 'unknown';
-		stop = true;
+    stop = true;
   }
 
   const id = parseInt(getVideoId());
   batch = batch.filter(x => x !== id);
 
-  if(stop || batch.length == 0) {
-    await _save(zip, title);
-    await cleanBatch();
+    if(stop || batch.length == 0) {
+      await _save(zip, title);
+      await cleanBatch();
+    }
+    else {
+      setBatch(batch);
+      await cache.put('/subs.zip', new Response(await zip.generateAsync({type:'blob'})));
+      await asyncSleep(batchDelay);
+      keepLockedForNavigation = true;
+      window.location = window.location.origin + '/watch/' + batch[0];
+    }
   }
-  else {
-    setBatch(batch);
-    cache.put('/subs.zip', new Response(await zip.generateAsync({type:'blob'})));
-    await asyncSleep(batchDelay);
-    window.location = window.location.origin + '/watch/' + batch[0];
+  finally {
+    if(!keepLockedForNavigation)
+      batchDownloadInProgress = false;
   }
 };
 
 const downloadAll = () => {
-  batch = batchAll;
+  batch = batchAll.slice();
   downloadBatch();
 };
 
 const downloadSeason = () => {
-  batch = batchSeason;
+  batch = batchSeason.slice();
   downloadBatch();
 };
 
 const downloadToEnd = () => {
-  batch = batchToEnd;
+  batch = batchToEnd.slice();
   downloadBatch();
 };
 
 const processMessage = e => {
+  if(!e || !e.detail)
+    return;
   const {type, data} = e.detail;
   if(type === 'subs')
     processSubInfo(data);
@@ -620,82 +669,129 @@ const injection = (ALL_FORMATS) => {
   window.addEventListener('popstate', () => {
     const display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
     const menu = document.querySelector('#subtitle-downloader-menu');
-    menu.style.display = display;
+    if(menu)
+      menu.style.display = display;
   });
 
   // hijack JSON.parse and JSON.stringify functions
   ((parse, stringify, open, realFetch) => {
-    JSON.parse = function (text) {
-      const data = parse(text);
-
-      if (data && data.result && (data.result.timedtexttracks || data.result.textTracks) && data.result.movieId) {
-        window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'subs', data: data.result}}));
+    JSON.parse = function () {
+      const data = parse.apply(this, arguments);
+      try {
+        if (data && data.result && (data.result.timedtexttracks || data.result.textTracks) && data.result.movieId) {
+          window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'subs', data: data.result}}));
+        }
+      }
+      catch(error) {
+        console.debug('[Netflix Subtitle Downloader] JSON.parse observer failed:', error);
       }
       return data;
     };
 
-    JSON.stringify = function (data) {
+    JSON.stringify = function () {
+      const data = arguments[0];
       /*{
         let text = stringify(data);
         if (text.includes('dfxp-ls-sdh'))
           console.log(text, data);
       }*/
 
-      if (data && typeof data.url === 'string' && data.url.search(MANIFEST_PATTERN) > -1) {
-        for (let v of Object.values(data)) {
-          try {
-            if (v.profiles) {
-              for(const profile_name of ALL_FORMATS) {
-                if(!v.profiles.includes(profile_name)) {
-                  v.profiles.unshift(profile_name);
+      try {
+        if (data && typeof data.url === 'string' && data.url.search(MANIFEST_PATTERN) > -1) {
+          for (let v of Object.values(data)) {
+            try {
+              if (v.profiles) {
+                for(const profile_name of ALL_FORMATS) {
+                  if(!v.profiles.includes(profile_name)) {
+                    v.profiles.unshift(profile_name);
+                  }
                 }
               }
+              if (v.showAllSubDubTracks != null && forceSubs)
+                v.showAllSubDubTracks = true;
+              if (prefLocale !== '')
+                v.preferredTextLocale = prefLocale;
             }
-            if (v.showAllSubDubTracks != null && forceSubs)
-              v.showAllSubDubTracks = true;
-            if (prefLocale !== '')
-              v.preferredTextLocale = prefLocale;
-          }
-          catch (e) {
-            if (e instanceof TypeError)
-              continue;
-            else
-              throw e;
+            catch (e) {
+              if (e instanceof TypeError)
+                continue;
+              else
+                throw e;
+            }
           }
         }
-      }
-      if(data && typeof data.movieId === 'number') {
-        try {
-          let videoId = data.params.sessionParams.uiplaycontext.video_id;
-          if(typeof videoId === 'number' && videoId !== data.movieId)
-            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'id_override', data: [videoId, data.movieId]}}));
+        if(data && typeof data.movieId === 'number') {
+          try {
+            let videoId = data.params.sessionParams.uiplaycontext.video_id;
+            if(typeof videoId === 'number' && videoId !== data.movieId)
+              window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'id_override', data: [videoId, data.movieId]}}));
+          }
+          catch(ignore) {}
         }
-        catch(ignore) {}
       }
-      return stringify(data);
+      catch(error) {
+        console.debug('[Netflix Subtitle Downloader] JSON.stringify observer failed:', error);
+      }
+      return stringify.apply(this, arguments);
     };
 
     XMLHttpRequest.prototype.open = function() {
-      if(arguments[1] && arguments[1].includes('/metadata?'))
-        this.addEventListener('load', async () => {
-          let data = this.response;
-          if(data instanceof Blob)
-            data = JSON.parse(await data.text());
-          else if(typeof data === "string")
-            data = JSON.parse(data);
-          window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
+      let requestUrl = '';
+      try {
+        if(arguments.length > 1)
+          requestUrl = String(arguments[1] || '');
+      }
+      catch(ignore) {}
+
+      if(requestUrl.includes('/metadata?'))
+        this.addEventListener('load', () => {
+          Promise.resolve().then(async () => {
+            let data = this.response;
+            if(data instanceof Blob)
+              data = JSON.parse(await data.text());
+            else if(typeof data === 'string')
+              data = JSON.parse(data);
+            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
+          }).catch(error => {
+            console.debug('[Netflix Subtitle Downloader] XHR metadata observer failed:', error);
+          });
         }, false);
-      open.apply(this, arguments);
+      return open.apply(this, arguments);
     };
 
-    window.fetch = async (...args) => {
-      const response = realFetch(...args);
-      if(args[0] && args[0].includes('/metadata?')) {
-        const copied = (await response).clone();
-        const data = await copied.json();
-        window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
+    const getFetchUrl = input => {
+      if(typeof input === 'string')
+        return input;
+      if(input && typeof input.url === 'string')
+        return input.url;
+      try {
+        return input == null ? '' : String(input);
       }
-      return response;
+      catch(ignore) {
+        return '';
+      }
+    };
+
+    window.fetch = function() {
+      const args = arguments;
+      const requestUrl = getFetchUrl(args[0]);
+      const responsePromise = realFetch.apply(this, args);
+      if(!requestUrl.includes('/metadata?'))
+        return responsePromise;
+
+      responsePromise.then(response => {
+        try {
+          response.clone().json().then(data => {
+            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
+          }).catch(error => {
+            console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
+          });
+        }
+        catch(error) {
+          console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
+        }
+      }).catch(() => {});
+      return responsePromise;
     };
   })(JSON.parse, JSON.stringify, XMLHttpRequest.prototype.open, window.fetch);
 }
