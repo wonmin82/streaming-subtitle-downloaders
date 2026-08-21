@@ -6,6 +6,7 @@ if (!source.includes('// @version    1.0.17')) throw new Error('version bump mis
 if (!source.includes("'fontSize', 'origin'")) throw new Error('fontSize is not preserved in specified style');
 if (!source.includes('ttmlPositionOrigin(positionValue, extent, positionContext)')) throw new Error('position does not use resolved extent/context');
 if (!source.includes('var extentContext = extentFromNode ? nodeLayoutContext : regionLayoutContext;')) throw new Error('geometry source context selection missing');
+if (!source.includes('function ttmlCellFontSizeReference(')) throw new Error('region cell-size reference missing');
 
 const start = source.indexOf('    function ttmlAttribute(');
 const end = source.indexOf('    function ttmlSpaceMode(');
@@ -60,6 +61,7 @@ pair(context.ttmlResolveFontSize('1c', null, base), [3.75, 100 / 15]);
 pair(context.ttmlResolveFontSize('1c 1c', null, base), [100 / 32, 100 / 15]);
 pair(context.ttmlResolveFontSize('50% 2em', [4, 6], base), [2, 12]);
 pair(context.ttmlResolveFontSize('20px', null, base), [20 / 1920 * 100, 20 / 1080 * 100]);
+pair(context.ttmlCellFontSizeReference(base), [100 / 32, 100 / 15]);
 
 const initial = element('initial', { 'tts:fontSize': '2c 1c' }, root);
 const region = element('region', { 'tts:fontSize': '40px 60px' }, root);
@@ -73,6 +75,8 @@ const styleMap = context.ttmlStyleMap(doc2);
 const regionStyle = context.ttmlRegionPresentationStyle(region, styleMap);
 const regionFont = context.ttmlRegionFontSize(regionStyle, doc2, base2);
 pair(regionFont, [40 / 1920 * 100, 60 / 1080 * 100]);
+pair(context.ttmlRegionFontSize({ fontSize: '50% 200%' }, doc2, base2), [50 / 32, 200 / 15]);
+pair(context.ttmlRegionFontSize({ fontSize: '2em 0.5em' }, doc2, base2), [200 / 32, 50 / 15]);
 const pFont = context.ttmlContentFontSize(p, doc2, styleMap, regionFont, base2, 0);
 pair(pFont, [100 / 32, 200 / 15]);
 
@@ -89,6 +93,7 @@ if (context.ttmlInitialFontSize(noExtentDoc, noExtentContext) !== null) {
     throw new Error('single-value initial 1c should fail closed without root aspect ratio');
 }
 pair(context.ttmlResolveFontSize('1c 1c', null, noExtentContext), [100 / 32, 100 / 15]);
+pair(context.ttmlRegionFontSize({ fontSize: '100% 100%' }, noExtentDoc, noExtentContext), [100 / 32, 100 / 15]);
 if (context.ttmlLengthToPercentage('1em', 'h', noExtentContext) !== null) {
     throw new Error('em geometry should fail closed without computed font size');
 }
