@@ -145,4 +145,15 @@ test('netflix: preferred-format fallback includes WebVTT, IMSC, DFXP and simple 
   requireText(source, 'const pickFormat = formats =>', 'format selector');
 });
 
+test('netflix: download fallback skips unusable candidates and failed mirrors', () => {
+  const source = sources.netflix;
+  requireText(source, "const DOWNLOAD_TIMEOUT = 'NETFLIX_SUBTITLE_DOWNLOADER_DOWNLOAD_TIMEOUT';", 'distinct download timeout');
+  requireText(source, 'const isUsableFormatCandidate = candidate =>', 'usable format guard');
+  requireText(source, 'isUsableFormatCandidate(formats[format])', 'format fallback guard');
+  requireText(source, 'result.ok !== true', 'HTTP status validation');
+  requireText(source, 'subtitle fetch failed, trying another URL', 'network mirror fallback');
+  requireText(source, 'subtitle fetch timed out, trying another URL', 'timeout mirror fallback');
+  requireText(source, 'subtitle response could not be read, trying another URL', 'body-read mirror fallback');
+});
+
 console.log(`# ${passed} regression groups passed`);
