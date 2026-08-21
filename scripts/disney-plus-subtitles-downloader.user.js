@@ -995,7 +995,7 @@
             }
 
             if (line.charAt(0) === '#') return;
-            if (isMediaPlaylist || /\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#]|$)/i.test(line)) {
+            if (isMediaPlaylist || /\.(?:vtt|webvtt)(?:[?#]|$)/i.test(line)) {
                 // A completed Parent Segment contains the same media as its preceding PARTs.
                 // Prefer the completed segment and retain PARTs only for the unfinished live edge.
                 pendingParts = [];
