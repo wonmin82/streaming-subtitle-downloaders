@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.4
+// @version    1.0.5
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2141,7 +2141,7 @@
         var cues = [];
         paragraphs.forEach(function (p) {
             var timing = ttmlResolveTiming(p, context, 0);
-            var text = ttmlCueText(p);
+            var text = ttmlCueText(p, doc);
             if (timing && text.replace(/\s/g, '') && isFinite(timing.begin) && isFinite(timing.end) && timing.end > timing.begin) {
                 cues.push(formatVttTime(timing.begin) + ' --> ' + formatVttTime(timing.end) + '\n' + text);
             }
@@ -2331,15 +2331,108 @@
         return NaN;
     }
 
+    function ttmlStyleMap(doc) {
+        var styles = {};
+        Array.prototype.slice.call(doc.getElementsByTagName('*')).forEach(function (node) {
+            if (localName(node) !== 'style' || !ttmlHasAncestor(node, 'styling')) return;
+            var id = ttmlAttribute(node, 'id');
+            if (id) styles[id] = node;
+        });
+        return styles;
+    }
+
+    function ttmlHasAncestor(node, name) {
+        var current = node && node.parentNode;
+        while (current) {
+            if (localName(current) === name) return true;
+            current = current.parentNode;
+        }
+        return false;
+    }
+
+    function ttmlSpecifiedPresentationStyle(node, styleMap, resolving) {
+        var specified = {};
+        if (!node || node.nodeType !== 1) return specified;
+        resolving = resolving || {};
+
+        var references = String(node.getAttribute('style') || '')
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean);
+        references.forEach(function (id) {
+            var referenced = styleMap[id];
+            if (!referenced || resolving[id]) return;
+            var nextResolving = {};
+            Object.keys(resolving).forEach(function (key) {
+                nextResolving[key] = true;
+            });
+            nextResolving[id] = true;
+            ttmlMergePresentationStyle(specified, ttmlSpecifiedPresentationStyle(referenced, styleMap, nextResolving));
+        });
+
+        ['fontWeight', 'fontStyle', 'textDecoration', 'ruby'].forEach(function (name) {
+            var value = ttmlAttribute(node, name);
+            if (value) specified[name] = value;
+        });
+        return specified;
+    }
+
+    function ttmlMergePresentationStyle(target, source) {
+        Object.keys(source || {}).forEach(function (key) {
+            target[key] = source[key];
+        });
+        return target;
+    }
+
+    function ttmlComputedPresentationStyle(node, styleMap) {
+        var inherited = {
+            bold: false,
+            italic: false,
+            underline: false,
+            ruby: 'none'
+        };
+        var parent = node && node.parentNode;
+        if (parent && parent.nodeType === 1) {
+            var parentStyle = ttmlComputedPresentationStyle(parent, styleMap);
+            inherited.bold = parentStyle.bold;
+            inherited.italic = parentStyle.italic;
+            inherited.underline = parentStyle.underline;
+        }
+
+        var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
+        if (specified.fontWeight) {
+            inherited.bold = String(specified.fontWeight).toLowerCase() === 'bold';
+        }
+        if (specified.fontStyle) {
+            var fontStyle = String(specified.fontStyle).toLowerCase();
+            inherited.italic = fontStyle === 'italic' || fontStyle === 'oblique';
+        }
+        if (specified.textDecoration) {
+            inherited.underline = ttmlUnderlineFromDecoration(specified.textDecoration, inherited.underline);
+        }
+        inherited.ruby = specified.ruby ? String(specified.ruby) : 'none';
+        return inherited;
+    }
+
+    function ttmlUnderlineFromDecoration(value, inherited) {
+        var tokens = String(value || '')
+            .toLowerCase()
+            .split(/\s+/);
+        if (tokens.indexOf('none') >= 0 || tokens.indexOf('nounderline') >= 0) return false;
+        if (tokens.indexOf('underline') >= 0) return true;
+        return inherited;
+    }
+
     function ttmlSpaceMode(node, inherited) {
         var value = String(ttmlAttribute(node, 'space') || '').toLowerCase();
         if (value === 'preserve' || value === 'default') return value;
         return inherited || 'default';
     }
 
-    function ttmlCueText(node) {
+    function ttmlCueText(node, doc) {
         var state = { text: '', pendingSpace: false };
-        ttmlAppendCueText(node, ttmlInheritedSpaceMode(node), state);
+        var context = { styleMap: ttmlStyleMap(doc) };
+        ttmlAppendCueText(node, ttmlInheritedSpaceMode(node), state, context);
         return state.text.replace(/\r\n|\r/g, '\n');
     }
 
@@ -2357,11 +2450,15 @@
         return mode;
     }
 
-    function ttmlAppendCueText(node, inheritedSpace, state) {
+    function ttmlAppendCueText(node, inheritedSpace, state, context) {
         if (!node) return;
         var mode = inheritedSpace;
         if (node.nodeType === 1) {
             mode = ttmlSpaceMode(node, inheritedSpace);
+            var presentation = ttmlComputedPresentationStyle(node, context.styleMap);
+            if (presentation.ruby === 'container') {
+                if (ttmlAppendRuby(node, mode, state, context)) return;
+            }
             if (localName(node) === 'br') {
                 state.pendingSpace = false;
                 state.text += '\n';
@@ -2370,39 +2467,112 @@
         }
 
         if (node.nodeType === 3 || node.nodeType === 4) {
-            var value = String(node.nodeValue || '').replace(/\r\n|\r/g, '\n');
-            if (mode === 'preserve') {
-                if (state.pendingSpace && state.text && value && !/^\s/.test(value) && !/\s$/.test(state.text)) {
-                    state.text += ' ';
-                }
-                state.pendingSpace = false;
-                state.text += value;
-            } else {
-                ttmlAppendDefaultText(value, state);
-            }
+            var parentStyle = ttmlComputedPresentationStyle(node.parentNode, context.styleMap);
+            ttmlAppendTextValue(String(node.nodeValue || '').replace(/\r\n|\r/g, '\n'), mode, parentStyle, state);
             return;
         }
 
         var children = node.childNodes || [];
         for (var i = 0; i < children.length; i++) {
-            ttmlAppendCueText(children[i], mode, state);
+            ttmlAppendCueText(children[i], mode, state, context);
         }
     }
 
-    function ttmlAppendDefaultText(value, state) {
-        var normalized = String(value || '').replace(/\s+/g, ' ');
-        if (!normalized) return;
-        var leadingSpace = normalized.charAt(0) === ' ';
-        var trailingSpace = normalized.charAt(normalized.length - 1) === ' ';
-        var content = normalized.trim();
-
-        if (leadingSpace && state.text) state.pendingSpace = true;
-        if (content) {
-            if (state.pendingSpace && state.text && !/\s$/.test(state.text)) state.text += ' ';
+    function ttmlAppendTextValue(value, mode, style, state) {
+        var output = '';
+        if (mode === 'preserve') {
+            if (state.pendingSpace && state.text && value && !/^\s/.test(value) && !/\s$/.test(state.text)) output += ' ';
             state.pendingSpace = false;
-            state.text += content;
+            output += value;
+        } else {
+            var normalized = String(value || '').replace(/\s+/g, ' ');
+            if (!normalized) return;
+            var leadingSpace = normalized.charAt(0) === ' ';
+            var trailingSpace = normalized.charAt(normalized.length - 1) === ' ';
+            var content = normalized.trim();
+            if (leadingSpace && state.text) state.pendingSpace = true;
+            if (content) {
+                if (state.pendingSpace && state.text && !/\s$/.test(state.text)) output += ' ';
+                state.pendingSpace = false;
+                output += content;
+            }
+            if (trailingSpace && (state.text || output)) state.pendingSpace = true;
         }
-        if (trailingSpace && state.text) state.pendingSpace = true;
+        if (output) state.text += ttmlWrapVttText(ttmlEscapeVttText(output), style);
+    }
+
+    function ttmlEscapeVttText(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;');
+    }
+
+    function ttmlWrapVttText(value, style) {
+        var open = '';
+        var close = '';
+        if (style && style.bold) {
+            open += '<b>';
+            close = '</b>' + close;
+        }
+        if (style && style.italic) {
+            open += '<i>';
+            close = '</i>' + close;
+        }
+        if (style && style.underline) {
+            open += '<u>';
+            close = '</u>' + close;
+        }
+        return open + value + close;
+    }
+
+    function ttmlAppendRuby(node, mode, state, context) {
+        var pairs = ttmlRubyPairs(node, context.styleMap);
+        if (!pairs || !pairs.length) return false;
+        state.pendingSpace = false;
+        state.text += '<ruby>';
+        pairs.forEach(function (pair) {
+            state.text += ttmlRenderRubyPart(pair.base, mode, context);
+            state.text += '<rt>' + ttmlRenderRubyPart(pair.text, mode, context) + '</rt>';
+        });
+        state.text += '</ruby>';
+        return true;
+    }
+
+    function ttmlRubyPairs(container, styleMap) {
+        var children = Array.prototype.slice.call(container.childNodes || []).filter(function (node) {
+            return node.nodeType === 1;
+        });
+        var bases = [];
+        var texts = [];
+        children.forEach(function (child) {
+            var ruby = ttmlComputedPresentationStyle(child, styleMap).ruby;
+            if (ruby === 'base') bases.push(child);
+            if (ruby === 'text') texts.push(child);
+            if (ruby === 'baseContainer') {
+                Array.prototype.slice.call(child.childNodes || []).forEach(function (nested) {
+                    if (nested.nodeType === 1 && ttmlComputedPresentationStyle(nested, styleMap).ruby === 'base') bases.push(nested);
+                });
+            }
+            if (ruby === 'textContainer') {
+                Array.prototype.slice.call(child.childNodes || []).forEach(function (nested) {
+                    if (nested.nodeType === 1 && ttmlComputedPresentationStyle(nested, styleMap).ruby === 'text') texts.push(nested);
+                });
+            }
+        });
+        if (!bases.length || bases.length !== texts.length) return null;
+        return bases.map(function (base, index) {
+            return { base: base, text: texts[index] };
+        });
+    }
+
+    function ttmlRenderRubyPart(node, inheritedSpace, context) {
+        var substate = { text: '', pendingSpace: false };
+        var mode = ttmlSpaceMode(node, inheritedSpace);
+        var children = node.childNodes || [];
+        for (var i = 0; i < children.length; i++) {
+            ttmlAppendCueText(children[i], mode, substate, context);
+        }
+        return substate.text;
     }
 
     function timestampSeconds(value) {
