@@ -13,23 +13,23 @@ function el(name,attrs={},parent=null){const n={nodeType:1,localName:name,nodeNa
 function text(value,parent){const n={nodeType:3,nodeValue:value,parentNode:parent};parent.childNodes.push(n);return n}
 function doc(root){const all=[root];function walk(x){(x.childNodes||[]).forEach(c=>{if(c.nodeType===1){all.push(c);walk(c)}})}walk(root);return {getElementsByTagName(){return all;},documentElement:root}}
 const p=el('p',{begin:'0s',dur:'5s'}); text('Hello',p);
-const s1=el('set',{begin:'1s',dur:'1s','tts:fontWeight':'bold'},p);
-const s2=el('set',{begin:'2s',dur:'1s','tts:fontStyle':'italic'},p);
-const s3=el('set',{begin:'3s',dur:'1s',fill:'freeze','tts:textDecoration':'underline'},p);
-const d=doc(p), timing={frameRate:30,effectiveFrameRate:30,subFrameRate:1,tickRate:1}, styles=ctx.ttmlStyleMap(d);
+el('set',{begin:'1s',dur:'1s','tts:fontWeight':'bold'},p);
+el('set',{begin:'2s',dur:'1s','tts:fontStyle':'italic'},p);
+el('set',{begin:'3s',dur:'1s',fill:'freeze','tts:textDecoration':'underline'},p);
+let d=doc(p), timing={frameRate:30,effectiveFrameRate:30,subFrameRate:1,tickRate:1}, styles=ctx.ttmlStyleMap(d);
 function rendered(t){return ctx.ttmlCueText(p,d,timing,t,styles)}
 if(rendered(.5)!=='Hello') throw new Error('static interval changed');
 if(rendered(1.5)!=='<b>Hello</b>') throw new Error('bold set not applied');
 if(rendered(2.5)!=='<i>Hello</i>') throw new Error('italic set not applied');
 if(rendered(3.5)!=='<u>Hello</u>') throw new Error('underline set not applied');
 if(rendered(4.5)!=='<u>Hello</u>') throw new Error('fill freeze not preserved');
-const overlap=el('set',{begin:'1s',dur:'2s','tts:fontWeight':'normal'},p);
+let intervals=ctx.ttmlParagraphCueIntervals(p,d,timing);
+let signature=intervals.map(x=>`${x.begin}-${x.end}:${x.text}`).join('|');
+if(signature!=='0-1:Hello|1-2:<b>Hello</b>|2-3:<i>Hello</i>|3-5:<u>Hello</u>') throw new Error('set boundaries/cue merge incorrect: '+signature);
+const overlap=el('set',{begin:'1s',dur:'2s','tts:fontWeight':'normal'},p); d=doc(p); styles=ctx.ttmlStyleMap(d);
 if(rendered(1.5)!=='Hello') throw new Error('later active set did not override earlier set');
 if(rendered(2.5)!=='<i>Hello</i>') throw new Error('unrelated animation property was disturbed');
-const intervals=ctx.ttmlParagraphCueIntervals(p,d,timing);
-const signature=intervals.map(x=>`${x.begin}-${x.end}:${x.text}`).join('|');
-if(!signature.includes('0-1:Hello')||!signature.includes('1-2:Hello')||!signature.includes('2-3:<i>Hello</i>')||!signature.includes('3-5:<u>Hello</u>')) throw new Error('set boundaries/cue merge incorrect: '+signature);
-const bad=el('set',{begin:'bogus',dur:'1s','tts:fontWeight':'bold'},p);
+const bad=el('set',{begin:'bogus',dur:'1s','tts:fontWeight':'bold'},p); d=doc(p); styles=ctx.ttmlStyleMap(d);
 if(ctx.ttmlParagraphCueIntervals(p,d,timing).length!==0) throw new Error('malformed set timing must fail closed');
 p.childNodes.pop();
 const repeat=el('set',{begin:'0s',dur:'1s',repeatCount:'2','tts:fontWeight':'bold'},p);
