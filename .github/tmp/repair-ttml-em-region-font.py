@@ -17,13 +17,13 @@ new = '''    function ttmlCellFontSizeReference(context) {
     }
 
     function ttmlRegionFontSize(regionStyle, doc, context) {
-        var initial = ttmlInitialFontSize(doc, context);
-        if (!initial) return null;
         var value = regionStyle && regionStyle.fontSize || '';
-        if (!value) return initial;
-        var cellReference = ttmlCellFontSizeReference(context);
-        if (!cellReference) return null;
-        return ttmlResolveFontSize(value, cellReference, context);
+        if (value) {
+            var cellReference = ttmlCellFontSizeReference(context);
+            if (!cellReference) return null;
+            return ttmlResolveFontSize(value, cellReference, context);
+        }
+        return ttmlInitialFontSize(doc, context);
     }
 '''
 if text.count(old) != 1:
