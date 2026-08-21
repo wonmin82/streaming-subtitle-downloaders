@@ -72,6 +72,53 @@ for (const service of ['apple', 'disney', 'coupang']) {
     assert.strictEqual(ctx.parseHlsByteRange('9007199254740992@0', false), null);
   });
 
+  test(`${service}: LL-HLS partial segments cover only the unfinished live edge`, () => {
+    const block = functionDeclarations(source, [
+      'extractHlsSegmentEntries', 'parseAttrList', 'absoluteUrl',
+      'parseHlsByteRange', 'isSafeHlsByteInteger', 'resolveHlsByteRange'
+    ]);
+    const ctx = evaluateFunctions(block, { URL });
+    const playlist = [
+      '#EXTM3U',
+      '#EXT-X-MAP:URI="init.vtt"',
+      '#EXT-X-PART:DURATION=0.5,URI="seg1.vtt",BYTERANGE="10@0"',
+      '#EXT-X-PART:DURATION=0.5,URI="seg1.vtt",BYTERANGE="12"',
+      '#EXTINF:1.0,',
+      'seg1.vtt',
+      '#EXT-X-PART:DURATION=0.5,URI="seg2.vtt",BYTERANGE="8@0"',
+      '#EXT-X-PART:DURATION=0.5,URI="seg2.vtt",BYTERANGE="9"',
+      '#EXT-X-PRELOAD-HINT:TYPE=PART,URI="seg2.vtt",BYTERANGE-START=17'
+    ].join('\n');
+    const entries = ctx.extractHlsSegmentEntries(playlist, 'https://example.test/subs/live.m3u8');
+    assert.strictEqual(entries.length, 3, 'completed parent must replace its PARTs while live-edge PARTs remain');
+    assert.strictEqual(entries[0].url, 'https://example.test/subs/seg1.vtt');
+    assert.strictEqual(entries[0].partial, undefined, 'completed parent must not be marked partial');
+    assert.strictEqual(entries[1].partial, true);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(entries[1].byterange)), { offset: 0, length: 8 });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(entries[2].byterange)), { offset: 8, length: 9 });
+    assert(entries.every(entry => entry.map && entry.map.url === 'https://example.test/subs/init.vtt'), 'map must apply to parent and PART entries');
+    assert(!entries.some(entry => /PRELOAD/.test(entry.url)), 'preload hints must not be fetched');
+
+    const gapPlaylist = [
+      '#EXTM3U',
+      '#EXT-X-PART:DURATION=0.5,URI="seg3.vtt",BYTERANGE="5@0",GAP=YES',
+      '#EXT-X-PART:DURATION=0.5,URI="seg3.vtt",BYTERANGE="7"'
+    ].join('\n');
+    const gapEntries = ctx.extractHlsSegmentEntries(gapPlaylist, 'https://example.test/subs/live.m3u8');
+    assert.strictEqual(gapEntries.length, 1, 'GAP part must not be fetched');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(gapEntries[0].byterange)), { offset: 5, length: 7 }, 'GAP range must still advance implicit offset');
+
+    const invalidImplicit = [
+      '#EXTM3U',
+      '#EXT-X-PART:DURATION=0.5,URI="seg4.vtt",BYTERANGE="5@0"',
+      '#EXTINF:0.5,',
+      'seg4.vtt',
+      '#EXT-X-PART:DURATION=0.5,URI="seg5.vtt",BYTERANGE="7"'
+    ].join('\n');
+    assert.throws(() => ctx.extractHlsSegmentEntries(invalidImplicit, 'https://example.test/subs/live.m3u8'), /Implicit EXT-X-BYTERANGE offset/);
+    assert.throws(() => ctx.extractHlsSegmentEntries('#EXTM3U\n#EXT-X-PART:URI="missing-duration.vtt"', 'https://example.test/live.m3u8'), /duration/);
+  });
+
   test(`${service}: WebVTT HLS metadata path remains present`, () => {
     requireText(source, 'X-TIMESTAMP-MAP', 'timestamp-map handling');
     assert(/STYLE/.test(source), 'STYLE metadata handling missing');

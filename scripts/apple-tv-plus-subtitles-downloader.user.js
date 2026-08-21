@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.9
+// @version    1.0.10
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1580,6 +1580,8 @@
         var currentMap = null;
         var pendingByteRange = null;
         var previousSegment = null;
+        var pendingParts = [];
+        var previousPart = null;
 
         lines.forEach(function (rawLine) {
             var line = rawLine.trim();
@@ -1587,15 +1589,15 @@
 
             var mapMatch = line.match(/^#EXT-X-MAP:(.*)$/i);
             if (mapMatch) {
-                var attrs = parseAttrList(mapMatch[1]);
-                if (!attrs.URI) {
+                var mapAttrs = parseAttrList(mapMatch[1]);
+                if (!mapAttrs.URI) {
                     currentMap = null;
                     return;
                 }
-                var mapUrl = absoluteUrl(attrs.URI, baseUrl);
+                var mapUrl = absoluteUrl(mapAttrs.URI, baseUrl);
                 var mapByteRange = null;
-                if (Object.prototype.hasOwnProperty.call(attrs, 'BYTERANGE')) {
-                    var parsedMapRange = parseHlsByteRange(attrs.BYTERANGE, true);
+                if (Object.prototype.hasOwnProperty.call(mapAttrs, 'BYTERANGE')) {
+                    var parsedMapRange = parseHlsByteRange(mapAttrs.BYTERANGE, true);
                     if (!parsedMapRange) {
                         throw new Error('Invalid EXT-X-MAP BYTERANGE; an explicit offset is required.');
                     }
@@ -1608,6 +1610,33 @@
                 return;
             }
 
+            var partMatch = line.match(/^#EXT-X-PART:(.*)$/i);
+            if (partMatch) {
+                var partAttrs = parseAttrList(partMatch[1]);
+                if (!partAttrs.URI) throw new Error('EXT-X-PART is missing its URI.');
+                var partDuration = Number(partAttrs.DURATION);
+                if (!isFinite(partDuration) || partDuration <= 0) throw new Error('Invalid EXT-X-PART duration.');
+                var partUrl = absoluteUrl(partAttrs.URI, baseUrl);
+                var partByteRange = null;
+                if (Object.prototype.hasOwnProperty.call(partAttrs, 'BYTERANGE')) {
+                    var parsedPartRange = parseHlsByteRange(partAttrs.BYTERANGE, false);
+                    if (!parsedPartRange) throw new Error('Invalid EXT-X-PART BYTERANGE.');
+                    partByteRange = resolveHlsByteRange(parsedPartRange, partUrl, previousPart);
+                }
+                var partEntry = {
+                    url: partUrl,
+                    map: currentMap,
+                    byterange: partByteRange,
+                    partial: true
+                };
+                previousPart = {
+                    url: partUrl,
+                    byterange: partByteRange
+                };
+                if (!/^YES$/i.test(partAttrs.GAP || '')) pendingParts.push(partEntry);
+                return;
+            }
+
             var byteRangeMatch = line.match(/^#EXT-X-BYTERANGE:(.*)$/i);
             if (byteRangeMatch) {
                 if (pendingByteRange !== null) throw new Error('Duplicate EXT-X-BYTERANGE before a media segment URI.');
@@ -1617,7 +1646,11 @@
             }
 
             if (line.charAt(0) === '#') return;
-            if (isMediaPlaylist || /\.(?:vtt|webvtt)(?:[?#]|$)/i.test(line)) {
+            if (isMediaPlaylist || /\.(?:vtt|webvtt|ttml|dfxp|srt)(?:[?#]|$)/i.test(line)) {
+                // A completed Parent Segment contains the same media as its preceding PARTs.
+                // Prefer the completed segment and retain PARTs only for the unfinished live edge.
+                pendingParts = [];
+                previousPart = null;
                 var segmentUrl = absoluteUrl(line, baseUrl);
                 var segmentByteRange = pendingByteRange === null ? null :
                     resolveHlsByteRange(pendingByteRange, segmentUrl, previousSegment);
@@ -1635,6 +1668,7 @@
         });
 
         if (pendingByteRange !== null) throw new Error('EXT-X-BYTERANGE is missing its media segment URI.');
+        Array.prototype.push.apply(entries, pendingParts);
         return entries;
     }
 
