@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.0
+// @version    1.0.1
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1149,15 +1149,42 @@
     }
 
     function extractSegmentUrls(text, baseUrl) {
-        var urls = [];
-        text.split(/\r\n|\r|\n/).forEach(function (line) {
-            line = line.trim();
-            if (!line || line.charAt(0) === '#') return;
-            if (/\.(?:vtt|webvtt)(?:[?#]|$)/i.test(line) || /WEBVTT/i.test(line)) {
-                urls.push(absoluteUrl(line, baseUrl));
+        return extractHlsSegmentEntries(text, baseUrl).map(function (entry) {
+            return entry.url;
+        });
+    }
+
+    function extractHlsSegmentEntries(text, baseUrl) {
+        var entries = [];
+        var lines = String(text || '').split(/\r\n|\r|\n/);
+        var isMediaPlaylist = lines.some(function (line) {
+            return /^#EXTINF:/i.test(line.trim());
+        });
+        var currentMap = null;
+
+        lines.forEach(function (rawLine) {
+            var line = rawLine.trim();
+            if (!line) return;
+
+            var mapMatch = line.match(/^#EXT-X-MAP:(.*)$/i);
+            if (mapMatch) {
+                var attrs = parseAttrList(mapMatch[1]);
+                currentMap = attrs.URI ? {
+                    url: absoluteUrl(attrs.URI, baseUrl),
+                    byterange: attrs.BYTERANGE || ''
+                } : null;
+                return;
+            }
+
+            if (line.charAt(0) === '#') return;
+            if (isMediaPlaylist || /\.(?:vtt|webvtt)(?:[?#]|$)/i.test(line)) {
+                entries.push({
+                    url: absoluteUrl(line, baseUrl),
+                    map: currentMap
+                });
             }
         });
-        return urls;
+        return entries;
     }
 
     function downloadAllTracks() {
@@ -1349,34 +1376,154 @@
 
             var duration = playlistDurationSeconds(playlist) || subtitleTextDurationSeconds(playlist);
             if (duration && !track.playlistDuration) track.playlistDuration = duration;
-            var segments = track.segments && track.segments.length ? track.segments : extractSegmentUrls(playlist, track.URI);
+            var segments = extractHlsSegmentEntries(playlist, track.URI);
+            if (!segments.length && track.segments && track.segments.length) {
+                segments = track.segments.map(function (url) { return { url: url, map: null }; });
+            }
             if (!segments.length) throw new Error('No VTT segments found for ' + track.NAME + '.');
 
             var merged = 'WEBVTT\n\n';
-            var successCount = 0;
-            return runSequential(segments, function (segmentUrl) {
-                return getText(segmentUrl).then(function (segmentText) {
-                    var cleaned = cleanVttSegment(segmentText);
-                    if (cleaned.trim()) {
-                        merged += cleaned.trim() + '\n\n';
-                        successCount++;
+            var timestampState = createHlsTimestampState();
+            var mapCache = {};
+            var seenBlocks = {};
+            var failedSegments = [];
+            var cueCount = 0;
+            return runSequential(segments, function (segment) {
+                return Promise.all([
+                    getText(segment.url),
+                    getHlsInitText(segment.map, mapCache)
+                ]).then(function (values) {
+                    var cleaned = normalizeHlsVttSegment(values[0], timestampState, values[1]);
+                    var uniqueBody = uniqueHlsVttBody(cleaned, seenBlocks);
+                    if (uniqueBody) {
+                        merged += uniqueBody + '\n\n';
+                        cueCount += countHlsVttCues(uniqueBody);
                     }
                 }).catch(function (err) {
+                    failedSegments.push(segment.url);
                     debuglog('Segment failed: ' + err.message);
                 });
             }).then(function () {
-                if (successCount === 0) throw new Error('Failed to download subtitle segments.');
+                if (failedSegments.length) {
+                    throw new Error('Failed to download ' + failedSegments.length + ' of ' + segments.length + ' subtitle segments; refusing to save an incomplete subtitle.');
+                }
+                if (cueCount === 0) throw new Error('No subtitle cues found in downloaded segments.');
                 return merged;
             });
         });
     }
 
     function cleanVttSegment(text) {
-        return text
+        return String(text || '')
             .replace(/^\uFEFF/, '')
+            .replace(/\r\n|\r/g, '\n')
             .replace(/^WEBVTT[^\n]*(?:\n|$)/i, '')
-            .replace(/^X-TIMESTAMP-MAP:[^\n]*(?:\n|$)/gmi, '')
+            .replace(/^X-TIMESTAMP-MAP\s*=\s*[^\n]*(?:\n|$)/gmi, '')
             .replace(/\n{3,}/g, '\n\n');
+    }
+
+    function createHlsTimestampState() {
+        return { baseOffsetSeconds: null };
+    }
+
+    function normalizeHlsVttSegment(text, timestampState, initText) {
+        var value = String(text || '').replace(/\r\n|\r/g, '\n');
+        var initValue = String(initText || '').replace(/\r\n|\r/g, '\n');
+        var timestampMap = parseHlsTimestampMap(value) || parseHlsTimestampMap(initValue);
+        var offsetSeconds = timestampMap ? timestampMap.mpegTimestamp / 90000 - timestampMap.localSeconds : 0;
+        if (timestampState.baseOffsetSeconds === null) {
+            timestampState.baseOffsetSeconds = offsetSeconds;
+        }
+        var shiftSeconds = normalizeHlsTimestampOffset(offsetSeconds - timestampState.baseOffsetSeconds);
+        if (Math.abs(shiftSeconds) >= 0.0005) {
+            value = shiftHlsVttCueTimes(value, shiftSeconds);
+        }
+        return cleanVttSegment(value);
+    }
+
+    function getHlsInitText(mapInfo, cache) {
+        if (!mapInfo || !mapInfo.url) return Promise.resolve('');
+        if (mapInfo.byterange) {
+            return Promise.reject(new Error('EXT-X-MAP BYTERANGE is not supported for ' + shortUrl(mapInfo.url)));
+        }
+        if (!cache[mapInfo.url]) {
+            cache[mapInfo.url] = getText(mapInfo.url);
+        }
+        return cache[mapInfo.url];
+    }
+
+    function parseHlsTimestampMap(text) {
+        var line = String(text || '').match(/^X-TIMESTAMP-MAP\s*=\s*([^\n]+)$/mi);
+        if (!line) return null;
+        var local = line[1].match(/(?:^|,)\s*LOCAL:([^,\s]+)/i);
+        var mpeg = line[1].match(/(?:^|,)\s*MPEGTS:(\d+)/i);
+        if (!local || !mpeg) return null;
+        var localSeconds = hlsTimestampSeconds(local[1]);
+        var mpegTimestamp = Number(mpeg[1]);
+        if (!isFinite(localSeconds) || !isFinite(mpegTimestamp)) return null;
+        return { localSeconds: localSeconds, mpegTimestamp: mpegTimestamp };
+    }
+
+    function normalizeHlsTimestampOffset(seconds) {
+        var wrapSeconds = Math.pow(2, 33) / 90000;
+        return ((seconds + wrapSeconds / 2) % wrapSeconds + wrapSeconds) % wrapSeconds - wrapSeconds / 2;
+    }
+
+    function shiftHlsVttCueTimes(text, shiftSeconds) {
+        return String(text || '').replace(
+            /^([ \t]*)((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})([ \t]+-->[ \t]+)((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})(.*)$/gm,
+            function (_, prefix, start, arrow, end, settings) {
+                return prefix +
+                    formatHlsTimestamp(hlsTimestampSeconds(start) + shiftSeconds) +
+                    arrow +
+                    formatHlsTimestamp(hlsTimestampSeconds(end) + shiftSeconds) +
+                    settings;
+            }
+        );
+    }
+
+    function hlsTimestampSeconds(value) {
+        var parts = String(value || '').split(':');
+        if (parts.length === 3) {
+            return (parseInt(parts[0], 10) || 0) * 3600 +
+                (parseInt(parts[1], 10) || 0) * 60 +
+                (parseFloat(parts[2]) || 0);
+        }
+        if (parts.length === 2) {
+            return (parseInt(parts[0], 10) || 0) * 60 + (parseFloat(parts[1]) || 0);
+        }
+        return NaN;
+    }
+
+    function formatHlsTimestamp(seconds) {
+        var totalMs = Math.max(0, Math.round((Number(seconds) || 0) * 1000));
+        var hours = Math.floor(totalMs / 3600000);
+        var minutes = Math.floor((totalMs % 3600000) / 60000);
+        var secs = Math.floor((totalMs % 60000) / 1000);
+        var ms = totalMs % 1000;
+        return String(hours).padStart(2, '0') + ':' +
+            String(minutes).padStart(2, '0') + ':' +
+            String(secs).padStart(2, '0') + '.' +
+            String(ms).padStart(3, '0');
+    }
+
+    function uniqueHlsVttBody(text, seenBlocks) {
+        var output = [];
+        String(text || '').replace(/\r\n|\r/g, '\n').split(/\n{2,}/).forEach(function (block) {
+            block = block.trim();
+            if (!block || seenBlocks[block]) return;
+            seenBlocks[block] = true;
+            output.push(block);
+        });
+        return output.join('\n\n');
+    }
+
+    function countHlsVttCues(text) {
+        var count = 0;
+        String(text || '').split(/\r\n|\r|\n/).forEach(function (line) {
+            if (line.indexOf('-->') >= 0) count++;
+        });
+        return count;
     }
 
     function normalizeVttForDownload(vtt) {
