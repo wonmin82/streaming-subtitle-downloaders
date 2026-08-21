@@ -119,7 +119,7 @@ for path, (old_version, new_version) in SCRIPTS.items():
     if text.count(old_meta) != 1:
         raise SystemExit(f'{path}: expected exactly one {old_meta!r}')
     text = text.replace(old_meta, new_meta, 1)
-    text, count = pattern.subn(FUNCTION + '\n', text, count=1)
+    text, count = pattern.subn(lambda match: FUNCTION + '\n', text, count=1)
     if count != 1:
         raise SystemExit(f'{path}: extractHlsSegmentEntries replacement count={count}')
     path.write_text(text)
