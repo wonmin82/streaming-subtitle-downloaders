@@ -1,7 +1,7 @@
 name: Temporary TTML vertical text validation
 on:
   pull_request:
-    types: [opened]
+    types: [reopened]
     branches: [main]
 permissions:
   contents: write
