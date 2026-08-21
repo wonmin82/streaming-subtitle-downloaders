@@ -15,7 +15,7 @@ const context = { console };
 vm.createContext(context);
 vm.runInContext(`
 function localName(node) {
-    return String(node && (node.localName || node.nodeName || node.name) || '').split(':').pop().toLowerCase();
+    return String(node && (node.localName || node.nodeName || node.name) || '').split(':').pop();
 }
 ${source.slice(start, end)}
 `, context);
