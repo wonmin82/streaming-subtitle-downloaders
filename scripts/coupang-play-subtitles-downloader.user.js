@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.19
+// @version    1.0.20
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2808,17 +2808,22 @@
         return fill === 'freeze' && activeTime >= timing.end;
     }
 
-    function ttmlActiveInlineSetStyle(node, styleMap, timingContext, activeTime) {
+    function ttmlActiveSetStyle(node, styleMap, timingContext, activeTime, propertyNames) {
         var animated = {};
         Array.prototype.slice.call(node && node.childNodes || []).forEach(function (child) {
             if (child.nodeType !== 1 || localName(child) !== 'set') return;
             if (!ttmlSetAppliesAtTime(child, timingContext, activeTime)) return;
             var specified = ttmlSpecifiedPresentationStyle(child, styleMap);
-            ['fontWeight', 'fontStyle', 'textDecoration', 'textCombine', 'textOrientation'].forEach(function (name) {
+            (propertyNames || []).forEach(function (name) {
                 if (specified[name]) animated[name] = specified[name];
             });
         });
         return animated;
+    }
+
+    function ttmlActiveInlineSetStyle(node, styleMap, timingContext, activeTime) {
+        return ttmlActiveSetStyle(node, styleMap, timingContext, activeTime,
+            ['fontWeight', 'fontStyle', 'textDecoration', 'textCombine', 'textOrientation']);
     }
 
     function ttmlComputedPresentationStyleAtTime(node, styleMap, timingContext, activeTime) {
@@ -2894,6 +2899,13 @@
             if (child.nodeType !== 1 || localName(child) !== 'style') return;
             ttmlMergePresentationStyle(resolved, ttmlSpecifiedPresentationStyle(child, styleMap));
         });
+        return resolved;
+    }
+
+    function ttmlRegionPresentationStyleAtTime(region, styleMap, timingContext, activeTime) {
+        var resolved = ttmlRegionPresentationStyle(region, styleMap);
+        ttmlMergePresentationStyle(resolved, ttmlActiveSetStyle(region, styleMap, timingContext, activeTime,
+            ['fontSize', 'origin', 'extent', 'position', 'textAlign', 'displayAlign', 'writingMode']));
         return resolved;
     }
 
@@ -3030,17 +3042,18 @@
         return ttmlInitialFontSize(doc, context);
     }
 
-    function ttmlContentFontSize(node, doc, styleMap, regionFontSize, context, depth) {
+    function ttmlContentFontSize(node, doc, styleMap, regionFontSize, context, depth, timingContext, activeTime) {
         if (!node || depth > 64) return regionFontSize;
         var parent = node.parentNode;
         while (parent && parent.nodeType === 1 && !/^(?:body|div|p|span)$/.test(localName(parent))) {
             parent = parent.parentNode;
         }
         var parentSize = parent && parent.nodeType === 1
-            ? ttmlContentFontSize(parent, doc, styleMap, regionFontSize, context, depth + 1)
+            ? ttmlContentFontSize(parent, doc, styleMap, regionFontSize, context, depth + 1, timingContext, activeTime)
             : regionFontSize;
         if (!parentSize) return null;
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
+        ttmlMergePresentationStyle(specified, ttmlActiveSetStyle(node, styleMap, timingContext, activeTime, ['fontSize']));
         return specified.fontSize ? ttmlResolveFontSize(specified.fontSize, parentSize, context) : parentSize;
     }
 
@@ -3226,9 +3239,59 @@
         return null;
     }
 
-    function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) {
+    function ttmlContentPresentationValueAtTime(node, name, styleMap, timingContext, activeTime) {
+        var chain = [];
+        var current = node;
+        while (current && current.nodeType === 1) {
+            if (/^(?:body|div|p|span)$/.test(localName(current))) chain.push(current);
+            current = current.parentNode;
+        }
+        var value = '';
+        for (var i = chain.length - 1; i >= 0; i--) {
+            var specified = ttmlSpecifiedPresentationStyle(chain[i], styleMap);
+            ttmlMergePresentationStyle(specified, ttmlActiveSetStyle(chain[i], styleMap, timingContext, activeTime, [name]));
+            if (specified[name]) value = specified[name];
+        }
+        return value;
+    }
+
+    function ttmlNodeLayoutPresentationStyleAtTime(node, styleMap, timingContext, activeTime) {
+        var resolved = ttmlSpecifiedPresentationStyle(node, styleMap);
+        ttmlMergePresentationStyle(resolved, ttmlActiveSetStyle(node, styleMap, timingContext, activeTime,
+            ['fontSize', 'origin', 'extent', 'position', 'textAlign', 'displayAlign']));
+        return resolved;
+    }
+
+    function ttmlSetAffectsCuePresentation(node, styleMap) {
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
-        var value = specified.textAlign || regionStyle.textAlign || '';
+        return ['fontWeight', 'fontStyle', 'textDecoration', 'textCombine', 'textOrientation', 'fontSize',
+            'origin', 'extent', 'position', 'textAlign', 'displayAlign', 'writingMode'].some(function (name) {
+            return !!specified[name];
+        });
+    }
+
+    function ttmlCueExternalTimedSets(node, doc, styleMap) {
+        var result = [];
+        var seen = [];
+        function addDirectSets(container) {
+            Array.prototype.slice.call(container && container.childNodes || []).forEach(function (child) {
+                if (child.nodeType !== 1 || localName(child) !== 'set' || !ttmlSetAffectsCuePresentation(child, styleMap)) return;
+                if (seen.indexOf(child) >= 0) return;
+                seen.push(child);
+                result.push(child);
+            });
+        }
+        var current = node && node.parentNode;
+        while (current && current.nodeType === 1) {
+            if (/^(?:body|div|span)$/.test(localName(current))) addDirectSets(current);
+            current = current.parentNode;
+        }
+        addDirectSets(ttmlCueRegion(node, doc));
+        return result;
+    }
+
+    function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode, timingContext, activeTime) {
+        var value = ttmlContentPresentationValueAtTime(node, 'textAlign', styleMap, timingContext, activeTime) || regionStyle.textAlign || '';
         if (!value && ttmlWebVttVertical(writingMode)) value = 'start';
         return ttmlWebVttAlign(value, writingMode);
     }
@@ -3253,24 +3316,24 @@
         return '';
     }
 
-    function ttmlCueSettings(node, doc) {
-        var styleMap = ttmlStyleMap(doc);
+    function ttmlCueSettings(node, doc, timingContext, activeTime, styleMap) {
+        styleMap = styleMap || ttmlStyleMap(doc);
         var region = ttmlCueRegion(node, doc);
-        var regionStyle = region ? ttmlRegionPresentationStyle(region, styleMap) : {};
+        var regionStyle = region ? ttmlRegionPresentationStyleAtTime(region, styleMap, timingContext, activeTime) : {};
         var writingMode = String(regionStyle.writingMode || 'lrtb').toLowerCase();
         var horizontalWriting = /^(?:lrtb|rltb|lr|rl)$/.test(writingMode);
         var verticalWriting = ttmlWebVttVertical(writingMode);
         var supportedWriting = horizontalWriting || !!verticalWriting;
         var settings = [];
         if (verticalWriting) settings.push('vertical:' + verticalWriting);
-        var align = supportedWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) : '';
+        var align = supportedWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode, timingContext, activeTime) : '';
         if (align) settings.push('align:' + align);
         if (!region || !supportedWriting) return settings.join(' ');
 
-        var nodeStyle = ttmlSpecifiedPresentationStyle(node, styleMap);
+        var nodeStyle = ttmlNodeLayoutPresentationStyleAtTime(node, styleMap, timingContext, activeTime);
         var baseLayoutContext = ttmlLayoutContext(doc);
         var regionFontSize = ttmlRegionFontSize(regionStyle, doc, baseLayoutContext);
-        var nodeFontSize = ttmlContentFontSize(node, doc, styleMap, regionFontSize, baseLayoutContext, 0);
+        var nodeFontSize = ttmlContentFontSize(node, doc, styleMap, regionFontSize, baseLayoutContext, 0, timingContext, activeTime);
         var regionLayoutContext = ttmlLayoutContext(doc, regionFontSize);
         var nodeLayoutContext = ttmlLayoutContext(doc, nodeFontSize);
         var extentFromNode = !!nodeStyle.extent;
@@ -3347,6 +3410,7 @@
         if (!timing || !isFinite(timing.begin) || !isFinite(timing.end) || timing.end <= timing.begin) return [];
 
         var boundaries = [timing.begin, timing.end];
+        var styleMap = ttmlStyleMap(doc);
         var descendants = node.getElementsByTagName ? node.getElementsByTagName('*') : [];
         for (var i = 0; i < descendants.length; i++) {
             var descendant = descendants[i];
@@ -3362,14 +3426,21 @@
             if (boundaries.length > MAX_TTML_CUE_BOUNDARIES) return [];
         }
 
+        var externalSets = ttmlCueExternalTimedSets(node, doc, styleMap);
+        for (var externalIndex = 0; externalIndex < externalSets.length; externalIndex++) {
+            var externalTiming = ttmlResolveTiming(externalSets[externalIndex], timingContext, 0);
+            if (!externalTiming) return [];
+            if (isFinite(externalTiming.begin) && externalTiming.begin > timing.begin && externalTiming.begin < timing.end) boundaries.push(externalTiming.begin);
+            if (isFinite(externalTiming.end) && externalTiming.end > timing.begin && externalTiming.end < timing.end) boundaries.push(externalTiming.end);
+            if (boundaries.length > MAX_TTML_CUE_BOUNDARIES) return [];
+        }
+
         boundaries.sort(function (a, b) { return a - b; });
         var unique = [];
         boundaries.forEach(function (value) {
             if (!unique.length || Math.abs(value - unique[unique.length - 1]) > 0.000001) unique.push(value);
         });
 
-        var settings = ttmlCueSettings(node, doc);
-        var styleMap = ttmlStyleMap(doc);
         var intervals = [];
         for (var j = 0; j + 1 < unique.length; j++) {
             var begin = unique[j];
@@ -3378,6 +3449,7 @@
             var sampleTime = begin + (end - begin) / 2;
             var cueText = ttmlCueText(node, doc, timingContext, sampleTime, styleMap);
             if (!cueText.replace(/\s/g, '')) continue;
+            var settings = ttmlCueSettings(node, doc, timingContext, sampleTime, styleMap);
 
             var previous = intervals.length ? intervals[intervals.length - 1] : null;
             if (previous && previous.text === cueText && previous.settings === settings && Math.abs(previous.end - begin) <= 0.000001) {
