@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.9
+// @version    1.0.10
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -201,6 +201,11 @@
         } catch (err) {
             return false;
         }
+    }
+
+    function isActivePlaybackObservation() {
+        if (isTopFrame()) return isPlaybackPage() && hasPlaybackSurface();
+        return !!state.playbackSessionId && !!state.topSessionOrigin && isPlaybackContext();
     }
 
     function isPlaybackResourceUrl(rawUrl) {
@@ -493,6 +498,7 @@
             segments: track.segments || null,
             hlsSegments: track.hlsSegments || null,
             playlistDuration: track.playlistDuration || null,
+            activePlayback: !!track.activePlayback,
             contentType: track.contentType || ''
         };
     }
@@ -902,6 +908,7 @@
                 FORCED: /forced/i.test(url) ? 'YES' : 'NO',
                 URI: url,
                 source: source || 'direct',
+                activePlayback: isActivePlaybackObservation(),
                 contentType: inferContentType(url)
             });
             state.status = 'Ready. Select a subtitle track.';
@@ -918,11 +925,12 @@
         sessionId = resolveObservationSession(sessionId, observedAt);
         if (!sessionId && shouldDefer) return;
         if (!isPlaybackSessionCurrent(sessionId)) return;
+        var activePlayback = isActivePlaybackObservation();
 
         baseUrl = normalizeUrl(baseUrl);
         var trimmed = text.replace(/^\uFEFF/, '').trim();
         if (baseUrl && isManifestUrl(baseUrl)) {
-            parseManifest(baseUrl, trimmed, sessionId);
+            parseManifest(baseUrl, trimmed, sessionId, activePlayback);
         } else if (baseUrl && isSubtitleUrl(baseUrl)) {
             addTrack({
                 NAME: inferTrackName(baseUrl),
@@ -930,6 +938,7 @@
                 FORCED: /forced/i.test(baseUrl) ? 'YES' : 'NO',
                 URI: baseUrl,
                 source: source || 'direct',
+                activePlayback: activePlayback,
                 contentType: inferContentType(baseUrl),
                 playlistDuration: subtitleTextDurationSeconds(trimmed) || null
             });
@@ -940,12 +949,13 @@
                 FORCED: /forced/i.test(baseUrl) ? 'YES' : 'NO',
                 URI: baseUrl,
                 source: source || 'direct-text',
+                activePlayback: activePlayback,
                 contentType: inferTextContentType(trimmed),
                 text: trimmed,
                 playlistDuration: subtitleTextDurationSeconds(trimmed) || null
             });
         } else if (/^\s*#EXTM3U/i.test(trimmed) || /^\s*<MPD[\s>]/i.test(trimmed)) {
-            parseManifest(baseUrl || location.href, trimmed, sessionId);
+            parseManifest(baseUrl || location.href, trimmed, sessionId, activePlayback);
         }
 
         extractUrlsFromText(trimmed, baseUrl).forEach(function (url) {
@@ -953,7 +963,7 @@
         });
 
         try {
-            collectSubtitleUrlsFromJson(JSON.parse(trimmed), baseUrl, '', 0, sessionId, observedAt);
+            collectSubtitleUrlsFromJson(JSON.parse(trimmed), baseUrl, '', 0, sessionId, observedAt, activePlayback);
         } catch (err) {}
     }
 
@@ -977,7 +987,7 @@
         return Object.keys(urls);
     }
 
-    function collectSubtitleUrlsFromJson(value, baseUrl, path, depth, sessionId, observedAt) {
+    function collectSubtitleUrlsFromJson(value, baseUrl, path, depth, sessionId, observedAt, activePlayback) {
         if (value == null || depth > 12) return;
         if (typeof value === 'string') {
             extractUrlsFromText(value, baseUrl).forEach(function (url) {
@@ -989,7 +999,7 @@
 
         if (Array.isArray(value)) {
             value.slice(0, 500).forEach(function (item) {
-                collectSubtitleUrlsFromJson(item, baseUrl, path, depth + 1, sessionId, observedAt);
+                collectSubtitleUrlsFromJson(item, baseUrl, path, depth + 1, sessionId, observedAt, activePlayback);
             });
             return;
         }
@@ -1015,7 +1025,7 @@
                 forced = 'YES';
             }
 
-            collectSubtitleUrlsFromJson(child, baseUrl, nextPath, depth + 1, sessionId, observedAt);
+            collectSubtitleUrlsFromJson(child, baseUrl, nextPath, depth + 1, sessionId, observedAt, activePlayback);
         });
 
         if (possibleUrl) {
@@ -1030,6 +1040,7 @@
                     TYPE: type || '',
                     URI: url,
                     source: 'json',
+                    activePlayback: !!activePlayback,
                     contentType: inferContentType(url)
                 });
             }
@@ -1076,13 +1087,15 @@
         if (!isPlaybackSessionCurrent(sessionId)) return;
         if (state.seenManifestUrls[url]) return;
         state.seenManifestUrls[url] = 'pending';
+        var activePlayback = isActivePlaybackObservation();
         state.status = 'Found manifest via ' + source + '. Reading tracks...';
         updateUi();
 
         getText(url).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             state.seenManifestUrls[url] = 'loaded';
-            parseManifest(url, text || '', sessionId);
+            if (/^Could not read manifest:/.test(state.lastError || '')) state.lastError = '';
+            parseManifest(url, text || '', sessionId, activePlayback);
             updateUi();
         }).catch(function (err) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
@@ -1095,18 +1108,19 @@
         });
     }
 
-    function parseManifest(url, text, sessionId) {
+    function parseManifest(url, text, sessionId, activePlayback) {
         if (!isPlaybackSessionCurrent(sessionId)) return;
         if (!text) return;
+        activePlayback = activePlayback == null ? isActivePlaybackObservation() : !!activePlayback;
         if (/^\s*#EXTM3U/i.test(text)) {
-            parseHlsManifest(url, text);
+            parseHlsManifest(url, text, activePlayback);
         } else if (/^\s*<MPD[\s>]/i.test(text)) {
-            parseDashManifest(url, text);
+            parseDashManifest(url, text, activePlayback);
         }
         if (state.tracks.length > 0) state.status = 'Ready. Select a subtitle track.';
     }
 
-    function parseHlsManifest(url, text) {
+    function parseHlsManifest(url, text, activePlayback) {
         var lines = text.split(/\r\n|\r|\n/);
         var subtitleMediaLines = lines.filter(function (line) {
             return /^#EXT-X-MEDIA:/i.test(line) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(line);
@@ -1124,6 +1138,7 @@
                 TYPE: attrs.TYPE || '',
                 URI: trackUrl,
                 source: 'hls-master',
+                activePlayback: !!activePlayback,
                 contentType: inferContentType(trackUrl)
             });
         });
@@ -1135,6 +1150,7 @@
                 FORCED: /forced/i.test(url) ? 'YES' : 'NO',
                 URI: url,
                 source: 'hls-playlist',
+                activePlayback: !!activePlayback,
                 segments: extractSegmentUrls(text, url),
                 hlsSegments: extractHlsSegmentEntries(text, url),
                 playlistDuration: playlistDurationSeconds(text) || null,
@@ -1143,7 +1159,7 @@
         }
     }
 
-    function parseDashManifest(url, text) {
+    function parseDashManifest(url, text, activePlayback) {
         var doc;
         try {
             doc = new DOMParser().parseFromString(text, 'application/xml');
@@ -1192,6 +1208,7 @@
                             TYPE: repMime,
                             URI: representationBaseUrl,
                             source: 'dash',
+                            activePlayback: !!activePlayback,
                             contentType: inferContentType(representationBaseUrl)
                         });
                     }
@@ -1212,6 +1229,7 @@
                             TYPE: repMime,
                             URI: url,
                             source: 'dash-template',
+                            activePlayback: !!activePlayback,
                             segments: templateSegments,
                             playlistDuration: periodDuration || null,
                             contentType: inferContentType(templateSegments[0])
@@ -1531,6 +1549,7 @@
             existing.hlsSegments = incoming.hlsSegments || null;
             existing.contentType = incoming.contentType || existing.contentType;
             existing.playlistDuration = incoming.playlistDuration || existing.playlistDuration;
+            existing.activePlayback = !!incoming.activePlayback;
         } else if (incoming.segments && incoming.segments.length && (!existing.segments || !existing.segments.length)) {
             existing.segments = incoming.segments;
         }
@@ -1541,18 +1560,20 @@
         if (!existing.FORCED && incoming.FORCED) existing.FORCED = incoming.FORCED;
         if (!existing.TYPE && incoming.TYPE) existing.TYPE = incoming.TYPE;
         if (!existing.CHARACTERISTICS && incoming.CHARACTERISTICS) existing.CHARACTERISTICS = incoming.CHARACTERISTICS;
+        if (!existing.activePlayback && incoming.activePlayback && incomingScore >= existingScore) existing.activePlayback = true;
         if (isBetterTrackName(incoming.NAME, existing.NAME)) existing.NAME = incoming.NAME;
         debuglog('Track merged: ' + existing.NAME);
     }
 
     function trackScoreForSource(track) {
         var score = 0;
+        if (track.activePlayback) score += 100;
         if (track.source === 'json') score += 5;
         if (/master|dash/.test(track.source || '')) score += 4;
         if (/playlist/.test(track.source || '')) score += 3;
         if (track.segments && track.segments.length) score += 3;
         if (track.playlistDuration && track.playlistDuration > 120) score += 5;
-        if (isShortPreviewTrack(track)) score -= 20;
+        if (isShortPreviewTrack(track)) score -= 200;
         if (track.URI) score += 1;
         return score;
     }

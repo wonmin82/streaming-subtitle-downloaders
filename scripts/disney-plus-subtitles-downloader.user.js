@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.6
+// @version    1.0.7
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -621,6 +621,7 @@
         getText(url).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             state.seenManifestUrls[url] = 'loaded';
+            if (/^Could not read manifest:/.test(state.lastError || '')) state.lastError = '';
             parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
@@ -732,7 +733,7 @@
         var incomingScore = trackSourceScore(incoming);
         var existingScore = trackSourceScore(existing);
 
-        if (incomingScore >= existingScore) {
+        if (incomingScore > existingScore) {
             existing.URI = incoming.URI;
             existing.source = incoming.source || existing.source;
             existing.segments = incoming.segments || existing.segments;
