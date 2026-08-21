@@ -2,7 +2,7 @@ name: Temporary TTML em geometry validation
 
 on:
   pull_request:
-    types: [opened]
+    types: [reopened]
     branches: [main]
 
 permissions:
