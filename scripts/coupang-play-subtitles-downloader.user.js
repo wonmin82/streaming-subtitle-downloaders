@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.11
+// @version    1.0.12
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -32,6 +32,8 @@
     var MESSAGE_TYPE_TRACK = 'cpsd-subtitle-track';
     var MESSAGE_TYPE_SESSION = 'cpsd-playback-session';
     var MESSAGE_TYPE_SESSION_REQUEST = 'cpsd-playback-session-request';
+    var MAX_SESSION_CLIENTS = 32;
+    var MAX_MESSAGE_TRACK_SEGMENTS = 10000;
 
     var state = {
         initialized: false,
@@ -377,19 +379,56 @@
         return Date.now();
     }
 
+    function isPlainMessageObject(value) {
+        return !!value && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function isDescendantFrameSource(source) {
+        if (!isTopFrame() || !source || source === window) return false;
+        try {
+            return source.top === window;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function isValidSessionId(sessionId) {
+        return typeof sessionId === 'string' && /^coupang\:[A-Za-z0-9:._-]{1,248}$/.test(sessionId);
+    }
+
+    function isValidSessionStartedAt(value) {
+        return typeof value === 'number' && isFinite(value) && value > 0 && value <= Date.now() + 60000;
+    }
+
+    function isSessionRequestMessage(data) {
+        return isPlainMessageObject(data) && data.type === MESSAGE_TYPE_SESSION_REQUEST;
+    }
+
+    function isSessionMessage(data) {
+        return isPlainMessageObject(data) && data.type === MESSAGE_TYPE_SESSION &&
+            isValidSessionId(data.sessionId) && isValidSessionStartedAt(data.sessionStartedAtEpochMs);
+    }
+
+    function isTrackMessage(data) {
+        return isPlainMessageObject(data) && data.type === MESSAGE_TYPE_TRACK &&
+            isValidSessionId(data.sessionId) && isPlainMessageObject(data.track);
+    }
+
     function registerSessionClient(source, origin) {
-        if (!isTopFrame() || !source || !origin) return;
+        if (!isTopFrame() || !isDescendantFrameSource(source) || !isTrustedCoupangOrigin(origin)) return false;
         for (var i = 0; i < state.sessionClients.length; i++) {
             if (state.sessionClients[i].source === source) {
                 state.sessionClients[i].origin = origin;
-                return;
+                return true;
             }
         }
+        if (state.sessionClients.length >= MAX_SESSION_CLIENTS) return false;
         state.sessionClients.push({ source: source, origin: origin });
+        return true;
     }
 
     function isRegisteredSessionClient(source, origin) {
-        if (!isTopFrame()) return false;
+        if (!isTopFrame() || !isDescendantFrameSource(source) || !isTrustedCoupangOrigin(origin)) return false;
         for (var i = 0; i < state.sessionClients.length; i++) {
             if (state.sessionClients[i].source === source && state.sessionClients[i].origin === origin) return true;
         }
@@ -399,11 +438,10 @@
     function installSessionBridge() {
         window.addEventListener('message', function (event) {
             var data = event.data;
-            if (!data || !isTrustedCoupangOrigin(event.origin)) return;
+            if (!isPlainMessageObject(data) || !isTrustedCoupangOrigin(event.origin)) return;
 
-            if (data.type === MESSAGE_TYPE_SESSION_REQUEST && isTopFrame()) {
-                if (!event.source || !event.source.postMessage) return;
-                registerSessionClient(event.source, event.origin);
+            if (isSessionRequestMessage(data) && isTopFrame()) {
+                if (!registerSessionClient(event.source, event.origin)) return;
                 if (!state.playbackSessionId) return;
                 try {
                     event.source.postMessage({
@@ -417,10 +455,12 @@
                 return;
             }
 
-            if (data.type === MESSAGE_TYPE_SESSION && !isTopFrame()) {
+            if (isSessionMessage(data) && !isTopFrame()) {
                 if (event.source !== window.top) return;
+                if (state.topSessionOrigin && event.origin !== state.topSessionOrigin) return;
+                if (state.playbackSessionEpochMs && Number(data.sessionStartedAtEpochMs) < state.playbackSessionEpochMs) return;
                 state.topSessionOrigin = event.origin;
-                adoptPlaybackSession(data.sessionId || '', data.sessionStartedAtEpochMs);
+                adoptPlaybackSession(data.sessionId, data.sessionStartedAtEpochMs);
             }
         });
     }
@@ -445,6 +485,7 @@
         if (!isTopFrame() || !state.playbackSessionId) return;
         var activeClients = [];
         state.sessionClients.forEach(function (client) {
+            if (!isDescendantFrameSource(client.source) || !isTrustedCoupangOrigin(client.origin)) return;
             try {
                 client.source.postMessage({
                     type: MESSAGE_TYPE_SESSION,
@@ -460,11 +501,13 @@
     function installFrameBridge() {
         window.addEventListener('message', function (event) {
             var data = event.data;
-            if (!data || data.type !== MESSAGE_TYPE_TRACK || !data.track) return;
+            if (!isTrackMessage(data)) return;
             if (!isTrustedCoupangOrigin(event.origin)) return;
             if (!isRegisteredSessionClient(event.source, event.origin)) return;
             if (data.sessionId !== state.playbackSessionId) return;
-            addTrack(data.track, true);
+            var track = sanitizeTrackMessage(data.track);
+            if (!track) return;
+            addTrack(track, true);
             state.status = 'Ready. Select a subtitle track.';
             updateUi();
         });
@@ -472,17 +515,123 @@
 
     function isTrustedCoupangOrigin(origin) {
         try {
-            var host = new URL(origin).hostname;
-            return isCoupangHost(host) || /\.coupangplay\.com$/i.test(host);
+            var parsed = new URL(origin);
+            if (parsed.protocol !== 'https:') return false;
+            var host = parsed.hostname;
+            return isCoupangHost(host);
         } catch (err) {
             return false;
         }
     }
 
+    function isSafeMessageUrl(value) {
+        if (typeof value !== 'string' || !value || value.length > 8192) return false;
+        try {
+            var parsed = new URL(value);
+            return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function sanitizedMessageString(value, maxLength) {
+        if (value == null) return '';
+        if (typeof value !== 'string' || value.length > maxLength) return null;
+        return value;
+    }
+
+    function isSafeMessageSegments(segments) {
+        if (segments == null) return true;
+        if (!Array.isArray(segments) || segments.length > MAX_MESSAGE_TRACK_SEGMENTS) return false;
+        for (var i = 0; i < segments.length; i++) {
+            if (!isSafeMessageUrl(segments[i])) return false;
+        }
+        return true;
+    }
+
+    function cloneSafeMessageSegments(segments) {
+        return segments == null ? null : segments.slice();
+    }
+
+    function isSafeMessageByteRange(range) {
+        if (range == null) return true;
+        if (!isPlainMessageObject(range) || typeof range.offset !== 'number' || typeof range.length !== 'number') return false;
+        var offset = range.offset;
+        var length = range.length;
+        return isFinite(offset) && Math.floor(offset) === offset && offset >= 0 && offset <= 9007199254740991 &&
+            isFinite(length) && Math.floor(length) === length && length > 0 && length <= 9007199254740991 &&
+            offset + length - 1 <= 9007199254740991;
+    }
+
+    function cloneSafeMessageByteRange(range) {
+        return range == null ? null : { offset: Number(range.offset), length: Number(range.length) };
+    }
+
+    function isSafeMessageHlsMap(map) {
+        return map == null || (isPlainMessageObject(map) && isSafeMessageUrl(map.url) && isSafeMessageByteRange(map.byterange));
+    }
+
+    function isSafeMessageHlsSegments(entries) {
+        if (entries == null) return true;
+        if (!Array.isArray(entries) || entries.length > MAX_MESSAGE_TRACK_SEGMENTS) return false;
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (!isPlainMessageObject(entry) || !isSafeMessageUrl(entry.url) ||
+                !isSafeMessageByteRange(entry.byterange) || !isSafeMessageHlsMap(entry.map)) return false;
+        }
+        return true;
+    }
+
+    function cloneSafeMessageHlsSegments(entries) {
+        if (entries == null) return null;
+        return entries.map(function (entry) {
+            return {
+                url: entry.url,
+                byterange: cloneSafeMessageByteRange(entry.byterange),
+                map: entry.map == null ? null : {
+                    url: entry.map.url,
+                    byterange: cloneSafeMessageByteRange(entry.map.byterange)
+                }
+            };
+        });
+    }
+
+    function sanitizeTrackMessage(track) {
+        if (!isPlainMessageObject(track) || !isSafeMessageUrl(track.URI)) return null;
+        var name = sanitizedMessageString(track.NAME, 512);
+        var language = sanitizedMessageString(track.LANGUAGE, 64);
+        var forced = sanitizedMessageString(track.FORCED, 16);
+        var characteristics = sanitizedMessageString(track.CHARACTERISTICS, 1024);
+        var type = sanitizedMessageString(track.TYPE, 256);
+        var source = sanitizedMessageString(track.source, 128);
+        var contentType = sanitizedMessageString(track.contentType, 256);
+        if (name === null || language === null || forced === null || characteristics === null || type === null || source === null || contentType === null) return null;
+        if (!isSafeMessageSegments(track.segments)) return null;
+        if (!isSafeMessageHlsSegments(track.hlsSegments)) return null;
+        if (track.activePlayback != null && typeof track.activePlayback !== 'boolean') return null;
+        if (track.playlistDuration != null && (typeof track.playlistDuration !== 'number' || !isFinite(track.playlistDuration) || track.playlistDuration < 0 || track.playlistDuration > 2592000)) return null;
+        return {
+            NAME: name,
+            LANGUAGE: language,
+            FORCED: forced || 'NO',
+            CHARACTERISTICS: characteristics,
+            TYPE: type,
+            URI: track.URI,
+            source: source,
+            segments: cloneSafeMessageSegments(track.segments),
+            activePlayback: !!track.activePlayback,
+            playlistDuration: track.playlistDuration == null ? null : track.playlistDuration,
+            hlsSegments: cloneSafeMessageHlsSegments(track.hlsSegments),
+            contentType: contentType,
+        };
+    }
+
     function forwardTrackToTop(track) {
         if (!state.playbackSessionId || !state.topSessionOrigin) return;
+        var messageTrack = sanitizeTrackMessage(cloneTrackForMessage(track));
+        if (!messageTrack) return;
         try {
-            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, sessionId: state.playbackSessionId, track: cloneTrackForMessage(track) }, state.topSessionOrigin);
+            window.top.postMessage({ type: MESSAGE_TYPE_TRACK, sessionId: state.playbackSessionId, track: messageTrack }, state.topSessionOrigin);
         } catch (err) {
             debuglog('Could not forward track to top frame: ' + err.message);
         }
