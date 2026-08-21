@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.18
+// @version    1.0.19
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2512,7 +2512,16 @@
                 cues.push(formatVttTime(cue.begin) + ' --> ' + formatVttTime(cue.end) + (cue.settings ? ' ' + cue.settings : '') + '\n' + cue.text);
             });
         });
-        return 'WEBVTT\n\n' + cues.join('\n\n') + '\n';
+        return ttmlVttDocument(cues);
+    }
+
+    function ttmlVttDocument(cues) {
+        var body = (cues || []).join('\n\n');
+        var header = 'WEBVTT\n\n';
+        if (body.indexOf('<c.ttml-combine>') >= 0) {
+            header += 'STYLE\n::cue(.ttml-combine) { text-combine-upright: all; }\n\n';
+        }
+        return header + body + '\n';
     }
 
     function ttmlHasParserError(doc) {
@@ -2736,7 +2745,7 @@
             ttmlMergePresentationStyle(specified, ttmlSpecifiedPresentationStyle(referenced, styleMap, nextResolving));
         });
 
-        ['fontWeight', 'fontStyle', 'textDecoration', 'ruby', 'fontSize', 'origin', 'extent', 'position', 'textAlign', 'displayAlign', 'writingMode'].forEach(function (name) {
+        ['fontWeight', 'fontStyle', 'textDecoration', 'ruby', 'fontSize', 'textCombine', 'textOrientation', 'origin', 'extent', 'position', 'textAlign', 'displayAlign', 'writingMode'].forEach(function (name) {
             var value = ttmlAttribute(node, name);
             if (value) specified[name] = value;
         });
@@ -2755,7 +2764,9 @@
             bold: false,
             italic: false,
             underline: false,
-            ruby: 'none'
+            ruby: 'none',
+            textCombine: 'none',
+            textOrientation: 'mixed'
         };
         var parent = node && node.parentNode;
         if (parent && parent.nodeType === 1) {
@@ -2763,6 +2774,8 @@
             inherited.bold = parentStyle.bold;
             inherited.italic = parentStyle.italic;
             inherited.underline = parentStyle.underline;
+            inherited.textCombine = parentStyle.textCombine;
+            inherited.textOrientation = parentStyle.textOrientation;
         }
 
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
@@ -2777,6 +2790,11 @@
             inherited.underline = ttmlUnderlineFromDecoration(specified.textDecoration, inherited.underline);
         }
         inherited.ruby = specified.ruby ? String(specified.ruby) : 'none';
+        if (specified.textCombine) inherited.textCombine = String(specified.textCombine).toLowerCase() === 'all' ? 'all' : 'none';
+        if (specified.textOrientation) {
+            var textOrientation = String(specified.textOrientation).toLowerCase();
+            inherited.textOrientation = /^(?:mixed|upright|sideways)$/.test(textOrientation) ? textOrientation : 'mixed';
+        }
         return inherited;
     }
 
@@ -2796,7 +2814,7 @@
             if (child.nodeType !== 1 || localName(child) !== 'set') return;
             if (!ttmlSetAppliesAtTime(child, timingContext, activeTime)) return;
             var specified = ttmlSpecifiedPresentationStyle(child, styleMap);
-            ['fontWeight', 'fontStyle', 'textDecoration'].forEach(function (name) {
+            ['fontWeight', 'fontStyle', 'textDecoration', 'textCombine', 'textOrientation'].forEach(function (name) {
                 if (specified[name]) animated[name] = specified[name];
             });
         });
@@ -2808,7 +2826,9 @@
             bold: false,
             italic: false,
             underline: false,
-            ruby: 'none'
+            ruby: 'none',
+            textCombine: 'none',
+            textOrientation: 'mixed'
         };
         var parent = node && node.parentNode;
         if (parent && parent.nodeType === 1) {
@@ -2816,6 +2836,8 @@
             inherited.bold = parentStyle.bold;
             inherited.italic = parentStyle.italic;
             inherited.underline = parentStyle.underline;
+            inherited.textCombine = parentStyle.textCombine;
+            inherited.textOrientation = parentStyle.textOrientation;
         }
 
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
@@ -2828,6 +2850,11 @@
         }
         if (specified.textDecoration) inherited.underline = ttmlUnderlineFromDecoration(specified.textDecoration, inherited.underline);
         inherited.ruby = specified.ruby ? String(specified.ruby) : 'none';
+        if (specified.textCombine) inherited.textCombine = String(specified.textCombine).toLowerCase() === 'all' ? 'all' : 'none';
+        if (specified.textOrientation) {
+            var textOrientation = String(specified.textOrientation).toLowerCase();
+            inherited.textOrientation = /^(?:mixed|upright|sideways)$/.test(textOrientation) ? textOrientation : 'mixed';
+        }
         return inherited;
     }
 
@@ -3452,6 +3479,10 @@
     function ttmlWrapVttText(value, style) {
         var open = '';
         var close = '';
+        if (style && style.textCombine === 'all') {
+            open += '<c.ttml-combine>';
+            close = '</c>' + close;
+        }
         if (style && style.bold) {
             open += '<b>';
             close = '</b>' + close;
