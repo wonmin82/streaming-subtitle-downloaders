@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.5
+// @version    1.0.6
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2142,8 +2142,9 @@
         paragraphs.forEach(function (p) {
             var timing = ttmlResolveTiming(p, context, 0);
             var text = ttmlCueText(p, doc);
+            var settings = ttmlCueSettings(p, doc);
             if (timing && text.replace(/\s/g, '') && isFinite(timing.begin) && isFinite(timing.end) && timing.end > timing.begin) {
-                cues.push(formatVttTime(timing.begin) + ' --> ' + formatVttTime(timing.end) + '\n' + text);
+                cues.push(formatVttTime(timing.begin) + ' --> ' + formatVttTime(timing.end) + (settings ? ' ' + settings : '') + '\n' + text);
             }
         });
         return 'WEBVTT\n\n' + cues.join('\n\n') + '\n';
@@ -2370,7 +2371,7 @@
             ttmlMergePresentationStyle(specified, ttmlSpecifiedPresentationStyle(referenced, styleMap, nextResolving));
         });
 
-        ['fontWeight', 'fontStyle', 'textDecoration', 'ruby'].forEach(function (name) {
+        ['fontWeight', 'fontStyle', 'textDecoration', 'ruby', 'origin', 'extent', 'position', 'textAlign', 'displayAlign', 'writingMode'].forEach(function (name) {
             var value = ttmlAttribute(node, name);
             if (value) specified[name] = value;
         });
@@ -2421,6 +2422,114 @@
         if (tokens.indexOf('none') >= 0 || tokens.indexOf('nounderline') >= 0) return false;
         if (tokens.indexOf('underline') >= 0) return true;
         return inherited;
+    }
+
+    function ttmlRegionMap(doc) {
+        var regions = {};
+        Array.prototype.slice.call(doc.getElementsByTagName('*')).forEach(function (node) {
+            if (localName(node) !== 'region' || !ttmlHasAncestor(node, 'layout')) return;
+            var id = ttmlAttribute(node, 'id');
+            if (id) regions[id] = node;
+        });
+        return regions;
+    }
+
+    function ttmlCueRegion(node, doc) {
+        var regions = ttmlRegionMap(doc);
+        var current = node;
+        while (current && current.nodeType === 1) {
+            var regionId = String(current.getAttribute('region') || '').trim();
+            if (regionId) return regions[regionId] || null;
+            current = current.parentNode;
+        }
+        return null;
+    }
+
+    function ttmlRegionPresentationStyle(region, styleMap) {
+        var resolved = ttmlSpecifiedPresentationStyle(region, styleMap);
+        Array.prototype.slice.call(region && region.childNodes || []).forEach(function (child) {
+            if (child.nodeType !== 1 || localName(child) !== 'style') return;
+            ttmlMergePresentationStyle(resolved, ttmlSpecifiedPresentationStyle(child, styleMap));
+        });
+        return resolved;
+    }
+
+    function ttmlPercentagePair(value) {
+        var match = String(value || '').trim().match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+))%\s+([+-]?(?:\d+(?:\.\d+)?|\.\d+))%$/);
+        if (!match) return null;
+        var first = Number(match[1]);
+        var second = Number(match[2]);
+        if (!isFinite(first) || !isFinite(second)) return null;
+        return [first, second];
+    }
+
+    function ttmlLayoutPercentage(value) {
+        var rounded = Math.round(Number(value) * 1000) / 1000;
+        if (!isFinite(rounded)) return '';
+        return String(rounded).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1') + '%';
+    }
+
+    function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) {
+        var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
+        var value = specified.textAlign || regionStyle.textAlign || '';
+        return ttmlWebVttAlign(value, writingMode);
+    }
+
+    function ttmlWebVttAlign(value, writingMode) {
+        value = String(value || '').toLowerCase();
+        writingMode = String(writingMode || 'lrtb').toLowerCase();
+        if (/^(?:left|center|right)$/.test(value)) return value;
+        if (value === 'start') return /^(?:rltb|rl)$/.test(writingMode) ? 'right' : 'left';
+        if (value === 'end') return /^(?:rltb|rl)$/.test(writingMode) ? 'left' : 'right';
+        return '';
+    }
+
+    function ttmlCueSettings(node, doc) {
+        var styleMap = ttmlStyleMap(doc);
+        var region = ttmlCueRegion(node, doc);
+        var regionStyle = region ? ttmlRegionPresentationStyle(region, styleMap) : {};
+        var writingMode = String(regionStyle.writingMode || 'lrtb').toLowerCase();
+        var horizontalWriting = /^(?:lrtb|rltb|lr|rl)$/.test(writingMode);
+        var settings = [];
+        var align = horizontalWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) : '';
+        if (align) settings.push('align:' + align);
+        if (!region) return settings.join(' ');
+        if (!horizontalWriting) return '';
+        if (regionStyle.position) return settings.join(' ');
+
+        var origin = ttmlPercentagePair(regionStyle.origin);
+        var extent = ttmlPercentagePair(regionStyle.extent);
+        if (!origin || !extent) return settings.join(' ');
+
+        var x = origin[0];
+        var y = origin[1];
+        var width = extent[0];
+        var height = extent[1];
+        if (x < 0 || y < 0 || width <= 0 || height <= 0 || x > 100 || y > 100 || x + width > 100 || y + height > 100) {
+            return settings.join(' ');
+        }
+
+        var nodeStyle = ttmlSpecifiedPresentationStyle(node, styleMap);
+        var displayAlign = String(nodeStyle.displayAlign || regionStyle.displayAlign || 'before').toLowerCase();
+        var linePosition;
+        var lineAlign;
+        if (displayAlign === 'before') {
+            linePosition = y;
+            lineAlign = 'start';
+        } else if (displayAlign === 'center') {
+            linePosition = y + height / 2;
+            lineAlign = 'center';
+        } else if (displayAlign === 'after') {
+            linePosition = y + height;
+            lineAlign = 'end';
+        } else {
+            return settings.join(' ');
+        }
+
+        settings.unshift('size:' + ttmlLayoutPercentage(width));
+        settings.unshift('position:' + ttmlLayoutPercentage(x) + ',line-left');
+        settings.unshift('line:' + ttmlLayoutPercentage(linePosition) + ',' + lineAlign);
+        return settings.join(' ');
     }
 
     function ttmlSpaceMode(node, inherited) {
