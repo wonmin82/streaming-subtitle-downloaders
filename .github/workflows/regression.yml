@@ -15,6 +15,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+      - name: Check shared HLS parser synchronization
+        run: |
+          node tools/sync-hls-segment-parser.js --check
+          node tools/sync-hls-segment-parser.js --write
+          git diff --exit-code -- scripts/apple-tv-plus-subtitles-downloader.user.js scripts/disney-plus-subtitles-downloader.user.js scripts/coupang-play-subtitles-downloader.user.js
       - name: Check userscript syntax
         run: |
           for file in scripts/*.user.js; do
