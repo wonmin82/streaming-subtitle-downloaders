@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.1
+// @version    1.0.2
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -40,6 +40,8 @@
         seenManifestUrls: {},
         seenResourceUrls: {},
         playbackScanStartedAt: 0,
+        lastPerformanceScanAt: 0,
+        performanceEntryCount: 0,
         selectedTrackKey: '',
         userSelectedTrack: false,
         mediaTitle: '',
@@ -68,26 +70,36 @@
     }
 
     function tick() {
-        var playbackPath = location.pathname.indexOf('/play/') >= 0 ? location.pathname : '';
+        var playbackPage = isPlaybackPage();
+        var playbackPath = playbackPage ? location.pathname : '';
         if (state.oldlocation !== playbackPath) {
             state.oldlocation = playbackPath;
-            if (location.pathname.indexOf('/play/') >= 0) {
+            if (playbackPage) {
                 state.status = 'Scanning playback...';
                 resetSubtitleTracks();
                 resetMediaMetadata();
                 refreshMediaMetadataFromDom();
-                scanPerformanceEntries();
+                scanPerformanceEntries(true);
+                state.lastPerformanceScanAt = Date.now();
                 updateUi();
             }
         }
 
-        if (location.pathname.indexOf('/play/') >= 0) {
+        if (playbackPage) {
             ensureWidget();
-            scanPerformanceEntries();
+            var now = Date.now();
+            if (now - state.lastPerformanceScanAt >= 5000) {
+                scanPerformanceEntries();
+                state.lastPerformanceScanAt = now;
+            }
         } else {
             var root = document.getElementById('dpsd-root');
             if (root) root.style.display = 'none';
         }
+    }
+
+    function isPlaybackPage() {
+        return /(?:^|\/)play(?:\/|$)/i.test(location.pathname || '');
     }
 
     function scheduleUi() {
@@ -133,7 +145,7 @@
     }
 
     function ensureWidget() {
-        if (location.pathname.indexOf('/play/') < 0) return;
+        if (!isPlaybackPage()) return;
         if (!document.body) {
             setTimeout(ensureWidget, 100);
             return;
@@ -167,7 +179,8 @@
 
         bindMenuAction('dpsd-rescan', function () {
             state.status = 'Rescanning playback resources...';
-            scanPerformanceEntries();
+            scanPerformanceEntries(true);
+            state.lastPerformanceScanAt = Date.now();
             updateUi();
         });
         document.getElementById('dpsd-track').addEventListener('change', function () {
@@ -343,12 +356,15 @@
     }
 
     function startPerformanceObserver() {
-        scanPerformanceEntries();
+        if (isPlaybackPage()) scanPerformanceEntries();
         try {
             if (!targetWindow.PerformanceObserver) return;
             state.observer = new targetWindow.PerformanceObserver(function (list) {
+                if (!isPlaybackPage()) return;
                 list.getEntries().forEach(function (entry) {
-                    recordResourceUrl(entry.name, 'performance');
+                    if (isDisneyPlaybackResourceUrl(entry.name)) {
+                        recordResourceUrl(entry.name, 'performance');
+                    }
                 });
             });
             state.observer.observe({ entryTypes: ['resource'] });
@@ -358,17 +374,29 @@
         }
     }
 
-    function scanPerformanceEntries() {
+    function scanPerformanceEntries(rescanAll) {
         try {
+            if (!isPlaybackPage()) return;
             var perf = targetWindow.performance || window.performance;
             if (!perf || !perf.getEntriesByType) return;
-            perf.getEntriesByType('resource').forEach(function (entry) {
-                if (state.playbackScanStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackScanStartedAt) return;
-                recordResourceUrl(entry.name, 'performance-scan');
-            });
+            var entries = perf.getEntriesByType('resource');
+            var start = rescanAll || entries.length < state.performanceEntryCount ? 0 : state.performanceEntryCount;
+            for (var i = start; i < entries.length; i++) {
+                var entry = entries[i];
+                if (state.playbackScanStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackScanStartedAt) continue;
+                if (isDisneyPlaybackResourceUrl(entry.name)) {
+                    recordResourceUrl(entry.name, 'performance-scan');
+                }
+            }
+            state.performanceEntryCount = entries.length;
         } catch (err) {
             debuglog('Performance scan failed: ' + err.message);
         }
+    }
+
+    function isDisneyPlaybackResourceUrl(rawUrl) {
+        var url = normalizeUrl(rawUrl);
+        return /\.m3u8(?:[?#]|$)/i.test(url || '');
     }
 
     function recordResourceUrl(rawUrl, source) {
@@ -499,6 +527,8 @@
         state.seenManifestUrls = {};
         state.seenResourceUrls = {};
         state.playbackScanStartedAt = performanceNow() - 5000;
+        state.performanceEntryCount = 0;
+        state.lastPerformanceScanAt = 0;
         state.selectedTrackKey = '';
         state.userSelectedTrack = false;
         state.lastError = '';

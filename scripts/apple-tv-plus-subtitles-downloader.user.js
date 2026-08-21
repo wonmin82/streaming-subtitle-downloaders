@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.1
+// @version    1.0.2
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -47,6 +47,10 @@
         manifestMeta: {},
         playbackScanStartedAt: 0,
         playbackActive: false,
+        lastPerformanceScanAt: 0,
+        performanceEntryCount: 0,
+        lastDeepPlaybackScanAt: 0,
+        lastDeepPlaybackResult: false,
         selectedTrackKey: '',
         userSelectedTrack: false,
         mediaTitle: '',
@@ -73,8 +77,10 @@
             installFrameBridge();
             scheduleUi();
             setInterval(tick, 1000);
-        } else {
-            setInterval(scanPerformanceEntries, 1000);
+        } else if (!state.observer) {
+            setInterval(function () {
+                if (isAppleTvPage()) scanPerformanceEntries();
+            }, 5000);
         }
         debuglog('Script loaded');
     }
@@ -88,13 +94,18 @@
                 resetSubtitleTracks();
                 resetMediaMetadata();
                 refreshMediaMetadataFromDom();
-                scanPerformanceEntries();
+                scanPerformanceEntries(true);
+                state.lastPerformanceScanAt = Date.now();
                 updateUi();
             }
         }
 
         if (isAppleTvPage()) {
-            scanPerformanceEntries();
+            var now = Date.now();
+            if (now - state.lastPerformanceScanAt >= 5000) {
+                scanPerformanceEntries();
+                state.lastPerformanceScanAt = now;
+            }
             var playbackActive = hasPlaybackSurface();
             if (playbackActive) {
                 if (!state.playbackActive) {
@@ -102,6 +113,7 @@
                     discardShortPreviewTracks();
                     state.status = 'Scanning active playback...';
                     scanPerformanceEntries();
+                    state.lastPerformanceScanAt = now;
                 }
                 ensureWidget();
             } else {
@@ -141,15 +153,24 @@
     }
 
     function hasPlayableLongFormVideo() {
+        var now = Date.now();
+        if (state.lastDeepPlaybackScanAt && now - state.lastDeepPlaybackScanAt < 2000) {
+            return state.lastDeepPlaybackResult;
+        }
+
         var videos = collectVideosDeep(document);
+        var playable = false;
         for (var i = 0; i < videos.length; i++) {
             var video = videos[i];
             var rect = video.getBoundingClientRect();
             if (isPlayableVideo(video, rect)) {
-                return true;
+                playable = true;
+                break;
             }
         }
-        return false;
+        state.lastDeepPlaybackScanAt = now;
+        state.lastDeepPlaybackResult = playable;
+        return playable;
     }
 
     function isVisiblePlaybackRect(element) {
@@ -424,7 +445,8 @@
 
         bindMenuAction('dpsd-rescan', function () {
             state.status = 'Rescanning playback resources...';
-            scanPerformanceEntries();
+            scanPerformanceEntries(true);
+            state.lastPerformanceScanAt = Date.now();
             updateUi();
         });
         document.getElementById('dpsd-track').addEventListener('change', function () {
@@ -621,12 +643,14 @@
     }
 
     function startPerformanceObserver() {
-        scanPerformanceEntries();
+        if (isAppleTvPage()) scanPerformanceEntries();
         try {
             if (!targetWindow.PerformanceObserver) return;
             state.observer = new targetWindow.PerformanceObserver(function (list) {
                 list.getEntries().forEach(function (entry) {
-                    recordResourceUrl(entry.name, 'performance');
+                    if (isApplePlaybackResourceUrl(entry.name)) {
+                        recordResourceUrl(entry.name, 'performance');
+                    }
                 });
             });
             state.observer.observe({ entryTypes: ['resource'] });
@@ -636,17 +660,28 @@
         }
     }
 
-    function scanPerformanceEntries() {
+    function scanPerformanceEntries(rescanAll) {
         try {
             var perf = targetWindow.performance || window.performance;
             if (!perf || !perf.getEntriesByType) return;
-            perf.getEntriesByType('resource').forEach(function (entry) {
-                if (state.playbackScanStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackScanStartedAt) return;
-                recordResourceUrl(entry.name, 'performance-scan');
-            });
+            var entries = perf.getEntriesByType('resource');
+            var start = rescanAll || entries.length < state.performanceEntryCount ? 0 : state.performanceEntryCount;
+            for (var i = start; i < entries.length; i++) {
+                var entry = entries[i];
+                if (state.playbackScanStartedAt && typeof entry.startTime === 'number' && entry.startTime < state.playbackScanStartedAt) continue;
+                if (isApplePlaybackResourceUrl(entry.name)) {
+                    recordResourceUrl(entry.name, 'performance-scan');
+                }
+            }
+            state.performanceEntryCount = entries.length;
         } catch (err) {
             debuglog('Performance scan failed: ' + err.message);
         }
+    }
+
+    function isApplePlaybackResourceUrl(rawUrl) {
+        var url = normalizeUrl(rawUrl);
+        return /\.(?:m3u8|vtt|webvtt)(?:[?#]|$)/i.test(url || '');
     }
 
     function recordResourceUrl(rawUrl, source) {
@@ -789,6 +824,10 @@
         state.seenResourceUrls = {};
         state.manifestMeta = {};
         state.playbackScanStartedAt = performanceNow() - 5000;
+        state.performanceEntryCount = 0;
+        state.lastPerformanceScanAt = 0;
+        state.lastDeepPlaybackScanAt = 0;
+        state.lastDeepPlaybackResult = false;
         state.playbackActive = false;
         state.selectedTrackKey = '';
         state.userSelectedTrack = false;
