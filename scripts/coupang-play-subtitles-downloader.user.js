@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.14
+// @version    1.0.15
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -2834,6 +2834,142 @@
         return String(rounded).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1') + '%';
     }
 
+    function ttmlPositionPercentFactor(value) {
+        var match = String(value || '').trim().match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+))%$/);
+        if (!match) return null;
+        var percent = Number(match[1]);
+        if (!isFinite(percent) || percent < 0 || percent > 100) return null;
+        return percent / 100;
+    }
+
+    function ttmlPositionKeywordFactor(value, axis) {
+        value = String(value || '').toLowerCase();
+        if (value === 'center') return 0.5;
+        if (axis === 'h') {
+            if (value === 'left') return 0;
+            if (value === 'right') return 1;
+        } else {
+            if (value === 'top') return 0;
+            if (value === 'bottom') return 1;
+        }
+        return null;
+    }
+
+    function ttmlPositionEdgeFactor(edge, offset, axis) {
+        var factor = ttmlPositionPercentFactor(offset);
+        if (factor === null) return null;
+        edge = String(edge || '').toLowerCase();
+        if ((axis === 'h' && edge === 'left') || (axis === 'v' && edge === 'top')) return factor;
+        if ((axis === 'h' && edge === 'right') || (axis === 'v' && edge === 'bottom')) return 1 - factor;
+        return null;
+    }
+
+    function ttmlPositionFactors(value) {
+        var tokens = String(value || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+        if (!tokens.length || tokens.length > 4) return null;
+
+        var hKeyword = function (token) { return ttmlPositionKeywordFactor(token, 'h'); };
+        var vKeyword = function (token) { return ttmlPositionKeywordFactor(token, 'v'); };
+        var percent = ttmlPositionPercentFactor;
+        var x;
+        var y;
+
+        if (tokens.length === 1) {
+            var singlePercent = percent(tokens[0]);
+            if (singlePercent !== null) return [singlePercent, 0.5];
+            var singleH = hKeyword(tokens[0]);
+            var singleV = vKeyword(tokens[0]);
+            if (tokens[0] === 'center') return [0.5, 0.5];
+            if (singleH !== null) return [singleH, 0.5];
+            if (singleV !== null) return [0.5, singleV];
+            return null;
+        }
+
+        if (tokens.length === 2) {
+            var p0 = percent(tokens[0]);
+            var p1 = percent(tokens[1]);
+            if (p0 !== null && p1 !== null) return [p0, p1];
+
+            if (tokens[0] === 'center') {
+                if (tokens[1] === 'center') return [0.5, 0.5];
+                var secondV = vKeyword(tokens[1]);
+                if (tokens[1] === 'top' || tokens[1] === 'bottom') return [0.5, secondV];
+                var secondH = hKeyword(tokens[1]);
+                if (tokens[1] === 'left' || tokens[1] === 'right') return [secondH, 0.5];
+                if (p1 !== null) return [0.5, p1];
+            }
+
+            if (tokens[0] === 'left' || tokens[0] === 'right') {
+                x = hKeyword(tokens[0]);
+                if (tokens[1] === 'top' || tokens[1] === 'bottom' || tokens[1] === 'center') {
+                    return [x, vKeyword(tokens[1])];
+                }
+                if (p1 !== null) return [x, p1];
+            }
+
+            if (tokens[0] === 'top' || tokens[0] === 'bottom') {
+                y = vKeyword(tokens[0]);
+                if (tokens[1] === 'left' || tokens[1] === 'right' || tokens[1] === 'center') {
+                    return [hKeyword(tokens[1]), y];
+                }
+                if (p1 !== null) return [p1, y];
+            }
+
+            if (p0 !== null && (tokens[1] === 'top' || tokens[1] === 'bottom' || tokens[1] === 'center')) {
+                return [p0, vKeyword(tokens[1])];
+            }
+            return null;
+        }
+
+        if (tokens.length === 3) {
+            if ((tokens[0] === 'left' || tokens[0] === 'right') && percent(tokens[1]) !== null) {
+                x = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'h');
+                y = vKeyword(tokens[2]);
+                if (x !== null && y !== null) return [x, y];
+            }
+            if ((tokens[0] === 'top' || tokens[0] === 'bottom') && percent(tokens[1]) !== null) {
+                y = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'v');
+                x = hKeyword(tokens[2]);
+                if (x !== null && y !== null) return [x, y];
+            }
+            if ((tokens[1] === 'left' || tokens[1] === 'right') && percent(tokens[2]) !== null) {
+                y = vKeyword(tokens[0]);
+                x = ttmlPositionEdgeFactor(tokens[1], tokens[2], 'h');
+                if (x !== null && y !== null) return [x, y];
+            }
+            if ((tokens[1] === 'top' || tokens[1] === 'bottom') && percent(tokens[2]) !== null) {
+                x = hKeyword(tokens[0]);
+                y = ttmlPositionEdgeFactor(tokens[1], tokens[2], 'v');
+                if (x !== null && y !== null) return [x, y];
+            }
+            return null;
+        }
+
+        var firstHorizontalEdge = tokens[0] === 'left' || tokens[0] === 'right';
+        var firstVerticalEdge = tokens[0] === 'top' || tokens[0] === 'bottom';
+        if (firstHorizontalEdge && percent(tokens[1]) !== null && (tokens[2] === 'top' || tokens[2] === 'bottom') && percent(tokens[3]) !== null) {
+            x = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'h');
+            y = ttmlPositionEdgeFactor(tokens[2], tokens[3], 'v');
+            return x === null || y === null ? null : [x, y];
+        }
+        if (firstVerticalEdge && percent(tokens[1]) !== null && (tokens[2] === 'left' || tokens[2] === 'right') && percent(tokens[3]) !== null) {
+            y = ttmlPositionEdgeFactor(tokens[0], tokens[1], 'v');
+            x = ttmlPositionEdgeFactor(tokens[2], tokens[3], 'h');
+            return x === null || y === null ? null : [x, y];
+        }
+        return null;
+    }
+
+    function ttmlPositionOrigin(value, extentValue) {
+        var extent = ttmlPercentagePair(extentValue);
+        var factors = ttmlPositionFactors(value);
+        if (!extent || !factors) return null;
+        var width = extent[0];
+        var height = extent[1];
+        if (width <= 0 || height <= 0 || width > 100 || height > 100) return null;
+        return [factors[0] * (100 - width), factors[1] * (100 - height)];
+    }
+
     function ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) {
         var specified = ttmlSpecifiedPresentationStyle(node, styleMap);
         var value = specified.textAlign || regionStyle.textAlign || '';
@@ -2874,10 +3010,13 @@
         var align = supportedWriting ? ttmlCueTextAlign(node, regionStyle, styleMap, writingMode) : '';
         if (align) settings.push('align:' + align);
         if (!region || !supportedWriting) return settings.join(' ');
-        if (regionStyle.position) return settings.join(' ');
 
-        var origin = ttmlPercentagePair(regionStyle.origin);
-        var extent = ttmlPercentagePair(regionStyle.extent);
+        var nodeStyle = ttmlSpecifiedPresentationStyle(node, styleMap);
+        var extentValue = nodeStyle.extent || regionStyle.extent || '';
+        var positionValue = nodeStyle.position || regionStyle.position || '';
+        var originValue = nodeStyle.origin || regionStyle.origin || '';
+        var extent = ttmlPercentagePair(extentValue);
+        var origin = positionValue ? ttmlPositionOrigin(positionValue, extentValue) : ttmlPercentagePair(originValue);
         if (!origin || !extent) return settings.join(' ');
 
         var x = origin[0];
@@ -2888,7 +3027,6 @@
             return settings.join(' ');
         }
 
-        var nodeStyle = ttmlSpecifiedPresentationStyle(node, styleMap);
         var displayAlign = String(nodeStyle.displayAlign || regionStyle.displayAlign || 'before').toLowerCase();
         var linePosition;
         var lineAlign;
