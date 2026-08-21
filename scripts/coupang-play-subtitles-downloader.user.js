@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.10
+// @version    1.0.11
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -24,6 +24,8 @@
 
     var debug = location.hash === '#debug' || location.hash.indexOf('cpsd_debug') >= 0;
     var MAX_RETRIES = 5;
+    var RETRY_BASE_DELAY_MS = 250;
+    var RETRY_MAX_DELAY_MS = 4000;
     var MAX_DASH_TEMPLATE_SEGMENTS = 10000;
     var LOG_PREFIX = '[Coupang Play Subtitles DL]';
     var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -1082,6 +1084,18 @@
         return '';
     }
 
+    function scheduleManifestRetry(url, source, sessionId, delayMs) {
+        delayMs = Number(delayMs);
+        if (!isFinite(delayMs) || delayMs <= 0 || delayMs > 2147483647) return;
+        setTimeout(function () {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            if (state.seenManifestUrls[url] !== 'cooldown') return;
+            delete state.seenManifestUrls[url];
+            delete state.seenResourceUrls[url];
+            queueManifest(url, source, sessionId);
+        }, delayMs);
+    }
+
     function queueManifest(url, source, sessionId) {
         sessionId = sessionId == null ? state.playbackSessionId : sessionId;
         if (!isPlaybackSessionCurrent(sessionId)) return;
@@ -1100,8 +1114,14 @@
         }).catch(function (err) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             if (state.seenManifestUrls[url] === 'pending') {
-                delete state.seenManifestUrls[url];
-                delete state.seenResourceUrls[url];
+                var retryAfterMs = Number(err && err.retryAfterMs);
+                if (isFinite(retryAfterMs) && retryAfterMs > 0) {
+                    state.seenManifestUrls[url] = 'cooldown';
+                    scheduleManifestRetry(url, source, sessionId, retryAfterMs);
+                } else {
+                    delete state.seenManifestUrls[url];
+                    delete state.seenResourceUrls[url];
+                }
             }
             state.lastError = 'Could not read manifest: ' + err.message;
             updateUi();
@@ -2171,12 +2191,9 @@
                         resolve(response.responseText || '');
                         return;
                     }
-                    if (hlsShouldRetryRangeStatus(response.status) && retryCount < MAX_RETRIES) {
-                        setTimeout(function () {
-                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
-                        }, 200);
-                        return;
-                    }
+                    if (shouldRetryHttpStatus(response.status) && scheduleRetry(retryCount, response.responseHeaders, function () {
+                        return getHlsResourceText(url, byterange, retryCount + 1);
+                    }, resolve, reject)) return;
                     if (response.status === 200) {
                         reject(new Error('Server ignored HLS byte range for ' + url));
                         return;
@@ -2184,29 +2201,19 @@
                     reject(new Error('HTTP ' + response.status + ' for HLS byte range ' + url));
                 },
                 onerror: function () {
-                    if (retryCount < MAX_RETRIES) {
-                        setTimeout(function () {
-                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
-                        }, 200);
-                    } else {
-                        reject(new Error('Network error for HLS byte range ' + url));
-                    }
+                    if (scheduleRetry(retryCount, '', function () {
+                        return getHlsResourceText(url, byterange, retryCount + 1);
+                    }, resolve, reject)) return;
+                    reject(new Error('Network error for HLS byte range ' + url));
                 },
                 ontimeout: function () {
-                    if (retryCount < MAX_RETRIES) {
-                        setTimeout(function () {
-                            getHlsResourceText(url, byterange, retryCount + 1).then(resolve, reject);
-                        }, 200);
-                    } else {
-                        reject(new Error('Timeout for HLS byte range ' + url));
-                    }
+                    if (scheduleRetry(retryCount, '', function () {
+                        return getHlsResourceText(url, byterange, retryCount + 1);
+                    }, resolve, reject)) return;
+                    reject(new Error('Timeout for HLS byte range ' + url));
                 }
             });
         });
-    }
-
-    function hlsShouldRetryRangeStatus(status) {
-        return status === 408 || status === 429 || status >= 500;
     }
 
     function hlsContentRangeMatches(headers, byterange) {
@@ -2938,6 +2945,54 @@
         return next();
     }
 
+    function shouldRetryHttpStatus(status) {
+        status = Number(status);
+        return status === 408 || status === 425 || status === 429 ||
+            status === 500 || status === 502 || status === 503 || status === 504;
+    }
+
+    function retryAfterDelayMs(headers, nowMs) {
+        var match = String(headers || '').match(/(?:^|\r?\n)\s*Retry-After\s*:\s*([^\r\n]+)/i);
+        if (!match) return null;
+        var value = match[1].trim();
+        if (/^\d+$/.test(value)) {
+            var seconds = Number(value);
+            var delay = seconds * 1000;
+            return isFinite(delay) ? delay : null;
+        }
+        var when = Date.parse(value);
+        if (!isFinite(when)) return null;
+        var now = nowMs == null ? Date.now() : Number(nowMs);
+        if (!isFinite(now)) now = Date.now();
+        return Math.max(0, when - now);
+    }
+
+    function retryDelayMs(retryCount, responseHeaders, nowMs) {
+        var retryAfter = retryAfterDelayMs(responseHeaders, nowMs);
+        if (retryAfter != null) {
+            return retryAfter <= RETRY_MAX_DELAY_MS ? retryAfter : null;
+        }
+        var attempt = Math.max(0, Number(retryCount) || 0);
+        return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, attempt));
+    }
+
+    function scheduleRetry(retryCount, responseHeaders, retry, resolve, reject) {
+        var retryAfter = retryAfterDelayMs(responseHeaders);
+        if (retryAfter != null && (retryCount >= MAX_RETRIES || retryAfter > RETRY_MAX_DELAY_MS)) {
+            var error = new Error('Server requested retry after ' + Math.ceil(retryAfter / 1000) + 's');
+            error.retryAfterMs = retryAfter;
+            reject(error);
+            return true;
+        }
+        if (retryCount >= MAX_RETRIES) return false;
+        var delay = retryDelayMs(retryCount, responseHeaders);
+        if (delay == null) return false;
+        setTimeout(function () {
+            retry().then(resolve, reject);
+        }, delay);
+        return true;
+    }
+
     function getText(url, retryCount, headers) {
         retryCount = retryCount || 0;
         return new Promise(function (resolve, reject) {
@@ -2947,24 +3002,26 @@
                 headers: headers || undefined,
                 responseType: 'text',
                 onload: function (response) {
-                    if (response.status >= 200 && response.status < 400) {
+                    if (response.status >= 200 && response.status < 300) {
                         resolve(response.responseText || '');
-                    } else if (retryCount < MAX_RETRIES) {
-                        setTimeout(function () {
-                            getText(url, retryCount + 1, headers).then(resolve, reject);
-                        }, 300);
-                    } else {
-                        reject(new Error('HTTP ' + response.status + ' for ' + url));
+                        return;
                     }
+                    if (shouldRetryHttpStatus(response.status) && scheduleRetry(retryCount, response.responseHeaders, function () {
+                        return getText(url, retryCount + 1, headers);
+                    }, resolve, reject)) return;
+                    reject(new Error('HTTP ' + response.status + ' for ' + url));
                 },
                 onerror: function () {
-                    if (retryCount < MAX_RETRIES) {
-                        setTimeout(function () {
-                            getText(url, retryCount + 1, headers).then(resolve, reject);
-                        }, 300);
-                    } else {
-                        reject(new Error('Network error for ' + url));
-                    }
+                    if (scheduleRetry(retryCount, '', function () {
+                        return getText(url, retryCount + 1, headers);
+                    }, resolve, reject)) return;
+                    reject(new Error('Network error for ' + url));
+                },
+                ontimeout: function () {
+                    if (scheduleRetry(retryCount, '', function () {
+                        return getText(url, retryCount + 1, headers);
+                    }, resolve, reject)) return;
+                    reject(new Error('Timeout for ' + url));
                 }
             });
         });
