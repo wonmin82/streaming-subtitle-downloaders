@@ -1,0 +1,27 @@
+name: Temporary Netflix download fallback validation
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: validate/netflix-download-fallback
+          fetch-depth: 0
+      - run: python3 .github/tmp/patch-netflix-download-fallback.py
+      - run: |
+          node --check scripts/netflix-subtitles-downloader.user.js
+          node --check tests/regression.js
+          git diff --check
+      - run: node tests/regression.js
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/netflix-subtitles-downloader.user.js tests/regression.js
+          git commit -m "Validate Netflix download fallback implementation"
+          git push origin HEAD:validate/netflix-download-fallback
