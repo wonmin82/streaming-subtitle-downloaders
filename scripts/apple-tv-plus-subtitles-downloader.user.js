@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.16
+// @version    1.0.17
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -351,10 +351,13 @@
         state.langs = kept;
     }
 
-    function beginPlaybackSession() {
+    function beginPlaybackSession(lookbackMs) {
         invalidateDownloadOperation();
         var nowEpochMs = Date.now();
-        var initialLookbackMs = state.playbackSessionSequence === 0 ? 5000 : 0;
+        var requestedLookbackMs = Number(lookbackMs);
+        var initialLookbackMs = isFinite(requestedLookbackMs) && requestedLookbackMs >= 0
+            ? Math.min(requestedLookbackMs, 5000)
+            : (state.playbackSessionSequence === 0 ? 5000 : 0);
         state.playbackSessionSequence++;
         state.playbackSessionId = 'apple:' + state.playbackSessionSequence + ':' + nowEpochMs.toString(36) + ':' + Math.random().toString(36).slice(2);
         state.playbackSessionEpochMs = nowEpochMs - initialLookbackMs;
@@ -1402,17 +1405,34 @@
             (left.indexOf(right) >= 0 || right.indexOf(left) >= 0);
     }
 
+    function playbackMetadataChanged(playbackTitle, playbackEpisodeTag) {
+        var titleChanged = playbackTitle && state.mediaTitle && !mediaTitlesMatch(playbackTitle, state.mediaTitle);
+        var episodeChanged = playbackEpisodeTag && state.episodeTag && playbackEpisodeTag !== state.episodeTag;
+        return !!(titleChanged || episodeChanged);
+    }
+
+    function restartPlaybackSessionForMetadataChange() {
+        beginPlaybackSession(3000);
+        var sessionId = state.playbackSessionId;
+        state.status = 'Scanning new playback...';
+        resetSubtitleTracks();
+        resetMediaMetadata();
+        setTimeout(function () {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            scanPerformanceEntries(true);
+            state.lastPerformanceScanAt = Date.now();
+            updateUi();
+        }, 0);
+    }
+
     function refreshMediaMetadataFromDom() {
         var playbackTitle = activePlaybackTitle();
         var playbackText = activePlaybackInfoText();
-        if (playbackTitle && state.mediaTitle && !mediaTitlesMatch(playbackTitle, state.mediaTitle)) {
-            state.seasonNumber = null;
-            state.episodeNumber = null;
-            state.episodeTag = '';
-        }
+        var playbackEpisodeTag = seasonEpisodeTag(playbackText || playbackInfoText());
+        if (playbackMetadataChanged(playbackTitle, playbackEpisodeTag)) restartPlaybackSessionForMetadataChange();
         updateMediaMetadata({
             title: playbackTitle || displayTitle(),
-            episodeTag: seasonEpisodeTag(playbackText || playbackInfoText())
+            episodeTag: playbackEpisodeTag
         }, playbackTitle ? 4 : 1);
     }
 

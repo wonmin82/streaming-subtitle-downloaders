@@ -250,9 +250,10 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   };
   const block = [
     'var state = { mediaTitle: "Ted Lasso", mediaTitlePriority: 3, seasonNumber: 1, episodeNumber: 1, episodeTag: "S01E01" };',
+    'function restartPlaybackSessionForMetadataChange() { state.mediaTitle = ""; state.mediaTitlePriority = 0; state.seasonNumber = null; state.episodeNumber = null; state.episodeTag = ""; }',
     functionDeclarations(source, [
       'activePlaybackContainer', 'activePlaybackTitle', 'activePlaybackInfoText',
-      'normalizedMediaTitleForComparison', 'mediaTitlesMatch',
+      'normalizedMediaTitleForComparison', 'mediaTitlesMatch', 'playbackMetadataChanged',
       'isGenericMediaTitle', 'shouldReplaceMediaTitle', 'updateMediaMetadata',
       'refreshMediaMetadataFromDom', 'safeBaseFilename', 'displayTitle',
       'cleanDisplayTitle', 'seasonEpisodeTag', 'playbackInfoText', 'metaContent',
@@ -276,6 +277,42 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   assert.strictEqual(ctx.safeBaseFilename(), "'테드 래소' - Ted Lasso.S01E01");
   assert.strictEqual(ctx.state.mediaTitle, "'테드 래소' - Ted Lasso", 'player metadata title must outrank the episode aria-label');
   assert.strictEqual(ctx.state.episodeTag, 'S01E01', 'localized player metadata should supply season and episode numbers');
+});
+
+for (const service of ['apple', 'disney']) {
+  test(`${service}: playback metadata changes start a clean UI session`, () => {
+    const source = sources[service];
+    const changed = functionDeclaration(source, 'playbackMetadataChanged');
+    const ctx = evaluateFunctions(changed, {
+      state: { mediaTitle: 'Show Title', episodeTag: 'S01E01' },
+      mediaTitlesMatch(left, right) { return left === right; }
+    });
+    assert.strictEqual(ctx.playbackMetadataChanged('Show Title', 'S01E01'), false);
+    assert.strictEqual(ctx.playbackMetadataChanged('Show Title', 'S01E02'), true, 'episode transition must start a new session');
+    assert.strictEqual(ctx.playbackMetadataChanged('Other Title', 'S01E01'), true, 'title transition must start a new session');
+
+    const restart = functionDeclaration(source, 'restartPlaybackSessionForMetadataChange');
+    requireText(restart, 'beginPlaybackSession(3000);', 'bounded transition lookback');
+    requireText(restart, 'resetSubtitleTracks();', 'track and progress reset');
+    requireText(restart, 'resetMediaMetadata();', 'metadata reset');
+    const resetTracks = functionDeclaration(source, 'resetSubtitleTracks');
+    requireText(resetTracks, 'state.progressCompleted = 0;', 'completed progress reset');
+    requireText(resetTracks, 'state.progressTotal = 0;', 'total progress reset');
+    requireText(resetTracks, "state.progressLabel = 'Idle';", 'progress label reset');
+  });
+}
+
+test('disney: active player metadata is scoped and Korean episode labels are parsed', () => {
+  const source = sources.disney;
+  requireText(source, "var playbackKey = playbackPage ? location.href.split('#')[0] : '';", 'full playback URL session key');
+  const refresh = functionDeclaration(source, 'refreshMediaMetadataFromDom');
+  requireText(refresh, 'activePlaybackContainer()', 'active playback container');
+  requireText(refresh, 'activePlaybackInfoText(container)', 'scoped playback text');
+  requireText(refresh, "!container ? playbackInfoText() : ''", 'whole-page fallback guard');
+
+  const parser = functionDeclarations(source, ['seasonEpisodeTag', 'formatSeasonEpisode', 'padNumber']);
+  const ctx = evaluateFunctions(parser, { playbackInfoText() { return ''; } });
+  assert.strictEqual(ctx.seasonEpisodeTag('시즌 3: 2회, 챕터 18: 만달로어 광산'), 'S03E02');
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {
@@ -350,6 +387,31 @@ test('netflix: filename preview follows playback and omits the archive extension
   assert(!preview.includes("+ '.zip'"), 'Netflix preview must not include the ZIP extension');
   assert(!source.includes('keepResultFilename'), 'completed downloads must not pin a stale preview filename');
   requireText(source, 'const playbackMetadataChanged = (cached, dom, cachedIsDomDerived) =>', 'playback-change detector');
+});
+
+test('netflix: playback changes reset completed progress', () => {
+  const source = sources.netflix;
+  const start = source.indexOf('const playbackUiMetadataChanged =');
+  const end = source.indexOf('\nconst syncPlaybackMetadataState =', start);
+  assert(start >= 0 && end > start, 'Netflix playback UI reset helpers missing');
+  const block = [
+    'const normalizedPlaybackTitle = value => String(value || "").toLowerCase();',
+    'const positiveInteger = value => { const number = parseInt(value, 10); return number > 0 ? number : null; };',
+    'const downloadUiState = {active: false, filename: "Old.Title", completed: 7, total: 7, label: "Complete"};',
+    source.slice(start, end),
+    'this.episodeChanged = playbackUiMetadataChanged({type: "show", title: "Show", season: 1, episode: 1}, {type: "show", title: "Show", season: 1, episode: 2});',
+    'resetDownloadUiForPlaybackChange();',
+    'this.resetState = downloadUiState;'
+  ].join('\n');
+  const ctx = evaluateFunctions(block);
+  assert.strictEqual(ctx.episodeChanged, true);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.resetState)), {
+    active: false,
+    filename: '',
+    completed: 0,
+    total: 0,
+    label: 'Idle'
+  });
 });
 
 test('netflix: active player DOM title fills a missing metadata cache entry', () => {
@@ -445,7 +507,7 @@ test('netflix: show filenames always include season and episode without duplicat
   const end = sources.netflix.indexOf('\nconst isUsableFormatCandidate =', start);
   assert(start >= 0 && end > start, 'Netflix title helpers missing');
   const block = [
-    'const titleCache = {}; const idOverrides = {}; const domDerivedTitleIds = {}; let epTitleInFilename = true; const isWatchPage = () => true;',
+    'const titleCache = {}; const idOverrides = {}; const domDerivedTitleIds = {}; const downloadUiState = {active: false, filename: "", completed: 0, total: 0, label: "Idle"}; let lastPlaybackUiMetadata = null; let epTitleInFilename = true; const isWatchPage = () => true;',
     sources.netflix.slice(start, end),
     'titleCache["81697779"] = {type: "show", title: "이 사랑 통역 되나요?", season: 1, episode: 5, subtitle: "5화: 5화", hiddenNumber: true};',
     'this.limitedSeriesFilename = getTitleFromCache()[0];',

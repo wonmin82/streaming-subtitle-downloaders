@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.12
+// @version    1.0.13
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -87,9 +87,9 @@
 
     function tick() {
         var playbackPage = isPlaybackPage();
-        var playbackPath = playbackPage ? location.pathname : '';
-        if (state.oldlocation !== playbackPath) {
-            state.oldlocation = playbackPath;
+        var playbackKey = playbackPage ? location.href.split('#')[0] : '';
+        if (state.oldlocation !== playbackKey) {
+            state.oldlocation = playbackKey;
             if (playbackPage) {
                 beginPlaybackSession();
                 state.status = 'Scanning playback...';
@@ -154,9 +154,12 @@
         return /(?:^|\/)play(?:\/|$)/i.test(location.pathname || '');
     }
 
-    function beginPlaybackSession() {
+    function beginPlaybackSession(lookbackMs) {
         invalidateDownloadOperation();
-        var initialLookbackMs = state.playbackSessionSequence === 0 ? 5000 : 0;
+        var requestedLookbackMs = Number(lookbackMs);
+        var initialLookbackMs = isFinite(requestedLookbackMs) && requestedLookbackMs >= 0
+            ? Math.min(requestedLookbackMs, 5000)
+            : (state.playbackSessionSequence === 0 ? 5000 : 0);
         state.playbackSessionSequence++;
         state.playbackSessionId = 'disney:' + state.playbackSessionSequence + ':' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2);
         state.playbackSessionStartedAt = Math.max(0, performanceNow() - initialLookbackMs);
@@ -712,10 +715,92 @@
         state.progressLabel = 'Idle';
     }
 
+    function activePlaybackContainer() {
+        var selectors = [
+            '[data-testid="playback-view"]',
+            '[data-testid="video-player"]',
+            '[data-testid="player-container"]',
+            '[data-testid="playback-container"]',
+            '[data-testid="player-controls"]'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            try {
+                var container = document.querySelector(selectors[i]);
+                if (container) return container;
+            } catch (err) {}
+        }
+        try {
+            var video = document.querySelector('video');
+            if (video) return video.closest('main,[role="dialog"]') || video.parentElement;
+        } catch (err) {}
+        return null;
+    }
+
+    function activePlaybackTitle(container) {
+        container = container || activePlaybackContainer();
+        if (!container) return '';
+        var selectors = [
+            '[data-testid="player-metadata-title"]',
+            '[data-testid="playback-title"]',
+            '[data-testid="video-title"]',
+            '[data-testid*="player"][data-testid*="title"]',
+            'h1',
+            'h2'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            try {
+                var node = container.querySelector(selectors[i]);
+                var title = cleanDisplayTitle(node && node.textContent);
+                if (title && title !== 'DisneyPlus' && !/^S\d{1,2}E\d{1,3}$/i.test(title)) return title;
+            } catch (err) {}
+        }
+        return '';
+    }
+
+    function activePlaybackInfoText(container) {
+        container = container || activePlaybackContainer();
+        if (!container) return '';
+        var parts = [];
+        try { parts.push(container.getAttribute('aria-label') || ''); } catch (err) {}
+        try { parts.push(container.innerText || container.textContent || ''); } catch (err) {}
+        try {
+            Array.prototype.slice.call(container.querySelectorAll('[aria-label],[title]'), 0, 200).forEach(function (node) {
+                parts.push(node.getAttribute('aria-label') || '');
+                parts.push(node.getAttribute('title') || '');
+            });
+        } catch (err) {}
+        return parts.filter(Boolean).join('\n');
+    }
+
+    function playbackMetadataChanged(playbackTitle, playbackEpisodeTag) {
+        var titleChanged = playbackTitle && state.mediaTitle && !mediaTitlesMatch(playbackTitle, state.mediaTitle);
+        var episodeChanged = playbackEpisodeTag && state.episodeTag && playbackEpisodeTag !== state.episodeTag;
+        return !!(titleChanged || episodeChanged);
+    }
+
+    function restartPlaybackSessionForMetadataChange() {
+        beginPlaybackSession(3000);
+        var sessionId = state.playbackSessionId;
+        state.status = 'Scanning new playback...';
+        resetSubtitleTracks();
+        resetMediaMetadata();
+        setTimeout(function () {
+            if (!isPlaybackSessionCurrent(sessionId)) return;
+            scanPerformanceEntries(true);
+            state.lastPerformanceScanAt = Date.now();
+            updateUi();
+        }, 0);
+    }
+
     function refreshMediaMetadataFromDom() {
+        var container = activePlaybackContainer();
+        var playbackTitle = activePlaybackTitle(container) || displayTitle();
+        var scopedPlaybackText = activePlaybackInfoText(container);
+        var playbackEpisodeTag = seasonEpisodeTag(scopedPlaybackText || (!container ? playbackInfoText() : ''));
+        if (playbackMetadataChanged(playbackTitle, playbackEpisodeTag)) restartPlaybackSessionForMetadataChange();
         updateMediaMetadata({
-            title: displayTitle(),
-            episodeTag: seasonEpisodeTag(playbackInfoText())
+            title: playbackTitle,
+            episodeTag: playbackEpisodeTag
         });
     }
 
