@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.3
+// @version    1.0.4
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -300,7 +300,7 @@ const handleSubsReady = menu => {
   if(!menu || !menu.isConnected)
     return false;
   syncMenuVisibility(menu);
-  if(getSubsFromCache(true) === null || getXFromCache(titleCache, 'title', true) === null)
+  if(getSubsFromCache(true) === null || getTitleEntry(true) === null)
     return false;
 
   if(batch !== null && batch.length > 0)
@@ -467,13 +467,57 @@ const getXFromCache = (cache, name, silent) => {
 
 const getSubsFromCache = silent => getXFromCache(subCache, 'subs', silent);
 
+const normalizeDomTitle = value => String(value || '').replace(/\s+/g, ' ').trim();
+
+const playbackTitleFromDom = () => {
+  const player = document.querySelector('[data-uia="watch-video"]') ||
+    document.querySelector('.watch-video');
+  if(!player)
+    return '';
+  const selectors = [
+    '[data-uia="evidence-overlay"] h2',
+    '[data-uia="video-title"]',
+    'h1',
+    'h2'
+  ];
+
+  for(const selector of selectors) {
+    let node = null;
+    try {
+      node = player.querySelector(selector);
+    }
+    catch(ignore) {}
+    const title = normalizeDomTitle(node && node.textContent);
+    if(title && title.length <= 300 && title.toLowerCase() !== 'netflix')
+      return title;
+  }
+  return '';
+};
+
+const getTitleEntry = silent => {
+  const cached = getXFromCache(titleCache, 'title', true);
+  if(cached !== null)
+    return cached;
+
+  const title = playbackTitleFromDom();
+  if(title) {
+    const fallback = {type: 'movie', title};
+    titleCache[getVideoId()] = fallback;
+    return fallback;
+  }
+
+  if(silent === true)
+    return null;
+  return getXFromCache(titleCache, 'title');
+};
+
 const pad = (number, letter) => `${letter}${number.toString().padStart(2, '0')}`;
 const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const safeTitle = title => title.trim().replace(/[:*?"<>|\\\/]+/g, '_').replace(/ /g, '.');
 
 const getTitleFromCache = () => {
-  const title = getXFromCache(titleCache, 'title');
+  const title = getTitleEntry();
   const titleParts = [title.title];
   if(title.type === 'show') {
     const season = pad(title.season, 'S');

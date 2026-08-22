@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.11
+// @version    1.0.12
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1152,6 +1152,7 @@
 
     function shouldReplaceMediaTitle(title, priority) {
         if (!state.mediaTitle) return true;
+        if (isGenericMediaTitle(title) && !isGenericMediaTitle(state.mediaTitle)) return false;
         if (priority > state.mediaTitlePriority) return true;
         if (priority < state.mediaTitlePriority) return false;
         return !isGenericMediaTitle(title) || isGenericMediaTitle(state.mediaTitle);
@@ -1205,11 +1206,68 @@
         state.lastError = '';
     }
 
+    function activePlaybackContainer() {
+        var selectors = [
+            'dialog[data-testid="playback-view"][open]',
+            '[data-testid="playback-view"][open]',
+            '.main-playback-view dialog[open]',
+            'dialog.playback-view[open]'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            try {
+                var node = document.querySelector(selectors[i]);
+                if (node) return node;
+            } catch (err) {}
+        }
+
+        try {
+            var video = document.querySelector('video');
+            if (video && typeof video.closest === 'function') {
+                return video.closest('dialog[open], [data-testid*="playback"]');
+            }
+        } catch (err) {}
+        return null;
+    }
+
+    function activePlaybackTitle() {
+        var container = activePlaybackContainer();
+        if (!container) return '';
+        var candidates = [];
+        try { candidates.push(container.getAttribute('aria-label') || ''); } catch (err) {}
+        try {
+            var titleNode = container.querySelector('[data-testid*="title"], h1, h2');
+            if (titleNode) candidates.push(titleNode.textContent || '');
+        } catch (err) {}
+
+        for (var i = 0; i < candidates.length; i++) {
+            var title = cleanDisplayTitle(candidates[i]);
+            if (title && !isGenericMediaTitle(title)) return title;
+        }
+        return '';
+    }
+
+    function activePlaybackInfoText() {
+        var container = activePlaybackContainer();
+        if (!container) return '';
+        var parts = [];
+        try { parts.push(container.getAttribute('aria-label') || ''); } catch (err) {}
+        try { parts.push(container.innerText || container.textContent || ''); } catch (err) {}
+        try {
+            Array.prototype.slice.call(container.querySelectorAll('[aria-label],[title]'), 0, 200).forEach(function (node) {
+                parts.push(node.getAttribute('aria-label') || '');
+                parts.push(node.getAttribute('title') || '');
+            });
+        } catch (err) {}
+        return parts.filter(Boolean).join('\n');
+    }
+
     function refreshMediaMetadataFromDom() {
+        var playbackTitle = activePlaybackTitle();
+        var playbackText = activePlaybackInfoText();
         updateMediaMetadata({
-            title: displayTitle(),
-            episodeTag: seasonEpisodeTag(playbackInfoText())
-        }, 1);
+            title: playbackTitle || displayTitle(),
+            episodeTag: seasonEpisodeTag(playbackText || playbackInfoText())
+        }, playbackTitle ? 4 : 1);
     }
 
     function scheduleManifestRetry(url, source, sessionId, delayMs) {
@@ -2400,9 +2458,12 @@
     }
 
     function safeBaseFilename() {
+        var playbackTitle = activePlaybackTitle();
+        var playbackText = activePlaybackInfoText();
         refreshMediaMetadataFromDom();
-        var title = state.mediaTitle || displayTitle();
-        var episodeTag = state.episodeTag || seasonEpisodeTag(playbackInfoText());
+        var title = playbackTitle || state.mediaTitle || displayTitle();
+        var episodeTag = playbackText ? seasonEpisodeTag(playbackText) :
+            (state.episodeTag || seasonEpisodeTag(playbackInfoText()));
         if (episodeTag && title.toUpperCase().indexOf(episodeTag) < 0) {
             title += '.' + episodeTag;
         }

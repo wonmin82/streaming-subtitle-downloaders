@@ -198,6 +198,43 @@ test('apple: network title is not downgraded by generic DOM metadata', () => {
   ctx.updateMediaMetadata({ title: '\u200eApple TV' }, 1);
   assert.strictEqual(ctx.state.mediaTitle, 'Severance');
   assert.strictEqual(ctx.state.mediaTitlePriority, 3);
+  ctx.updateMediaMetadata({ title: 'Apple TV' }, 4);
+  assert.strictEqual(ctx.state.mediaTitle, 'Severance', 'generic titles must not replace a precise title at any priority');
+  assert.strictEqual(ctx.state.mediaTitlePriority, 3);
+});
+
+test('apple: active playback title overrides stale homepage metadata', () => {
+  const source = sources.apple;
+  const playback = {
+    innerText: 'F1 더 무비 정보 계속 보기',
+    textContent: 'F1 더 무비 정보 계속 보기',
+    getAttribute(name) { return name === 'aria-label' ? 'F1 더 무비' : ''; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; }
+  };
+  const document = {
+    title: '\u200eApple TV',
+    body: { innerText: 'Ted Lasso 시즌 1 에피소드 1' },
+    querySelector(selector) {
+      if (selector === 'dialog[data-testid="playback-view"][open]') return playback;
+      return null;
+    },
+    querySelectorAll() { return []; }
+  };
+  const block = [
+    'var state = { mediaTitle: "Ted Lasso", mediaTitlePriority: 3, seasonNumber: 1, episodeNumber: 1, episodeTag: "S01E01" };',
+    functionDeclarations(source, [
+      'activePlaybackContainer', 'activePlaybackTitle', 'activePlaybackInfoText',
+      'isGenericMediaTitle', 'shouldReplaceMediaTitle', 'updateMediaMetadata',
+      'refreshMediaMetadataFromDom', 'safeBaseFilename', 'displayTitle',
+      'cleanDisplayTitle', 'seasonEpisodeTag', 'playbackInfoText', 'metaContent',
+      'formatSeasonEpisode', 'padNumber', 'sanitizeFilename'
+    ])
+  ].join('\n');
+  const ctx = evaluateFunctions(block, { document });
+  assert.strictEqual(ctx.safeBaseFilename(), 'F1 더 무비');
+  assert.strictEqual(ctx.state.mediaTitle, 'F1 더 무비');
+  assert.strictEqual(ctx.state.mediaTitlePriority, 4);
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {
@@ -239,6 +276,59 @@ test('netflix: menu lifecycle does not depend on metadata readiness', () => {
   const end = source.indexOf('\nconst getVideoId =', start);
   assert(start >= 0 && end > start, 'processMetadata block missing');
   assert(!source.slice(start, end).includes("menu.style.display = 'none'"), 'metadata processing must not hide the menu');
+});
+
+test('netflix: active player DOM title fills a missing metadata cache entry', () => {
+  const listeners = {};
+  const parent = {
+    appendChild(node) { node.isConnected = true; node.parentNode = this; },
+    removeChild(node) { node.isConnected = false; node.parentNode = null; }
+  };
+  const titleNode = { textContent: ' 설국열차 ' };
+  const player = {
+    querySelector(selector) {
+      return selector === '[data-uia="evidence-overlay"] h2' ? titleNode : null;
+    }
+  };
+  const document = {
+    body: null,
+    head: null,
+    documentElement: parent,
+    location: { pathname: '/watch/70270364', href: 'https://www.netflix.com/watch/70270364' },
+    createElement(tag) {
+      return { tagName: String(tag).toUpperCase(), textContent: '', innerHTML: '', isConnected: false, style: {} };
+    },
+    addEventListener(type, handler) { listeners[type] = handler; },
+    querySelector(selector) {
+      return selector === '[data-uia="watch-video"]' ? player : null;
+    }
+  };
+  const context = {
+    console: { log() {}, warn() {}, debug() {}, error() {} },
+    document,
+    location: document.location,
+    localStorage: { getItem() { return null; }, setItem() {} },
+    sessionStorage: { getItem() { return null; }, setItem() {} },
+    MutationObserver: function () { this.observe = function () {}; },
+    setTimeout() {},
+    clearTimeout() {},
+    CustomEvent: function () {},
+    Blob: function () {},
+    FileReader: function () {},
+    JSZip: function () {},
+    saveAs() {},
+    caches: {},
+    alert() { throw new Error('title fallback should avoid the alert'); },
+    URL,
+    addEventListener() {},
+    dispatchEvent() {}
+  };
+  context.window = context;
+  context.unsafeWindow = context;
+  vm.createContext(context);
+  vm.runInContext(sources.netflix, context);
+  const title = vm.runInContext('getTitleEntry()', context);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(title)), { type: 'movie', title: '설국열차' });
 });
 
 test('netflix: document-start initialization tolerates a missing body', () => {
