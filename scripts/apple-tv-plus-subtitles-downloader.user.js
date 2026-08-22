@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.12
+// @version    1.0.13
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1233,10 +1233,23 @@
         var container = activePlaybackContainer();
         if (!container) return '';
         var candidates = [];
-        try { candidates.push(container.getAttribute('aria-label') || ''); } catch (err) {}
         try {
-            var titleNode = container.querySelector('[data-testid*="title"], h1, h2');
-            if (titleNode) candidates.push(titleNode.textContent || '');
+            var selectors = [
+                '[data-testid="player-metadata-title"]',
+                '[data-testid*="player"][data-testid*="title"]',
+                '[data-testid="video-title"]',
+                'h1',
+                'h2'
+            ];
+            for (var selectorIndex = 0; selectorIndex < selectors.length; selectorIndex++) {
+                var titleNode = container.querySelector(selectors[selectorIndex]);
+                if (titleNode) candidates.push(titleNode.textContent || '');
+            }
+        } catch (err) {}
+        try {
+            var ariaLabel = container.getAttribute('aria-label') || '';
+            var infoText = container.innerText || container.textContent || '';
+            if (!seasonEpisodeTag(infoText)) candidates.push(ariaLabel);
         } catch (err) {}
 
         for (var i = 0; i < candidates.length; i++) {
@@ -2527,6 +2540,7 @@
             /\bS(?:eason)?\s*(\d{1,2})\s*[:._ -]*E(?:p(?:isode)?)?\s*(\d{1,3})\b/i,
             /\bSeason\s*(\d{1,2}).{0,24}\bEpisode\s*(\d{1,3})\b/i,
             /\bSeason\s*(\d{1,2}).{0,24}\bEp\.?\s*(\d{1,3})\b/i,
+            /\uC2DC\uC98C\s*(\d{1,2}).{0,24}?\uC5D0\uD53C\uC18C\uB4DC\s*(\d{1,3})/i,
             /\uC2DC\uC98C\s*(\d{1,2})\s*[:._ -]*(\d{1,3})\s*(?:\uD68C|\uD654|\uC5D0\uD53C\uC18C\uB4DC)/i,
             /(\d{1,2})\s*\uC2DC\uC98C.{0,24}(\d{1,3})\s*(?:\uD68C|\uD654|\uC5D0\uD53C\uC18C\uB4DC)/i
         ];

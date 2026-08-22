@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.4
+// @version    1.0.5
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -468,42 +468,155 @@ const getXFromCache = (cache, name, silent) => {
 const getSubsFromCache = silent => getXFromCache(subCache, 'subs', silent);
 
 const normalizeDomTitle = value => String(value || '').replace(/\s+/g, ' ').trim();
+const positiveInteger = value => {
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) && number > 0 ? number : null;
+};
 
-const playbackTitleFromDom = () => {
+const seasonNumberFromLabel = value => {
+  const label = normalizeDomTitle(value);
+  let match = label.match(/(?:season|\uC2DC\uC98C)\s*(\d{1,3})/i) ||
+    label.match(/(\d{1,3})\s*(?:season|\uC2DC\uC98C)/i);
+  if(match)
+    return positiveInteger(match[1]);
+  if(/limited\s+series|mini\s*series|\uB9AC\uBBF8\uD2F0\uB4DC\s*\uC2DC\uB9AC\uC988|\uBBF8\uB2C8\s*\uC2DC\uB9AC\uC988/i.test(label))
+    return 1;
+  return null;
+};
+
+const episodeNumberFromLabel = value => {
+  const label = normalizeDomTitle(value);
+  const patterns = [
+    /(?:episode|ep\.?|\uC5D0\uD53C\uC18C\uB4DC)\s*(\d{1,4})/i,
+    /^\s*E\s*(\d{1,4})(?:\D|$)/i,
+    /^\s*(\d{1,4})\s*(?:\uD654|\uD68C)(?:\D|$)/i,
+    /^\s*(\d{1,4})\s*[:.\-\u2013\u2014]/
+  ];
+  for(const pattern of patterns) {
+    const match = label.match(pattern);
+    if(match)
+      return positiveInteger(match[1]);
+  }
+  return null;
+};
+
+const cleanEpisodeSubtitle = (value, episodeNumber) => {
+  let subtitle = normalizeDomTitle(value);
+  const episode = positiveInteger(episodeNumber);
+  if(!subtitle)
+    return '';
+
+  if(episode !== null) {
+    const number = String(episode);
+    const prefixes = [
+      new RegExp('^\\s*(?:episode|ep\\.?|e)\\s*0*' + number + '\\s*[:.\\-\\u2013\\u2014]?\\s*', 'i'),
+      new RegExp('^\\s*0*' + number + '\\s*(?:\\uD654|\\uD68C)\\s*[:.\\-\\u2013\\u2014]?\\s*', 'i')
+    ];
+    for(const prefix of prefixes) {
+      if(prefix.test(subtitle)) {
+        subtitle = subtitle.replace(prefix, '').trim();
+        break;
+      }
+    }
+
+    const compact = subtitle.replace(/\s+/g, '');
+    const duplicateMarkers = [
+      new RegExp('^0*' + number + '(?:\\uD654|\\uD68C)$', 'i'),
+      new RegExp('^(?:episode|ep\\.?|e)0*' + number + '$', 'i')
+    ];
+    if(duplicateMarkers.some(pattern => pattern.test(compact)))
+      return '';
+  }
+
+  return subtitle;
+};
+
+const playbackMetadataFromDom = () => {
   const player = document.querySelector('[data-uia="watch-video"]') ||
     document.querySelector('.watch-video');
   if(!player)
-    return '';
-  const selectors = [
-    '[data-uia="evidence-overlay"] h2',
-    '[data-uia="video-title"]',
-    'h1',
-    'h2'
-  ];
+    return null;
 
-  for(const selector of selectors) {
+  let overlay = null;
+  try {
+    overlay = player.querySelector('[data-uia="evidence-overlay"]');
+  }
+  catch(ignore) {}
+  const container = overlay || player;
+  const titleSelectors = overlay ? ['h2', '[data-uia="video-title"]', 'h1'] : [
+    '[data-uia="evidence-overlay"] h2', '[data-uia="video-title"]', 'h1', 'h2'
+  ];
+  let title = '';
+
+  for(const selector of titleSelectors) {
     let node = null;
     try {
-      node = player.querySelector(selector);
+      node = container.querySelector(selector);
     }
     catch(ignore) {}
-    const title = normalizeDomTitle(node && node.textContent);
+    title = normalizeDomTitle(node && node.textContent);
     if(title && title.length <= 300 && title.toLowerCase() !== 'netflix')
-      return title;
+      break;
   }
-  return '';
+  if(!title)
+    return null;
+
+  let seasonLabel = '';
+  let episodeLabel = '';
+  try {
+    const seasonNode = container.querySelector('[data-uia="evidence-overlay-season-title"]');
+    const episodeNode = container.querySelector('[data-uia="evidence-overlay-episode-title"]');
+    seasonLabel = normalizeDomTitle(seasonNode && seasonNode.textContent);
+    episodeLabel = normalizeDomTitle(episodeNode && episodeNode.textContent);
+  }
+  catch(ignore) {}
+
+  if(!episodeLabel)
+    return {type: 'movie', title};
+
+  const episode = episodeNumberFromLabel(episodeLabel);
+  return {
+    type: 'show',
+    title,
+    season: seasonNumberFromLabel(seasonLabel) || 1,
+    episode,
+    subtitle: cleanEpisodeSubtitle(episodeLabel, episode),
+    hiddenNumber: false
+  };
+};
+
+const playbackTitleFromDom = () => {
+  const metadata = playbackMetadataFromDom();
+  return metadata ? metadata.title : '';
+};
+
+const mergeTitleEntryWithDom = (cached, dom) => {
+  if(!cached)
+    return dom;
+  if(!dom)
+    return cached;
+  if(cached.type !== 'show' && dom.type === 'show')
+    return {...cached, ...dom};
+  if(cached.type !== 'show')
+    return cached;
+  return {
+    ...cached,
+    title: cached.title || dom.title,
+    season: positiveInteger(cached.season) || dom.season,
+    episode: positiveInteger(cached.episode) || dom.episode,
+    subtitle: cached.subtitle || dom.subtitle
+  };
 };
 
 const getTitleEntry = silent => {
   const cached = getXFromCache(titleCache, 'title', true);
+  const dom = playbackMetadataFromDom();
   if(cached !== null)
-    return cached;
+    return mergeTitleEntryWithDom(cached, dom);
 
-  const title = playbackTitleFromDom();
-  if(title) {
-    const fallback = {type: 'movie', title};
-    titleCache[getVideoId()] = fallback;
-    return fallback;
+  if(dom) {
+    titleCache[getVideoId()] = dom;
+    return dom;
   }
 
   if(silent === true)
@@ -514,22 +627,24 @@ const getTitleEntry = silent => {
 const pad = (number, letter) => `${letter}${number.toString().padStart(2, '0')}`;
 const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-const safeTitle = title => title.trim().replace(/[:*?"<>|\\\/]+/g, '_').replace(/ /g, '.');
+const safeTitle = title => title.trim()
+  .replace(/[:*?"<>|\\\/]+/g, '_')
+  .replace(/\s+/g, '.')
+  .replace(/\.+/g, '.')
+  .replace(/_+(?=\.|$)/g, '')
+  .replace(/^\.|\.$/g, '');
 
 const getTitleFromCache = () => {
   const title = getTitleEntry();
   const titleParts = [title.title];
   if(title.type === 'show') {
-    const season = pad(title.season, 'S');
-    if(title.hiddenNumber) {
-      titleParts.push(season);
-      titleParts.push(title.subtitle);
-    }
-    else {
-      titleParts.push(season + pad(title.episode, 'E'));
-      if(epTitleInFilename)
-        titleParts.push(title.subtitle);
-    }
+    const seasonNumber = positiveInteger(title.season) || 1;
+    const episodeNumber = positiveInteger(title.episode) || episodeNumberFromLabel(title.subtitle);
+    const season = pad(seasonNumber, 'S');
+    titleParts.push(season + (episodeNumber === null ? '' : pad(episodeNumber, 'E')));
+    const subtitle = cleanEpisodeSubtitle(title.subtitle, episodeNumber);
+    if(epTitleInFilename && subtitle)
+      titleParts.push(subtitle);
   }
   return [safeTitle(titleParts.join('.')), safeTitle(title.title)];
 };
