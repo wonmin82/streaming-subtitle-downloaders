@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.14
+// @version    1.0.15
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -78,6 +78,12 @@
         wait: false,
         status: 'Start playback, then wait for tracks...',
         lastError: '',
+        outputFilename: '',
+        progressCompleted: 0,
+        progressTotal: 0,
+        progressLabel: 'Idle',
+        progressUiTimer: null,
+        lastProgressUiAt: 0,
         downloadall: false,
         zip: null
     };
@@ -690,8 +696,9 @@
             '#dpsd-menu li.dpsd-disabled{opacity:.45;cursor:not-allowed}',
             '#dpsd-menu li.dpsd-disabled:hover{background:transparent}',
             '#dpsd-track{width:100%;margin-top:6px;border:1px solid #555;background:#222;color:#fff;padding:4px;font-size:12px}',
-            '#dpsd-status{color:#ddd;word-break:break-word}',
-            '#dpsd-count,#dpsd-selected-name,#dpsd-format{font-weight:normal}'
+            '#dpsd-status,#dpsd-filename{color:#ddd;word-break:break-word}',
+            '#dpsd-progress{width:100%;height:10px;margin-top:6px;accent-color:#00a8e1}',
+            '#dpsd-count,#dpsd-selected-name,#dpsd-format,#dpsd-progress-text{font-weight:normal}'
         ].join('\n');
 
         appendWhenPossible(style);
@@ -761,6 +768,25 @@
         formatValue.textContent = 'WebVTT';
         formatItem.appendChild(formatValue);
         menu.appendChild(formatItem);
+
+        var filenameItem = createMenuItem('', 'Output file: ', 'dpsd-info');
+        var filenameValue = document.createElement('span');
+        filenameValue.id = 'dpsd-filename';
+        filenameValue.textContent = 'Waiting for a subtitle track...';
+        filenameItem.appendChild(filenameValue);
+        menu.appendChild(filenameItem);
+
+        var progressItem = createMenuItem('', 'Progress: ', 'dpsd-info');
+        var progressValue = document.createElement('span');
+        progressValue.id = 'dpsd-progress-text';
+        progressValue.textContent = 'Idle';
+        var progressBar = document.createElement('progress');
+        progressBar.id = 'dpsd-progress';
+        progressBar.max = 1;
+        progressBar.value = 0;
+        progressItem.appendChild(progressValue);
+        progressItem.appendChild(progressBar);
+        menu.appendChild(progressItem);
 
         menu.appendChild(createMenuItem('dpsd-rescan', 'Rescan playback resources'));
 
@@ -853,6 +879,9 @@
         var downloadKo = document.getElementById('dpsd-download-ko');
         var downloadEnKo = document.getElementById('dpsd-download-en-ko');
         var selectedName = document.getElementById('dpsd-selected-name');
+        var filename = document.getElementById('dpsd-filename');
+        var progress = document.getElementById('dpsd-progress');
+        var progressText = document.getElementById('dpsd-progress-text');
         var preferredEn = findPreferredTrack('en');
         var preferredKo = findPreferredTrack('ko');
         var desiredKey = state.userSelectedTrack ? state.selectedTrackKey : preferredSelectionKey();
@@ -882,6 +911,8 @@
 
         count.textContent = state.langs.length + (state.langs.length === 1 ? ' track' : ' tracks');
         selectedName.textContent = findTrackByKey(select.value) ? findTrackByKey(select.value).NAME : 'none';
+        filename.textContent = state.wait && state.outputFilename ? state.outputFilename : previewSelectedFilename(select.value);
+        updateProgressElement(progress, progressText);
         status.textContent = state.lastError || state.status;
         setMenuItemDisabled(download, state.wait || state.langs.length === 0);
         setMenuItemDisabled(downloadAll, state.wait || state.langs.length === 0);
@@ -897,6 +928,84 @@
         if (!node) return;
         node.classList.toggle('dpsd-disabled', !!disabled);
         node.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+
+    function previewSelectedFilename(trackKey) {
+        var track = findTrackByKey(trackKey);
+        if (!track) return 'Waiting for a subtitle track...';
+        return trackDownloadFilename(track, tracksWithForcedCompanion(track), safeBaseFilename());
+    }
+
+    function trackDownloadFilename(track, tracks, baseFilename) {
+        tracks = uniqueTracks(tracks || [track]);
+        if (tracks.length === 1) return baseFilename + '.' + safeTrackName(track) + '.vtt';
+        return baseFilename + '.' + safeTrackName(track) + '.with-forced.zip';
+    }
+
+    function updateProgressElement(progress, progressText) {
+        if (!progress || !progressText) return;
+        var completed = Math.max(0, Number(state.progressCompleted) || 0);
+        var total = Math.max(0, Number(state.progressTotal) || 0);
+        var label = state.progressLabel || (state.wait ? 'Preparing...' : 'Idle');
+
+        if (state.wait && total === 0) {
+            progress.removeAttribute('value');
+            progress.max = 1;
+            progressText.textContent = label;
+            return;
+        }
+
+        progress.max = Math.max(1, total);
+        progress.value = Math.min(completed, Math.max(1, total));
+        progressText.textContent = total > 0
+            ? label + ' (' + completed + '/' + total + ', ' + Math.floor(completed * 100 / total) + '%)'
+            : label;
+    }
+
+    function scheduleProgressUi(force) {
+        var now = Date.now();
+        var elapsed = now - state.lastProgressUiAt;
+        var render = function () {
+            state.progressUiTimer = null;
+            state.lastProgressUiAt = Date.now();
+            updateProgressElement(
+                document.getElementById('dpsd-progress'),
+                document.getElementById('dpsd-progress-text')
+            );
+        };
+
+        if (force || elapsed >= 100) {
+            if (state.progressUiTimer !== null) {
+                clearTimeout(state.progressUiTimer);
+                state.progressUiTimer = null;
+            }
+            render();
+        } else if (state.progressUiTimer === null) {
+            state.progressUiTimer = setTimeout(render, 100 - elapsed);
+        }
+    }
+
+    function setDownloadProgress(operation, completed, total, label) {
+        assertDownloadOperationCurrent(operation);
+        operation.progressCompleted = Math.max(0, Number(completed) || 0);
+        operation.progressTotal = Math.max(operation.progressCompleted, Number(total) || 0);
+        state.progressCompleted = operation.progressCompleted;
+        state.progressTotal = operation.progressTotal;
+        if (label) state.progressLabel = label;
+        scheduleProgressUi(operation.progressCompleted >= operation.progressTotal);
+    }
+
+    function addDownloadProgressTotal(operation, count, label) {
+        setDownloadProgress(
+            operation,
+            operation.progressCompleted,
+            operation.progressTotal + Math.max(0, Number(count) || 0),
+            label
+        );
+    }
+
+    function advanceDownloadProgress(operation, label) {
+        setDownloadProgress(operation, operation.progressCompleted + 1, operation.progressTotal, label || 'Downloading segments...');
     }
 
     function installNetworkHooks() {
@@ -1204,6 +1313,10 @@
         state.selectedTrackKey = '';
         state.userSelectedTrack = false;
         state.lastError = '';
+        state.outputFilename = '';
+        state.progressCompleted = 0;
+        state.progressTotal = 0;
+        state.progressLabel = 'Idle';
     }
 
     function activePlaybackContainer() {
@@ -1819,13 +1932,21 @@
         return { offset: offset, length: parsed.length };
     }
 
-    function beginDownloadOperation() {
+    function beginDownloadOperation(outputFilename) {
         var operation = {
             id: ++state.downloadOperationSequence,
             sessionId: state.playbackSessionId,
-            baseFilename: safeBaseFilename()
+            baseFilename: safeBaseFilename(),
+            outputFilename: outputFilename || '',
+            progressCompleted: 0,
+            progressTotal: 0
         };
+        if (!operation.outputFilename) operation.outputFilename = operation.baseFilename + '.subtitles.zip';
         state.activeDownloadOperationId = operation.id;
+        state.outputFilename = operation.outputFilename;
+        state.progressCompleted = 0;
+        state.progressTotal = 0;
+        state.progressLabel = 'Preparing...';
         return operation;
     }
 
@@ -1855,8 +1976,10 @@
 
     function downloadAllTracks() {
         if (state.wait || state.langs.length === 0) return;
-        var operation = beginDownloadOperation();
         var tracks = state.langs.slice();
+        var baseFilename = safeBaseFilename();
+        var operation = beginDownloadOperation(baseFilename + '.subtitles.zip');
+        operation.baseFilename = baseFilename;
         var zip = new JSZip();
         state.downloadall = true;
         state.zip = zip;
@@ -1874,13 +1997,19 @@
             });
         }).then(function () {
             assertDownloadOperationCurrent(operation);
+            state.progressLabel = 'Creating ZIP...';
+            updateUi();
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
             assertDownloadOperationCurrent(operation);
             saveAs(blob, operation.baseFilename + '.subtitles.zip');
             state.status = 'Downloaded all subtitles.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -1888,19 +2017,26 @@
 
     function downloadTrack(track) {
         if (state.wait) return;
-        var operation = beginDownloadOperation();
         var tracks = tracksWithForcedCompanion(track);
+        var baseFilename = safeBaseFilename();
+        var outputFilename = trackDownloadFilename(track, tracks, baseFilename);
+        var operation = beginDownloadOperation(outputFilename);
+        operation.baseFilename = baseFilename;
         state.wait = true;
         state.lastError = '';
         state.selectedTrackKey = track.key;
         state.status = 'Downloading ' + downloadTrackNames(tracks) + '...';
         updateUi();
 
-        downloadTrackFiles(tracks, operation.baseFilename + '.' + safeTrackName(track) + '.with-forced.zip', operation).then(function () {
+        downloadTrackFiles(tracks, outputFilename, operation).then(function () {
             assertDownloadOperationCurrent(operation);
             state.status = 'Downloaded ' + downloadTrackNames(tracks) + '.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -1929,8 +2065,11 @@
             return;
         }
 
-        var operation = beginDownloadOperation();
         var tracks = uniqueTracks(tracksWithForcedCompanion(english).concat(tracksWithForcedCompanion(korean)));
+        var baseFilename = safeBaseFilename();
+        var outputFilename = baseFilename + '.en-ko.subtitles.zip';
+        var operation = beginDownloadOperation(outputFilename);
+        operation.baseFilename = baseFilename;
         var zip = new JSZip();
 
         state.wait = true;
@@ -1945,13 +2084,19 @@
             });
         })).then(function () {
             assertDownloadOperationCurrent(operation);
+            state.progressLabel = 'Creating ZIP...';
+            updateUi();
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
             assertDownloadOperationCurrent(operation);
             saveAs(blob, operation.baseFilename + '.en-ko.subtitles.zip');
             state.status = 'Downloaded English + Korean subtitles' + forcedSummary(tracks) + '.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -1974,6 +2119,8 @@
             });
         })).then(function () {
             assertDownloadOperationCurrent(operation);
+            state.progressLabel = 'Creating ZIP...';
+            updateUi();
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
             assertDownloadOperationCurrent(operation);
@@ -2040,7 +2187,7 @@
 
     function buildSubtitleFile(track, operation) {
         assertDownloadOperationCurrent(operation);
-        return getTrackVtt(track).then(function (vtt) {
+        return getTrackVtt(track, operation).then(function (vtt) {
             assertDownloadOperationCurrent(operation);
             var output = normalizeVttForDownload(vtt);
             if (!output.trim()) throw new Error('No subtitle cues found.');
@@ -2051,9 +2198,17 @@
         });
     }
 
-    function getTrackVtt(track) {
+    function getTrackVtt(track, operation) {
+        assertDownloadOperationCurrent(operation);
+        state.progressLabel = 'Reading ' + track.NAME + ' playlist...';
+        updateUi();
         return getText(track.URI).then(function (playlist) {
-            if (/^\s*WEBVTT/i.test(playlist)) return playlist;
+            assertDownloadOperationCurrent(operation);
+            if (/^\s*WEBVTT/i.test(playlist)) {
+                addDownloadProgressTotal(operation, 1, 'Downloading ' + track.NAME + '...');
+                advanceDownloadProgress(operation, 'Downloading ' + track.NAME + '...');
+                return playlist;
+            }
 
             var duration = playlistDurationSeconds(playlist) || subtitleTextDurationSeconds(playlist);
             if (duration && !track.playlistDuration) track.playlistDuration = duration;
@@ -2062,6 +2217,7 @@
                 segments = track.segments.map(function (url) { return { url: url, map: null }; });
             }
             if (!segments.length) throw new Error('No VTT segments found for ' + track.NAME + '.');
+            addDownloadProgressTotal(operation, segments.length, 'Downloading ' + track.NAME + ' segments...');
 
             var merged = '';
             var headerState = createHlsVttHeaderState();
@@ -2071,6 +2227,7 @@
             var failedSegments = [];
             var cueCount = 0;
             return runSequential(segments, function (segment) {
+                assertDownloadOperationCurrent(operation);
                 return Promise.all([
                     getHlsResourceText(segment.url, segment.byterange),
                     getHlsInitText(segment.map, mapCache)
@@ -2086,6 +2243,8 @@
                 }).catch(function (err) {
                     failedSegments.push(segment.url);
                     debuglog('Segment failed: ' + err.message);
+                }).then(function () {
+                    advanceDownloadProgress(operation, 'Downloading ' + track.NAME + ' segments...');
                 });
             }).then(function () {
                 if (failedSegments.length) {

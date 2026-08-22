@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.8
+// @version    1.0.9
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -47,6 +47,7 @@ class ProgressBar {
     });
 
     container.appendChild(this.progressElement);
+    setMenuDownloadProgress(0, max, 'Downloading subtitle tracks...', true);
   }
 
   increment() {
@@ -55,6 +56,7 @@ class ProgressBar {
       let p = this.current / this.max * 100;
       this.progressElement.style.background = `linear-gradient(to right, green ${p}%, transparent ${p}%)`;
     }
+    setMenuDownloadProgress(this.current, this.max, 'Downloading subtitle tracks...', true);
   }
 
   destroy() {
@@ -94,6 +96,8 @@ const DOWNLOAD_MENU = `
 <li class="pref-locale">Preferred locale: <span></span></li>
 <li class="lang-setting">Languages to download: <span></span></li>
 <li class="sub-format">Subtitle format: prefer <span></span></li>
+<li class="download-info output-filename">Output file: <span>Waiting for title metadata...</span></li>
+<li class="download-info download-progress">Progress: <span>Idle</span><progress max="1" value="0"></progress></li>
 <li class="batch-delay">Batch delay: <span></span></li>
 </ol>
 `;
@@ -126,6 +130,10 @@ body:hover #subtitle-downloader-menu { display: block; }
   cursor: pointer;
 }
 #subtitle-downloader-menu:hover li { display: block; }
+#subtitle-downloader-menu li.download-info { cursor: default; }
+#subtitle-downloader-menu li.download-info:hover { background: transparent; }
+#subtitle-downloader-menu .output-filename span { color: #ddd; word-break: break-word; }
+#subtitle-downloader-menu .download-progress progress { width: 100%; height: 10px; margin-top: 6px; accent-color: #e50914; }
 
 #subtitle-downloader-menu:not(.series) .series{ display: none; }
 #subtitle-downloader-menu.series .not-series{ display: none; }
@@ -141,6 +149,13 @@ let subCache = {};
 let titleCache = {};
 let subCacheWaitGeneration = 0;
 let batchDownloadInProgress = false;
+let downloadUiState = {
+  active: false,
+  filename: '',
+  completed: 0,
+  total: 0,
+  label: 'Idle'
+};
 
 let batch = null;
 try {
@@ -192,6 +207,10 @@ const toggleEpTitleInFilename = () => {
   else
     localStorage.removeItem('NSD_ep-title-in-filename');
   setEpTitleInFilename();
+  downloadUiState.filename = '';
+  downloadUiState.label = 'Idle';
+  downloadUiState.active = false;
+  applyDownloadUi();
 };
 const toggleForceLang = () => {
   forceSubs = !forceSubs;
@@ -293,6 +312,7 @@ const ensureMenu = () => {
     setBatchDelayText();
   }
   syncMenuVisibility(menu);
+  applyDownloadUi(menu);
   return menu;
 };
 
@@ -489,7 +509,7 @@ const episodeNumberFromLabel = value => {
   const patterns = [
     /(?:episode|ep\.?|\uC5D0\uD53C\uC18C\uB4DC)\s*(\d{1,4})/i,
     /^\s*E\s*(\d{1,4})(?:\D|$)/i,
-    /^\s*(\d{1,4})\s*(?:\uD654|\uD68C)(?:\D|$)/i,
+    /^\s*(\d{1,4})\s*(?:\uD654|\uD68C)/i,
     /^\s*(\d{1,4})\s*[:.\-\u2013\u2014]/,
     /(\d{1,4})\s*(?:\uD654|\uD68C)\s*$/i,
     /\bE\s*(\d{1,4})\s*$/i
@@ -544,6 +564,25 @@ const cleanEpisodeSubtitle = (value, episodeNumber) => {
   return subtitle;
 };
 
+const titleAndEpisodeFromDomContainer = node => {
+  if(!node)
+    return {title: '', episodeLabel: ''};
+
+  let heading = null;
+  try {
+    heading = node.querySelector('h1, h2, h3, h4, h5, h6');
+  }
+  catch(ignore) {}
+
+  const combined = normalizeDomTitle(node.textContent);
+  const title = normalizeDomTitle(heading && heading.textContent) || combined;
+  let episodeLabel = '';
+  if(title && combined.startsWith(title))
+    episodeLabel = normalizeDomTitle(combined.slice(title.length));
+
+  return {title, episodeLabel};
+};
+
 const playbackMetadataFromDom = () => {
   const player = document.querySelector('[data-uia="watch-video"]') ||
     document.querySelector('.watch-video');
@@ -556,17 +595,38 @@ const playbackMetadataFromDom = () => {
   }
   catch(ignore) {}
   const container = overlay || player;
-  const titleSelectors = overlay ? ['h2', '[data-uia="video-title"]', 'h1'] : [
-    '[data-uia="evidence-overlay"] h2', '[data-uia="video-title"]', 'h1', 'h2'
+  const titleSelectors = overlay ? ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '[data-uia="video-title"]'] : [
+    '[data-uia="evidence-overlay"] h1', '[data-uia="evidence-overlay"] h2',
+    '[data-uia="evidence-overlay"] h3', '[data-uia="evidence-overlay"] h4',
+    '[data-uia="evidence-overlay"] h5', '[data-uia="evidence-overlay"] h6',
+    '[data-uia="video-title"]', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
   ];
   let title = '';
+  let adjacentEpisodeLabel = '';
+
+  let titleContainer = null;
+  try {
+    titleContainer = container.querySelector('[data-uia="video-title"]');
+  }
+  catch(ignore) {}
+  if(titleContainer) {
+    const separated = titleAndEpisodeFromDomContainer(titleContainer);
+    title = separated.title;
+    if(episodeNumberFromLabel(separated.episodeLabel) !== null)
+      adjacentEpisodeLabel = separated.episodeLabel;
+  }
 
   for(const selector of titleSelectors) {
+    if(title)
+      break;
     let node = null;
     try {
       node = container.querySelector(selector);
     }
     catch(ignore) {}
+    const nodeUia = normalizeDomTitle(node && node.getAttribute && node.getAttribute('data-uia'));
+    if(/evidence-overlay-(?:season|episode)-title/i.test(nodeUia))
+      continue;
     title = normalizeDomTitle(node && node.textContent);
     if(title && title.length <= 300 && title.toLowerCase() !== 'netflix')
       break;
@@ -583,6 +643,9 @@ const playbackMetadataFromDom = () => {
     episodeLabel = normalizeDomTitle(episodeNode && episodeNode.textContent);
   }
   catch(ignore) {}
+
+  if(!episodeLabel)
+    episodeLabel = adjacentEpisodeLabel;
 
   if(!episodeLabel)
     return {type: 'movie', title};
@@ -637,14 +700,17 @@ const getTitleEntry = silent => {
 
 const syncPlaybackMetadataState = menu => {
   const title = getTitleEntry(true);
-  if(!title)
+  if(!title) {
+    applyDownloadUi(menu);
     return null;
+  }
   if(menu && menu.classList) {
     if(title.type === 'show')
       menu.classList.add('series');
     else
       menu.classList.remove('series');
   }
+  applyDownloadUi(menu);
   return title;
 };
 
@@ -658,8 +724,46 @@ const safeTitle = title => title.trim()
   .replace(/_+(?=\.|$)/g, '')
   .replace(/^\.|\.$/g, '');
 
-const getTitleFromCache = () => {
-  const title = getTitleEntry();
+const TITLE_CACHE_WAIT_TIMEOUT_MS = 5000;
+const DOM_MOVIE_STABILITY_MS = 1500;
+
+const waitForTitleEntry = async () => {
+  const videoId = getVideoId();
+  const deadline = Date.now() + TITLE_CACHE_WAIT_TIMEOUT_MS;
+  let movieCandidate = null;
+  let movieCandidateSince = 0;
+
+  while(getVideoId() === videoId && Date.now() < deadline) {
+    const candidate = getTitleEntry(true);
+    if(candidate) {
+      if(candidate.type === 'show') {
+        if(positiveInteger(candidate.episode) !== null)
+          return candidate;
+      }
+      else if(candidate.type !== 'movie' && candidate.type !== 'supplemental')
+        return candidate;
+
+      const fingerprint = JSON.stringify(candidate);
+      if(fingerprint !== movieCandidate) {
+        movieCandidate = fingerprint;
+        movieCandidateSince = Date.now();
+      }
+      else if(Date.now() - movieCandidateSince >= DOM_MOVIE_STABILITY_MS)
+        return candidate;
+    }
+    await asyncSleep(0.1);
+  }
+
+  const finalCandidate = getTitleEntry(true);
+  if(finalCandidate && finalCandidate.type === 'show' && positiveInteger(finalCandidate.episode) === null) {
+    alert("Couldn't find the episode number. Show the player controls and try again.");
+    throw '';
+  }
+  return getTitleEntry();
+};
+
+const getTitleFromCache = titleEntry => {
+  const title = titleEntry || getTitleEntry();
   const titleParts = [title.title];
   if(title.type === 'show') {
     const seasonNumber = positiveInteger(title.season) || 1;
@@ -671,6 +775,57 @@ const getTitleFromCache = () => {
       titleParts.push(subtitle);
   }
   return [safeTitle(titleParts.join('.')), safeTitle(title.title)];
+};
+
+const predictedOutputFilename = () => {
+  const title = getTitleEntry(true);
+  if(!title)
+    return 'Waiting for title metadata...';
+  try {
+    return getTitleFromCache(title)[0] + '.zip';
+  }
+  catch(ignore) {
+    return 'Waiting for title metadata...';
+  }
+};
+
+const applyDownloadUi = menu => {
+  menu = menu || document.querySelector('#subtitle-downloader-menu');
+  if(!menu || typeof menu.querySelector !== 'function')
+    return;
+
+  const filenameNode = menu.querySelector('.output-filename > span');
+  const progressText = menu.querySelector('.download-progress > span');
+  const progress = menu.querySelector('.download-progress progress');
+  const completed = Math.max(0, Number(downloadUiState.completed) || 0);
+  const total = Math.max(0, Number(downloadUiState.total) || 0);
+  const keepResultFilename = downloadUiState.label === 'Complete' || downloadUiState.label === 'Failed';
+
+  if(filenameNode)
+    filenameNode.textContent = (downloadUiState.active || keepResultFilename) && downloadUiState.filename
+      ? downloadUiState.filename
+      : predictedOutputFilename();
+  if(progressText)
+    progressText.textContent = total > 0
+      ? `${downloadUiState.label} (${completed}/${total}, ${Math.floor(completed * 100 / total)}%)`
+      : downloadUiState.label;
+  if(progress) {
+    progress.max = Math.max(1, total);
+    if(downloadUiState.active && total === 0)
+      progress.removeAttribute('value');
+    else
+      progress.value = Math.min(completed, Math.max(1, total));
+  }
+};
+
+const setMenuDownloadProgress = (completed, total, label, active, filename) => {
+  downloadUiState.completed = Math.max(0, Number(completed) || 0);
+  downloadUiState.total = Math.max(downloadUiState.completed, Number(total) || 0);
+  downloadUiState.label = label || (active ? 'Preparing...' : 'Idle');
+  downloadUiState.active = active === true;
+  if(typeof filename === 'string' && filename.length > 0)
+    downloadUiState.filename = filename;
+  applyDownloadUi();
 };
 
 const isUsableFormatCandidate = candidate => {
@@ -692,13 +847,25 @@ const pickFormat = formats => {
 
 
 const _save = async (_zip, title) => {
-  const content = await _zip.generateAsync({type:'blob'});
-  saveAs(content, title + '.zip');
+  const filename = title + '.zip';
+  setMenuDownloadProgress(0, 100, 'Creating ZIP...', true, filename);
+  try {
+    const content = await _zip.generateAsync({type:'blob'}, metadata => {
+      setMenuDownloadProgress(Math.round(metadata.percent || 0), 100, 'Creating ZIP...', true, filename);
+    });
+    saveAs(content, filename);
+    setMenuDownloadProgress(100, 100, 'Complete', false, filename);
+  }
+  catch(error) {
+    setMenuDownloadProgress(0, 0, 'Failed', false, filename);
+    throw error;
+  }
 };
 
 const _download = async _zip => {
+  const titleEntry = await waitForTitleEntry();
   const subs = getSubsFromCache();
-  const [title, seriesTitle] = getTitleFromCache();
+  const [title, seriesTitle] = getTitleFromCache(titleEntry);
   const downloaded = [];
 
   let filteredLangs;
@@ -714,6 +881,7 @@ const _download = async _zip => {
     }
   }
 
+  setMenuDownloadProgress(0, filteredLangs.length, 'Downloading subtitle tracks...', true, title + '.zip');
   const progress = new ProgressBar(filteredLangs.length);
   let stop = false;
   for(const lang of filteredLangs) {
@@ -776,14 +944,21 @@ const _download = async _zip => {
   if(await Promise.race([progress.stop, {}]) === STOP_THE_DOWNLOAD)
     stop = true;
   progress.destroy();
+  setMenuDownloadProgress(progress.current, progress.max, 'Preparing ZIP...', true, title + '.zip');
 
   return [title, seriesTitle, stop];
 };
 
 const downloadThis = async () => {
-  const _zip = new JSZip();
-  const [title] = await _download(_zip);
-  _save(_zip, title);
+  try {
+    const _zip = new JSZip();
+    const [title] = await _download(_zip);
+    await _save(_zip, title);
+  }
+  catch(error) {
+    setMenuDownloadProgress(0, 0, 'Failed', false);
+    console.error('[Netflix Subtitle Downloader] download failed', error);
+  }
 };
 
 const cleanBatch = async () => {

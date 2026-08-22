@@ -21,7 +21,7 @@ Each downloader runs in the streaming service's web player, detects subtitle res
 - Select an individual track or download preferred English, Korean, English + Korean, or all detected tracks.
 - Include associated forced tracks when the selected language provides them.
 - Convert supported segmented subtitle formats to WebVTT and refuse to save incomplete downloads.
-- Provide track count, output format, download status, and a manual playback-resource rescan.
+- Show the expected output filename and segment-level download progress alongside track count, output format, status, and a manual playback-resource rescan.
 - Build filenames from the active movie or show and add `SxxExx` when season and episode metadata is confirmed.
 
 Coupang Play additionally supports its DASH/TTML subtitle path. Apple TV+, Coupang Play, and Disney+ share the generated HLS segment and byte-range parser maintained in [`shared/hls-segment-parser.template.js`](shared/hls-segment-parser.template.js).
@@ -34,6 +34,7 @@ Coupang Play additionally supports its DASH/TTML subtitle path. Apple TV+, Coupa
 - Prefer WebVTT or XML-based Netflix subtitle variants, with fallback between available formats and mirrors.
 - Read live player metadata when API metadata is unavailable or stale.
 - Generate movie/show filenames and normalized TV episode names such as `Show.Title.S01E05` without duplicate episode labels.
+- Show the expected ZIP filename and progress for subtitle-track downloads and ZIP creation.
 
 ## Requirements
 
@@ -57,8 +58,9 @@ To update an installed script, use the userscript manager's update command or re
 
 1. Start the movie or episode and wait for the web player to load.
 2. Move the pointer to the top-center of the player to reveal the downloader menu.
-3. Choose the desired track or download action.
-4. Check the browser's configured download directory for the generated VTT or ZIP file.
+3. Confirm the expected output filename in the menu, then choose the desired track or download action.
+4. Follow the progress indicator while subtitle tracks or segments are downloaded.
+5. Check the browser's configured download directory for the generated VTT or ZIP file.
 
 For Apple TV+, Coupang Play, and Disney+, use **Rescan playback resources** if the player was already open before the script loaded or no tracks have appeared yet. On Netflix, keep the playback overlay loaded long enough for the current title, season, and episode metadata to appear before downloading.
 
