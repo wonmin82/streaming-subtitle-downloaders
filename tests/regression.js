@@ -206,9 +206,10 @@ test('apple: network title is not downgraded by generic DOM metadata', () => {
 test('apple: active playback title overrides stale homepage metadata', () => {
   const source = sources.apple;
   const playback = {
+    label: 'F1 더 무비',
     innerText: 'F1 더 무비 정보 계속 보기',
     textContent: 'F1 더 무비 정보 계속 보기',
-    getAttribute(name) { return name === 'aria-label' ? 'F1 더 무비' : ''; },
+    getAttribute(name) { return name === 'aria-label' ? this.label : ''; },
     querySelector() { return null; },
     querySelectorAll() { return []; }
   };
@@ -225,6 +226,7 @@ test('apple: active playback title overrides stale homepage metadata', () => {
     'var state = { mediaTitle: "Ted Lasso", mediaTitlePriority: 3, seasonNumber: 1, episodeNumber: 1, episodeTag: "S01E01" };',
     functionDeclarations(source, [
       'activePlaybackContainer', 'activePlaybackTitle', 'activePlaybackInfoText',
+      'normalizedMediaTitleForComparison', 'mediaTitlesMatch',
       'isGenericMediaTitle', 'shouldReplaceMediaTitle', 'updateMediaMetadata',
       'refreshMediaMetadataFromDom', 'safeBaseFilename', 'displayTitle',
       'cleanDisplayTitle', 'seasonEpisodeTag', 'playbackInfoText', 'metaContent',
@@ -235,6 +237,17 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   assert.strictEqual(ctx.safeBaseFilename(), 'F1 더 무비');
   assert.strictEqual(ctx.state.mediaTitle, 'F1 더 무비');
   assert.strictEqual(ctx.state.mediaTitlePriority, 4);
+
+  playback.label = "'테드 래소' - Ted Lasso";
+  playback.innerText = "'테드 래소' - Ted Lasso 정보 계속 보기";
+  playback.textContent = playback.innerText;
+  ctx.state.mediaTitle = 'Ted Lasso';
+  ctx.state.mediaTitlePriority = 3;
+  ctx.state.seasonNumber = 1;
+  ctx.state.episodeNumber = 1;
+  ctx.state.episodeTag = 'S01E01';
+  assert.strictEqual(ctx.safeBaseFilename(), "'테드 래소' - Ted Lasso.S01E01");
+  assert.strictEqual(ctx.state.episodeTag, 'S01E01', 'matching playback title should retain cached episode metadata');
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {

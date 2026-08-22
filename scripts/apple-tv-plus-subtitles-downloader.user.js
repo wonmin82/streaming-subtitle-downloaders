@@ -1261,9 +1261,31 @@
         return parts.filter(Boolean).join('\n');
     }
 
+    function normalizedMediaTitleForComparison(title) {
+        return cleanDisplayTitle(title)
+            .toLowerCase()
+            .replace(/[^a-z0-9\u00c0-\uffff]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function mediaTitlesMatch(first, second) {
+        var left = normalizedMediaTitleForComparison(first);
+        var right = normalizedMediaTitleForComparison(second);
+        if (!left || !right) return false;
+        if (left === right) return true;
+        return Math.min(left.length, right.length) >= 4 &&
+            (left.indexOf(right) >= 0 || right.indexOf(left) >= 0);
+    }
+
     function refreshMediaMetadataFromDom() {
         var playbackTitle = activePlaybackTitle();
         var playbackText = activePlaybackInfoText();
+        if (playbackTitle && state.mediaTitle && !mediaTitlesMatch(playbackTitle, state.mediaTitle)) {
+            state.seasonNumber = null;
+            state.episodeNumber = null;
+            state.episodeTag = '';
+        }
         updateMediaMetadata({
             title: playbackTitle || displayTitle(),
             episodeTag: seasonEpisodeTag(playbackText || playbackInfoText())
@@ -2462,8 +2484,8 @@
         var playbackText = activePlaybackInfoText();
         refreshMediaMetadataFromDom();
         var title = playbackTitle || state.mediaTitle || displayTitle();
-        var episodeTag = playbackText ? seasonEpisodeTag(playbackText) :
-            (state.episodeTag || seasonEpisodeTag(playbackInfoText()));
+        var episodeTag = seasonEpisodeTag(playbackText) || state.episodeTag ||
+            (playbackText ? '' : seasonEpisodeTag(playbackInfoText()));
         if (episodeTag && title.toUpperCase().indexOf(episodeTag) < 0) {
             title += '.' + episodeTag;
         }
