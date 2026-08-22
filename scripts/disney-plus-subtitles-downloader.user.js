@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.14
+// @version    1.0.15
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -56,6 +56,11 @@
         episodeNumber: null,
         episodeTag: '',
         episodeMetadataTitle: '',
+        shadowControlsRoot: null,
+        shadowControlsObserver: null,
+        shadowTitleRoot: null,
+        shadowTitleObserver: null,
+        shadowMetadataUiTimer: null,
         wait: false,
         status: 'Waiting for playback...',
         lastError: '',
@@ -94,12 +99,14 @@
                 beginPlaybackSession();
                 state.status = 'Scanning playback...';
                 resetSubtitleTracks();
+                resetShadowMetadataObservers();
                 resetMediaMetadata();
                 refreshMediaMetadataFromDom();
                 scanPerformanceEntries(true);
                 state.lastPerformanceScanAt = Date.now();
                 updateUi();
             } else {
+                resetShadowMetadataObservers();
                 invalidatePlaybackSession();
             }
         }
@@ -590,32 +597,22 @@
         var metadata = extractMetadataFromText(text);
         var hasEpisodeMetadata = metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber);
         if (hasEpisodeMetadata && !metadata.title) {
-            if (isPlayerExperienceMetadataUrl(url)) {
-                metadata.title = activePlaybackTitle(activePlaybackContainer()) || displayTitle();
-            } else {
-                delete metadata.episodeTag;
-                delete metadata.seasonNumber;
-                delete metadata.episodeNumber;
-                debuglog('Ignored episode metadata without a matching series title from ' + shortUrl(url));
-            }
+            delete metadata.episodeTag;
+            delete metadata.seasonNumber;
+            delete metadata.episodeNumber;
+            debuglog('Ignored episode metadata without a matching series title from ' + shortUrl(url));
         }
         if (metadata.title || metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber)) {
             updateMediaMetadata(metadata);
         }
     }
 
-    function isPlayerExperienceMetadataUrl(url) {
-        url = normalizeUrl(url);
-        return /(?:disney|bamgrid)\./i.test(url) && /(?:^|\/)playerExperience(?:\/|[?#]|$)/i.test(url);
-    }
-
     function shouldInspectMetadataUrl(url) {
         url = normalizeUrl(url);
         if (!url) return false;
         if (/\.(m3u8|vtt|mp4|mp4a|m4s|bif|png|jpg|jpeg|webp|woff2?)(?:[?#]|$)/i.test(url)) return false;
-        if (isPlayerExperienceMetadataUrl(url)) return true;
         if (/(?:upnext|explore|recommend(?:ation)?s?)/i.test(url)) return false;
-        return /disney|bamgrid|dssott|dssedge|graphql|deeplink/i.test(url);
+        return /disney|bamgrid|dssott|dssedge|graphql|playerExperience|deeplink/i.test(url);
     }
 
     function extractMetadataFromText(text) {
@@ -725,6 +722,123 @@
         state.progressLabel = 'Idle';
     }
 
+    function disconnectShadowObserver(observer) {
+        try {
+            if (observer) observer.disconnect();
+        } catch (err) {}
+    }
+
+    function resetShadowMetadataObservers() {
+        disconnectShadowObserver(state.shadowControlsObserver);
+        disconnectShadowObserver(state.shadowTitleObserver);
+        state.shadowControlsRoot = null;
+        state.shadowControlsObserver = null;
+        state.shadowTitleRoot = null;
+        state.shadowTitleObserver = null;
+        if (state.shadowMetadataUiTimer) clearTimeout(state.shadowMetadataUiTimer);
+        state.shadowMetadataUiTimer = null;
+    }
+
+    function shadowMutationObserver() {
+        try { return targetWindow.MutationObserver || window.MutationObserver; } catch (err) { return null; }
+    }
+
+    function scheduleShadowMetadataRefresh() {
+        if (state.shadowMetadataUiTimer) return;
+        state.shadowMetadataUiTimer = setTimeout(function () {
+            state.shadowMetadataUiTimer = null;
+            if (!isPlaybackPage() || !state.playbackSessionId) return;
+            refreshMediaMetadataFromDom();
+            updateUi();
+        }, 0);
+    }
+
+    function firstShadowPlaybackTitle(text) {
+        var lines = String(text || '').split(/[\r\n]+/);
+        for (var i = 0; i < lines.length; i++) {
+            var line = String(lines[i] || '').replace(/\s+/g, ' ').trim();
+            if (!line || seasonEpisodeTag(line)) continue;
+            var title = cleanDisplayTitle(line);
+            if (title && title !== 'DisneyPlus') return title;
+        }
+        return '';
+    }
+
+    function shadowPlaybackMetadata(titleRoot) {
+        if (!titleRoot) return null;
+        var text = '';
+        try { text = titleRoot.innerText || titleRoot.textContent || ''; } catch (err) {}
+        var episodeTag = seasonEpisodeTag(text);
+        if (!episodeTag) return null;
+        return {
+            title: activePlaybackTitle(activePlaybackContainer()) || firstShadowPlaybackTitle(text) || displayTitle(),
+            episodeTag: episodeTag
+        };
+    }
+
+    function connectShadowTitleObserver() {
+        var titleRoot = null;
+        try {
+            var titleBug = state.shadowControlsRoot && state.shadowControlsRoot.querySelector('title-bug');
+            titleRoot = titleBug && titleBug.shadowRoot;
+        } catch (err) {}
+        if (titleRoot === state.shadowTitleRoot) return false;
+
+        disconnectShadowObserver(state.shadowTitleObserver);
+        state.shadowTitleObserver = null;
+        state.shadowTitleRoot = titleRoot || null;
+        var Observer = shadowMutationObserver();
+        if (state.shadowTitleRoot && Observer) {
+            try {
+                state.shadowTitleObserver = new Observer(scheduleShadowMetadataRefresh);
+                state.shadowTitleObserver.observe(state.shadowTitleRoot, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true
+                });
+            } catch (err) {
+                disconnectShadowObserver(state.shadowTitleObserver);
+                state.shadowTitleObserver = null;
+            }
+        }
+        return true;
+    }
+
+    function observeShadowPlaybackMetadata() {
+        var controlsRoot = null;
+        try {
+            var controls = document.querySelector('main-app-controls-overlay');
+            controlsRoot = controls && controls.shadowRoot;
+        } catch (err) {}
+
+        if (controlsRoot !== state.shadowControlsRoot) {
+            disconnectShadowObserver(state.shadowControlsObserver);
+            disconnectShadowObserver(state.shadowTitleObserver);
+            state.shadowControlsRoot = controlsRoot || null;
+            state.shadowControlsObserver = null;
+            state.shadowTitleRoot = null;
+            state.shadowTitleObserver = null;
+            var Observer = shadowMutationObserver();
+            if (state.shadowControlsRoot && Observer) {
+                try {
+                    state.shadowControlsObserver = new Observer(function () {
+                        if (connectShadowTitleObserver()) scheduleShadowMetadataRefresh();
+                    });
+                    state.shadowControlsObserver.observe(state.shadowControlsRoot, {
+                        childList: true,
+                        subtree: true
+                    });
+                } catch (err) {
+                    disconnectShadowObserver(state.shadowControlsObserver);
+                    state.shadowControlsObserver = null;
+                }
+            }
+        }
+
+        connectShadowTitleObserver();
+        return shadowPlaybackMetadata(state.shadowTitleRoot);
+    }
+
     function activePlaybackContainer() {
         var selectors = [
             '[data-testid="disney-web-player-wrapper"]',
@@ -807,10 +921,12 @@
     }
 
     function refreshMediaMetadataFromDom() {
+        var shadowMetadata = observeShadowPlaybackMetadata();
         var container = activePlaybackContainer();
-        var playbackTitle = activePlaybackTitle(container) || displayTitle();
+        var playbackTitle = (shadowMetadata && shadowMetadata.title) || activePlaybackTitle(container) || displayTitle();
         var scopedPlaybackText = activePlaybackInfoText(container);
-        var playbackEpisodeTag = seasonEpisodeTag(scopedPlaybackText || (!container ? playbackInfoText() : ''));
+        var playbackEpisodeTag = (shadowMetadata && shadowMetadata.episodeTag) ||
+            seasonEpisodeTag(scopedPlaybackText || (!container ? playbackInfoText() : ''));
         if (playbackMetadataChanged(playbackTitle, playbackEpisodeTag)) restartPlaybackSessionForMetadataChange();
         updateMediaMetadata({
             title: playbackTitle,
