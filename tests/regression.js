@@ -55,6 +55,13 @@ for (const [service, source] of Object.entries(sources)) {
     requireText(source, '// @downloadURL', 'download URL metadata');
     requireText(source, '// @updateURL', 'update URL metadata');
   });
+
+  test(`${service}: runtime dependency versions stay aligned`, () => {
+    assert.deepStrictEqual(source.match(/^\/\/ @require\s+\S+$/gm), [
+      '// @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js',
+      '// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js'
+    ]);
+  });
 }
 
 for (const service of ['apple', 'disney', 'coupang']) {

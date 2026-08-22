@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.13
+// @version    1.0.14
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -21,8 +21,8 @@
 // @connect    *.cdn-apple.com
 // @connect    *.apple-dns.net
 // @connect    *
-// @require    https://cdn.jsdelivr.net/npm/jszip@3.5.0/dist/jszip.min.js
-// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js
+// @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js
+// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js
 // @run-at     document-start
 // ==/UserScript==
 

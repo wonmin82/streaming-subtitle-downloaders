@@ -100,10 +100,10 @@ streaming-subtitle-downloaders/
 
 The userscripts load their browser-side ZIP and file-saving dependencies through `@require` directives.
 
-| Scripts | JSZip | FileSaver |
-| --- | --- | --- |
-| Apple TV+, Coupang Play, Disney+ | 3.5.0 | 2.0.2 |
-| Netflix | 3.7.1 | `file-saver-es` 2.0.5 |
+| Dependency | Version |
+| --- | --- |
+| JSZip | 3.7.1 |
+| FileSaver | 2.0.5 |
 
 No package installation is required to run the repository's current Node.js development tools and regression suite.
 

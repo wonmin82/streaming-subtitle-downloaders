@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.22
+// @version    1.0.23
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -14,8 +14,8 @@
 // @grant      GM_xmlhttpRequest
 // @grant      unsafeWindow
 // @connect    *
-// @require    https://cdn.jsdelivr.net/npm/jszip@3.5.0/dist/jszip.min.js
-// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js
+// @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js
+// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js
 // @run-at     document-start
 // ==/UserScript==
 

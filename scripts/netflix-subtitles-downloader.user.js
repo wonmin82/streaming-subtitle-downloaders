@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.7
+// @version    1.0.8
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -11,7 +11,7 @@
 // @match      https://www.netflix.com/*
 // @grant      unsafeWindow
 // @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js
-// @require    https://cdn.jsdelivr.net/npm/file-saver-es@2.0.5/dist/FileSaver.min.js
+// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js
 // @run-at     document-start
 // ==/UserScript==
 
