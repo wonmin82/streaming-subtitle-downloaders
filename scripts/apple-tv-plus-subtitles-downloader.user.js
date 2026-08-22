@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.10
+// @version    1.0.11
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -71,6 +71,7 @@
         selectedTrackKey: '',
         userSelectedTrack: false,
         mediaTitle: '',
+        mediaTitlePriority: 0,
         seasonNumber: null,
         episodeNumber: null,
         episodeTag: '',
@@ -1068,7 +1069,7 @@
 
         var metadata = extractMetadataFromText(text);
         if (metadata.title || metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber)) {
-            updateMediaMetadata(metadata);
+            updateMediaMetadata(metadata, 3);
         }
     }
 
@@ -1139,12 +1140,33 @@
         });
     }
 
-    function updateMediaMetadata(metadata) {
+    function isGenericMediaTitle(title) {
+        var normalized = String(title || '')
+            .replace(/[\u200e\u200f]/g, '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+        return normalized === 'apple tv' || normalized === 'apple tv+' || normalized === 'appletvplus';
+    }
+
+    function shouldReplaceMediaTitle(title, priority) {
+        if (!state.mediaTitle) return true;
+        if (priority > state.mediaTitlePriority) return true;
+        if (priority < state.mediaTitlePriority) return false;
+        return !isGenericMediaTitle(title) || isGenericMediaTitle(state.mediaTitle);
+    }
+
+    function updateMediaMetadata(metadata, priority) {
         if (!metadata) return;
+        priority = Number(priority) || 1;
 
         if (metadata.title) {
             var title = cleanDisplayTitle(metadata.title);
-            if (title && !/\bS\d{1,2}E\d{1,3}\b/i.test(title)) state.mediaTitle = title;
+            if (title && !/\bS\d{1,2}E\d{1,3}\b/i.test(title) && shouldReplaceMediaTitle(title, priority)) {
+                state.mediaTitle = title;
+                state.mediaTitlePriority = priority;
+            }
         }
 
         if (metadata.seasonNumber && metadata.episodeNumber) {
@@ -1160,6 +1182,7 @@
 
     function resetMediaMetadata() {
         state.mediaTitle = '';
+        state.mediaTitlePriority = 0;
         state.seasonNumber = null;
         state.episodeNumber = null;
         state.episodeTag = '';
@@ -1186,7 +1209,7 @@
         updateMediaMetadata({
             title: displayTitle(),
             episodeTag: seasonEpisodeTag(playbackInfoText())
-        });
+        }, 1);
     }
 
     function scheduleManifestRetry(url, source, sessionId, delayMs) {
@@ -2387,13 +2410,25 @@
     }
 
     function displayTitle() {
-        var title = document.title || metaContent('og:title') || metaContent('twitter:title') || 'AppleTVPlus';
-        return cleanDisplayTitle(title);
+        var candidates = [
+            metaContent('og:title'),
+            metaContent('twitter:title'),
+            document.title || ''
+        ];
+        var fallback = '';
+        for (var i = 0; i < candidates.length; i++) {
+            if (!candidates[i]) continue;
+            var title = cleanDisplayTitle(candidates[i]);
+            if (!fallback) fallback = title;
+            if (!isGenericMediaTitle(title)) return title;
+        }
+        return fallback || 'AppleTVPlus';
     }
 
     function cleanDisplayTitle(title) {
         return String(title || 'AppleTVPlus')
-            .replace(/^\u200e+/, '')
+            .replace(/[\u200e\u200f]/g, '')
+            .replace(/\u00a0/g, ' ')
             .replace(/\s*보기\s*-\s*Apple.*$/i, '')
             .replace(/\s*-\s*Apple.*$/i, '')
             .replace(/\s*\|\s*Apple.*$/i, '')

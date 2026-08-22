@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.2
+// @version    1.0.3
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -12,6 +12,7 @@
 // @grant      unsafeWindow
 // @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js
 // @require    https://cdn.jsdelivr.net/npm/file-saver-es@2.0.5/dist/FileSaver.min.js
+// @run-at     document-start
 // ==/UserScript==
 
 class ProgressBar {
@@ -256,13 +257,52 @@ const popRandomElement = arr => {
   return arr.splice(arr.length * Math.random() << 0, 1)[0];
 };
 
+const isWatchPage = () => document.location.pathname.split('/')[1] === 'watch';
+
+const syncMenuVisibility = menu => {
+  if(!menu || !menu.isConnected)
+    return;
+  menu.style.display = (isWatchPage() ? '' : 'none');
+};
+
+const ensureMenu = () => {
+  if(!document.body)
+    return null;
+
+  let menu = document.querySelector('#subtitle-downloader-menu');
+  if(menu === null) {
+    menu = document.createElement('div');
+    menu.id = 'subtitle-downloader-menu';
+    menu.innerHTML = DOWNLOAD_MENU;
+    document.body.appendChild(menu);
+    menu.querySelector('.download').addEventListener('click', downloadThis);
+    menu.querySelector('.download-to-end').addEventListener('click', downloadToEnd);
+    menu.querySelector('.download-season').addEventListener('click', downloadSeason);
+    menu.querySelector('.download-all').addEventListener('click', downloadAll);
+    menu.querySelector('.ep-title-in-filename').addEventListener('click', toggleEpTitleInFilename);
+    menu.querySelector('.force-all-lang').addEventListener('click', toggleForceLang);
+    menu.querySelector('.pref-locale').addEventListener('click', setPreferredLocale);
+    menu.querySelector('.lang-setting').addEventListener('click', setLangToDownload);
+    menu.querySelector('.sub-format').addEventListener('click', setSubFormat);
+    menu.querySelector('.batch-delay').addEventListener('click', setBatchDelay);
+    setEpTitleInFilename();
+    setForceText();
+    setLocaleText();
+    setLangsText();
+    setFormatText();
+    setBatchDelayText();
+  }
+  syncMenuVisibility(menu);
+  return menu;
+};
+
 const handleSubsReady = menu => {
-  if(getSubsFromCache(true) === null || getXFromCache(titleCache, 'title', true) === null)
-    return false;
   if(!menu || !menu.isConnected)
     return false;
+  syncMenuVisibility(menu);
+  if(getSubsFromCache(true) === null || getXFromCache(titleCache, 'title', true) === null)
+    return false;
 
-  menu.style.display = (document.location.pathname.split('/')[1] === 'watch' ? '' : 'none');
   if(batch !== null && batch.length > 0)
     downloadBatch(true);
   return true;
@@ -317,7 +357,7 @@ const processSubInfo = async result => {
     }
   }
   subCache[result.movieId] = subs;
-  if(handleSubsReady(document.querySelector('#subtitle-downloader-menu')))
+  if(handleSubsReady(ensureMenu()))
     subCacheWaitGeneration++;
 };
 
@@ -345,34 +385,12 @@ const checkSubsCache = async menu => {
 };
 
 const processMetadata = data => {
+  const menu = ensureMenu();
   if(!data || !data.video)
     return;
+  if(!menu)
+    return;
 
-  // add menu when it's not there
-  let menu = document.querySelector('#subtitle-downloader-menu');
-  if(menu === null) {
-    menu = document.createElement('div');
-    menu.id = 'subtitle-downloader-menu';
-    menu.innerHTML = DOWNLOAD_MENU;
-    document.body.appendChild(menu);
-    menu.querySelector('.download').addEventListener('click', downloadThis);
-    menu.querySelector('.download-to-end').addEventListener('click', downloadToEnd);
-    menu.querySelector('.download-season').addEventListener('click', downloadSeason);
-    menu.querySelector('.download-all').addEventListener('click', downloadAll);
-    menu.querySelector('.ep-title-in-filename').addEventListener('click', toggleEpTitleInFilename);
-    menu.querySelector('.force-all-lang').addEventListener('click', toggleForceLang);
-    menu.querySelector('.pref-locale').addEventListener('click', setPreferredLocale);
-    menu.querySelector('.lang-setting').addEventListener('click', setLangToDownload);
-    menu.querySelector('.sub-format').addEventListener('click', setSubFormat);
-    menu.querySelector('.batch-delay').addEventListener('click', setBatchDelay);
-    setEpTitleInFilename();
-    setForceText();
-    setLocaleText();
-    setLangsText();
-    setFormatText();
-  }
-  // hide menu, at this point sub info is still missing
-  menu.style.display = 'none';
   menu.classList.remove('series');
 
   const result = data.video;
@@ -825,18 +843,25 @@ const injection = (ALL_FORMATS) => {
 
 window.addEventListener('netflix_sub_downloader_data', processMessage, false);
 
-// inject script
-const sc = document.createElement('script');
-sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ')';
-document.head.appendChild(sc);
-document.head.removeChild(sc);
+const injectPageHooks = () => {
+  const parent = document.head || document.documentElement;
+  if(!parent) {
+    window.setTimeout(injectPageHooks, 0);
+    return;
+  }
+  const sc = document.createElement('script');
+  sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ')';
+  parent.appendChild(sc);
+  parent.removeChild(sc);
+};
+injectPageHooks();
 
 // add CSS style
 const s = document.createElement('style');
 s.innerHTML = SCRIPT_CSS;
-document.head.appendChild(s);
 
 const observer = new MutationObserver(function(mutations) {
+  ensureMenu();
   mutations.forEach(function(mutation) {
     mutation.addedNodes.forEach(function(node) {
       // add scrollbar - Netflix doesn't expect you to have this manu languages to choose from...
@@ -847,4 +872,22 @@ const observer = new MutationObserver(function(mutations) {
     });
   });
 });
-observer.observe(document.body, { childList: true, subtree: true });
+
+let observerStarted = false;
+const initializeDom = () => {
+  if(!document.body)
+    return;
+  const parent = document.head || document.documentElement;
+  if(parent && !s.isConnected)
+    parent.appendChild(s);
+  ensureMenu();
+  if(!observerStarted) {
+    observer.observe(document.body, { childList: true, subtree: true });
+    observerStarted = true;
+  }
+};
+
+if(document.body)
+  initializeDom();
+else
+  document.addEventListener('DOMContentLoaded', initializeDom, {once: true});
