@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.11
+// @version    1.0.12
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -157,6 +157,7 @@ let downloadUiState = {
   total: 0,
   label: 'Idle'
 };
+let lastPlaybackUiMetadata = null;
 
 let batch = null;
 try {
@@ -750,6 +751,31 @@ const getTitleEntry = silent => {
   return getXFromCache(titleCache, 'title');
 };
 
+const playbackUiMetadataChanged = (previous, current) => {
+  if(!previous || !current)
+    return false;
+  const previousTitle = normalizedPlaybackTitle(previous.title);
+  const currentTitle = normalizedPlaybackTitle(current.title);
+  if(previousTitle && currentTitle && previousTitle !== currentTitle)
+    return true;
+  if(previous.type !== 'show' || current.type !== 'show')
+    return false;
+  const previousSeason = positiveInteger(previous.season);
+  const currentSeason = positiveInteger(current.season);
+  const previousEpisode = positiveInteger(previous.episode);
+  const currentEpisode = positiveInteger(current.episode);
+  return (previousSeason !== null && currentSeason !== null && previousSeason !== currentSeason) ||
+    (previousEpisode !== null && currentEpisode !== null && previousEpisode !== currentEpisode);
+};
+
+const resetDownloadUiForPlaybackChange = () => {
+  downloadUiState.active = false;
+  downloadUiState.filename = '';
+  downloadUiState.completed = 0;
+  downloadUiState.total = 0;
+  downloadUiState.label = 'Idle';
+};
+
 const syncPlaybackMetadataState = menu => {
   if(!isWatchPage())
     return null;
@@ -758,6 +784,9 @@ const syncPlaybackMetadataState = menu => {
     applyDownloadUi(menu);
     return null;
   }
+  if(playbackUiMetadataChanged(lastPlaybackUiMetadata, title))
+    resetDownloadUiForPlaybackChange();
+  lastPlaybackUiMetadata = {...title};
   if(menu && menu.classList) {
     if(title.type === 'show')
       menu.classList.add('series');
