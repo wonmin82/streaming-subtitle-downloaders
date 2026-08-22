@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.23
+// @version    1.0.24
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -77,6 +77,12 @@
         wait: false,
         status: 'Start playback, then wait for tracks...',
         lastError: '',
+        outputFilename: '',
+        progressCompleted: 0,
+        progressTotal: 0,
+        progressLabel: 'Idle',
+        progressUiTimer: null,
+        lastProgressUiAt: 0,
         zip: null
     };
 
@@ -692,8 +698,9 @@
             '#cpsd-menu li.cpsd-disabled{opacity:.45;cursor:not-allowed}',
             '#cpsd-menu li.cpsd-disabled:hover{background:transparent}',
             '#cpsd-track{width:100%;margin-top:6px;border:1px solid #555;background:#222;color:#fff;padding:4px;font-size:12px}',
-            '#cpsd-status{color:#ddd;word-break:break-word}',
-            '#cpsd-count,#cpsd-selected-name,#cpsd-format{font-weight:normal}'
+            '#cpsd-status,#cpsd-filename{color:#ddd;word-break:break-word}',
+            '#cpsd-progress{width:100%;height:10px;margin-top:6px;accent-color:#00a8e1}',
+            '#cpsd-count,#cpsd-selected-name,#cpsd-format,#cpsd-progress-text{font-weight:normal}'
         ].join('\n');
 
         appendWhenPossible(style);
@@ -771,6 +778,25 @@
         formatValue.textContent = 'WebVTT';
         formatItem.appendChild(formatValue);
         menu.appendChild(formatItem);
+
+        var filenameItem = createMenuItem('', 'Output file: ', 'cpsd-info');
+        var filenameValue = document.createElement('span');
+        filenameValue.id = 'cpsd-filename';
+        filenameValue.textContent = 'Waiting for a subtitle track...';
+        filenameItem.appendChild(filenameValue);
+        menu.appendChild(filenameItem);
+
+        var progressItem = createMenuItem('', 'Progress: ', 'cpsd-info');
+        var progressValue = document.createElement('span');
+        progressValue.id = 'cpsd-progress-text';
+        progressValue.textContent = 'Idle';
+        var progressBar = document.createElement('progress');
+        progressBar.id = 'cpsd-progress';
+        progressBar.max = 1;
+        progressBar.value = 0;
+        progressItem.appendChild(progressValue);
+        progressItem.appendChild(progressBar);
+        menu.appendChild(progressItem);
 
         menu.appendChild(createMenuItem('cpsd-rescan', 'Rescan playback resources'));
 
@@ -862,6 +888,9 @@
         var downloadKo = document.getElementById('cpsd-download-ko');
         var downloadEnKo = document.getElementById('cpsd-download-en-ko');
         var selectedName = document.getElementById('cpsd-selected-name');
+        var filename = document.getElementById('cpsd-filename');
+        var progress = document.getElementById('cpsd-progress');
+        var progressText = document.getElementById('cpsd-progress-text');
         var preferredEn = findPreferredTrack('en');
         var preferredKo = findPreferredTrack('ko');
         var desiredKey = state.userSelectedTrack ? state.selectedTrackKey : preferredSelectionKey();
@@ -889,6 +918,8 @@
 
         count.textContent = state.tracks.length + (state.tracks.length === 1 ? ' track' : ' tracks');
         selectedName.textContent = findTrackByKey(select.value) ? findTrackByKey(select.value).NAME : 'none';
+        filename.textContent = state.wait && state.outputFilename ? state.outputFilename : previewSelectedFilename(select.value);
+        updateProgressElement(progress, progressText);
         status.textContent = state.lastError || state.status;
         setMenuItemDisabled(download, state.wait || state.tracks.length === 0);
         setMenuItemDisabled(downloadAll, state.wait || state.tracks.length === 0);
@@ -904,6 +935,85 @@
         if (!node) return;
         node.classList.toggle('cpsd-disabled', !!disabled);
         node.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+
+    function previewSelectedFilename(trackKey) {
+        var track = findTrackByKey(trackKey);
+        if (!track) return 'Waiting for a subtitle track...';
+        return safeBaseFilename() + '.' + safeTrackName(track) + '.vtt';
+    }
+
+    function operationOutputFilename(operation) {
+        if (!operation || !operation.baseFilename) return 'Resolving title metadata...';
+        if (operation.kind === 'all') return operation.baseFilename + '.subtitles.zip';
+        if (operation.kind === 'en-ko') return operation.baseFilename + '.en-ko.subtitles.zip';
+        return operation.baseFilename + '.' + safeTrackName(operation.track) + '.vtt';
+    }
+
+    function updateProgressElement(progress, progressText) {
+        if (!progress || !progressText) return;
+        var completed = Math.max(0, Number(state.progressCompleted) || 0);
+        var total = Math.max(0, Number(state.progressTotal) || 0);
+        var label = state.progressLabel || (state.wait ? 'Preparing...' : 'Idle');
+
+        if (state.wait && total === 0) {
+            progress.removeAttribute('value');
+            progress.max = 1;
+            progressText.textContent = label;
+            return;
+        }
+
+        progress.max = Math.max(1, total);
+        progress.value = Math.min(completed, Math.max(1, total));
+        progressText.textContent = total > 0
+            ? label + ' (' + completed + '/' + total + ', ' + Math.floor(completed * 100 / total) + '%)'
+            : label;
+    }
+
+    function scheduleProgressUi(force) {
+        var now = Date.now();
+        var elapsed = now - state.lastProgressUiAt;
+        var render = function () {
+            state.progressUiTimer = null;
+            state.lastProgressUiAt = Date.now();
+            updateProgressElement(
+                document.getElementById('cpsd-progress'),
+                document.getElementById('cpsd-progress-text')
+            );
+        };
+
+        if (force || elapsed >= 100) {
+            if (state.progressUiTimer !== null) {
+                clearTimeout(state.progressUiTimer);
+                state.progressUiTimer = null;
+            }
+            render();
+        } else if (state.progressUiTimer === null) {
+            state.progressUiTimer = setTimeout(render, 100 - elapsed);
+        }
+    }
+
+    function setDownloadProgress(operation, completed, total, label) {
+        assertDownloadOperationCurrent(operation);
+        operation.progressCompleted = Math.max(0, Number(completed) || 0);
+        operation.progressTotal = Math.max(operation.progressCompleted, Number(total) || 0);
+        state.progressCompleted = operation.progressCompleted;
+        state.progressTotal = operation.progressTotal;
+        if (label) state.progressLabel = label;
+        scheduleProgressUi(operation.progressCompleted >= operation.progressTotal);
+    }
+
+    function addDownloadProgressTotal(operation, count, label) {
+        setDownloadProgress(
+            operation,
+            operation.progressCompleted,
+            operation.progressTotal + Math.max(0, Number(count) || 0),
+            label
+        );
+    }
+
+    function advanceDownloadProgress(operation, label) {
+        setDownloadProgress(operation, operation.progressCompleted + 1, operation.progressTotal, label || 'Downloading segments...');
     }
 
     function installNetworkHooks() {
@@ -2052,14 +2162,39 @@
         return max;
     }
 
-    function beginDownloadOperation() {
+    function beginDownloadOperation(kind, track) {
         var operation = {
             id: ++state.downloadOperationSequence,
             sessionId: state.playbackSessionId,
-            baseFilename: safeBaseFilename()
+            kind: kind || 'track',
+            track: track || null,
+            baseFilename: '',
+            metadataPromise: null,
+            progressCompleted: 0,
+            progressTotal: 0
         };
         state.activeDownloadOperationId = operation.id;
+        state.outputFilename = 'Resolving title metadata...';
+        state.progressCompleted = 0;
+        state.progressTotal = 0;
+        state.progressLabel = 'Reading title metadata...';
         return operation;
+    }
+
+    function ensureOperationBaseFilename(operation) {
+        assertDownloadOperationCurrent(operation);
+        if (operation.baseFilename) return Promise.resolve(operation.baseFilename);
+        if (operation.metadataPromise) return operation.metadataPromise;
+
+        operation.metadataPromise = ensureMediaMetadata().then(function () {
+            assertDownloadOperationCurrent(operation);
+            operation.baseFilename = safeBaseFilename();
+            state.outputFilename = operationOutputFilename(operation);
+            state.progressLabel = 'Preparing download...';
+            updateUi();
+            return operation.baseFilename;
+        });
+        return operation.metadataPromise;
     }
 
     function isDownloadOperationCurrent(operation) {
@@ -2086,7 +2221,7 @@
 
     function downloadAllTracks() {
         if (state.wait || state.tracks.length === 0) return;
-        var operation = beginDownloadOperation();
+        var operation = beginDownloadOperation('all');
         var tracks = state.tracks.slice();
         var zip = new JSZip();
         state.zip = zip;
@@ -2104,13 +2239,19 @@
             });
         }).then(function () {
             assertDownloadOperationCurrent(operation);
+            state.progressLabel = 'Creating ZIP...';
+            updateUi();
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
             assertDownloadOperationCurrent(operation);
-            saveAs(blob, operation.baseFilename + '.subtitles.zip');
+            saveAs(blob, operationOutputFilename(operation));
             state.status = 'Downloaded all subtitles.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -2118,7 +2259,7 @@
 
     function downloadTrack(track) {
         if (state.wait) return;
-        var operation = beginDownloadOperation();
+        var operation = beginDownloadOperation('track', track);
         state.wait = true;
         state.lastError = '';
         state.selectedTrackKey = track.key;
@@ -2129,8 +2270,12 @@
             assertDownloadOperationCurrent(operation);
             saveAs(new Blob([file.content], { type: 'text/vtt;charset=utf-8' }), file.name);
             state.status = 'Downloaded ' + track.NAME + '.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -2158,7 +2303,7 @@
             return;
         }
 
-        var operation = beginDownloadOperation();
+        var operation = beginDownloadOperation('en-ko');
         var tracks = uniqueTracks([english, korean]);
         var zip = new JSZip();
         state.wait = true;
@@ -2173,13 +2318,19 @@
             });
         })).then(function () {
             assertDownloadOperationCurrent(operation);
+            state.progressLabel = 'Creating ZIP...';
+            updateUi();
             return zip.generateAsync({ type: 'blob' });
         }).then(function (blob) {
             assertDownloadOperationCurrent(operation);
-            saveAs(blob, operation.baseFilename + '.en-ko.subtitles.zip');
+            saveAs(blob, operationOutputFilename(operation));
             state.status = 'Downloaded English + Korean subtitles.';
+            state.progressLabel = 'Complete';
         }).catch(function (err) {
-            if (isDownloadOperationCurrent(operation)) state.lastError = 'Download failed: ' + err.message;
+            if (isDownloadOperationCurrent(operation)) {
+                state.lastError = 'Download failed: ' + err.message;
+                state.progressLabel = 'Failed';
+            }
         }).then(function () {
             if (finishDownloadOperation(operation)) updateUi();
         });
@@ -2200,9 +2351,9 @@
 
     function buildSubtitleFile(track, operation) {
         assertDownloadOperationCurrent(operation);
-        return ensureMediaMetadata().then(function () {
+        return ensureOperationBaseFilename(operation).then(function () {
             assertDownloadOperationCurrent(operation);
-            return getTrackVtt(track);
+            return getTrackVtt(track, operation);
         }).then(function (vtt) {
             assertDownloadOperationCurrent(operation);
             var output = normalizeVttForDownload(vtt);
@@ -2214,33 +2365,56 @@
         });
     }
 
-    function getTrackVtt(track) {
+    function getTrackVtt(track, operation) {
         var sessionId = state.playbackSessionId;
-        if (track.text) return Promise.resolve(textToVtt(track.text, track));
-        if (track.segments && track.segments.length) return mergeSegments(track);
+        assertDownloadOperationCurrent(operation);
+        if (track.text) {
+            addDownloadProgressTotal(operation, 1, 'Processing ' + track.NAME + '...');
+            advanceDownloadProgress(operation, 'Processing ' + track.NAME + '...');
+            return Promise.resolve(textToVtt(track.text, track));
+        }
+        if (track.segments && track.segments.length) return mergeSegments(track, operation);
+
+        state.progressLabel = 'Reading ' + track.NAME + ' playlist...';
+        updateUi();
 
         return getText(track.URI).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) throw new Error('Playback changed while downloading subtitles.');
-            if (/^\s*WEBVTT/i.test(text)) return text;
-            if (looksLikeTtmlText(text)) return ttmlToVtt(text);
-            if (looksLikeSrt(text)) return srtToVtt(text);
+            assertDownloadOperationCurrent(operation);
+            if (/^\s*WEBVTT/i.test(text)) {
+                addDownloadProgressTotal(operation, 1, 'Processing ' + track.NAME + '...');
+                advanceDownloadProgress(operation, 'Processing ' + track.NAME + '...');
+                return text;
+            }
+            if (looksLikeTtmlText(text)) {
+                addDownloadProgressTotal(operation, 1, 'Processing ' + track.NAME + '...');
+                advanceDownloadProgress(operation, 'Processing ' + track.NAME + '...');
+                return ttmlToVtt(text);
+            }
+            if (looksLikeSrt(text)) {
+                addDownloadProgressTotal(operation, 1, 'Processing ' + track.NAME + '...');
+                advanceDownloadProgress(operation, 'Processing ' + track.NAME + '...');
+                return srtToVtt(text);
+            }
             if (/^\s*#EXTM3U/i.test(text)) {
                 var hlsSegments = extractHlsSegmentEntries(text, track.URI);
                 track.playlistDuration = playlistDurationSeconds(text) || track.playlistDuration;
                 if (!hlsSegments.length) throw new Error('No subtitle segments found for ' + track.NAME + '.');
                 track.hlsSegments = hlsSegments;
                 track.segments = hlsSegments.map(function (segment) { return segment.url; });
-                return mergeSegments(track);
+                return mergeSegments(track, operation);
             }
             if (/^\s*<MPD[\s>]/i.test(text)) {
                 parseDashManifest(track.URI, text);
                 throw new Error('DASH manifest was parsed. Select a detected text track and retry.');
             }
+            addDownloadProgressTotal(operation, 1, 'Processing ' + track.NAME + '...');
+            advanceDownloadProgress(operation, 'Processing ' + track.NAME + '...');
             return textToVtt(text, track);
         });
     }
 
-    function mergeSegments(track) {
+    function mergeSegments(track, operation) {
         var segments = track.hlsSegments && track.hlsSegments.length ? track.hlsSegments : (track.segments || []).map(function (url) {
             return { url: url, map: null };
         });
@@ -2251,7 +2425,9 @@
         var seenBlocks = {};
         var failedSegments = [];
         var cueCount = 0;
+        addDownloadProgressTotal(operation, segments.length, 'Downloading ' + track.NAME + ' segments...');
         return runSequential(segments, function (segment) {
+            assertDownloadOperationCurrent(operation);
             return Promise.all([
                 getHlsResourceText(segment.url, segment.byterange),
                 getHlsInitText(segment.map, mapCache)
@@ -2268,6 +2444,8 @@
             }).catch(function (err) {
                 failedSegments.push(segment.url);
                 debuglog('Segment failed: ' + err.message);
+            }).then(function () {
+                advanceDownloadProgress(operation, 'Downloading ' + track.NAME + ' segments...');
             });
         }).then(function () {
             if (failedSegments.length) {
@@ -3809,6 +3987,10 @@
         state.metadataPromise = null;
         state.lastError = '';
         state.status = 'Scanning playback...';
+        state.outputFilename = '';
+        state.progressCompleted = 0;
+        state.progressTotal = 0;
+        state.progressLabel = 'Idle';
     }
 
     function refreshMediaMetadataFromDom() {
@@ -3819,6 +4001,11 @@
     function ensureMediaMetadata() {
         var sessionId = state.playbackSessionId;
         refreshMediaMetadataFromDom();
+        var identifiers = playbackIdentifiers();
+        if (isEpisodePlayback(identifiers) && !state.episodeConfirmed && state.metadataFailedKey) {
+            state.metadataFailedKey = '';
+            scheduleDiscoverMetadata();
+        }
         return (state.metadataPromise || Promise.resolve()).then(function () {
             if (!isPlaybackSessionCurrent(sessionId)) throw new Error('Playback changed while reading metadata.');
             mergeMediaMetadata(mediaMetadataFromDom(), 1);

@@ -62,6 +62,13 @@ for (const [service, source] of Object.entries(sources)) {
       '// @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js'
     ]);
   });
+
+  test(`${service}: output filename and download progress remain visible in the menu`, () => {
+    requireText(source, 'Output file:', 'output filename menu row');
+    requireText(source, 'Progress:', 'download progress menu row');
+    assert(/createElement\(['"]progress['"]\)|<progress\b/.test(source), 'native progress element missing');
+    assert(/progressCompleted|downloadUiState/.test(source), 'progress state missing');
+  });
 }
 
 for (const service of ['apple', 'disney', 'coupang']) {
@@ -304,6 +311,8 @@ test('netflix: menu lifecycle does not depend on metadata readiness', () => {
   const end = source.indexOf('\nconst getVideoId =', start);
   assert(start >= 0 && end > start, 'processMetadata block missing');
   assert(!source.slice(start, end).includes("menu.style.display = 'none'"), 'metadata processing must not hide the menu');
+  requireText(source, 'DOM_MOVIE_STABILITY_MS = 1500', 'movie metadata stability window');
+  requireText(source, "Couldn't find the episode number", 'incomplete show metadata guard');
 });
 
 test('netflix: active player DOM title fills a missing metadata cache entry', () => {
@@ -363,6 +372,13 @@ test('netflix: show filenames always include season and episode without duplicat
   const titleNode = { textContent: '이 사랑 통역 되나요?' };
   const seasonNode = { textContent: '리미티드 시리즈' };
   const episodeNode = { textContent: '5화: 5화' };
+  const modernHeading = { textContent: '이 사랑 통역 되나요?' };
+  const modernTitleContainer = {
+    textContent: '이 사랑 통역 되나요?5화5화',
+    querySelector(selector) {
+      return selector === 'h1, h2, h3, h4, h5, h6' ? modernHeading : null;
+    }
+  };
   const overlay = {
     querySelector(selector) {
       if(selector === 'h2') return titleNode;
@@ -373,11 +389,14 @@ test('netflix: show filenames always include season and episode without duplicat
   };
   const player = {
     querySelector(selector) {
-      return selector === '[data-uia="evidence-overlay"]' && document.overlayVisible ? overlay : null;
+      if(selector === '[data-uia="evidence-overlay"]' && document.overlayVisible) return overlay;
+      if(selector === '[data-uia="video-title"]' && document.modernVisible) return modernTitleContainer;
+      return null;
     }
   };
   const document = {
     overlayVisible: true,
+    modernVisible: false,
     titleNode,
     seasonNode,
     episodeNode,
@@ -407,10 +426,20 @@ test('netflix: show filenames always include season and episode without duplicat
     'document.overlayVisible = false;',
     'this.persistedDomFilename = getTitleFromCache()[0];',
     'epTitleInFilename = false;',
-    'this.defaultDomFilename = getTitleFromCache()[0];'
+    'this.defaultDomFilename = getTitleFromCache()[0];',
+    'epTitleInFilename = true;',
+    'document.modernVisible = true;',
+    'delete titleCache["81697779"];',
+    'this.modernLimitedFilename = getTitleFromCache()[0];',
+    'modernHeading.textContent = "EBS 다큐프라임 - 주식의 시대";',
+    'modernTitleContainer.textContent = "EBS 다큐프라임 - 주식의 시대1화1부 우리는 왜 투자에 실패하는가";',
+    'delete titleCache["81697779"];',
+    'this.modernDocumentaryFilename = getTitleFromCache()[0];'
   ].join('\n');
   const ctx = evaluateFunctions(block, {
     document,
+    modernHeading,
+    modernTitleContainer,
     window: { location: { pathname: '/watch/81697779' } },
     unsafeWindow: {},
     alert() { throw new Error('DOM metadata fallback should avoid the alert'); }
@@ -423,6 +452,35 @@ test('netflix: show filenames always include season and episode without duplicat
   assert.strictEqual(ctx.syncedMenuIsSeries, true);
   assert.strictEqual(ctx.persistedDomFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
   assert.strictEqual(ctx.defaultDomFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01');
+  assert.strictEqual(ctx.modernLimitedFilename, '이.사랑.통역.되나요.S01E05');
+  assert.strictEqual(ctx.modernDocumentaryFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
+});
+
+test('coupang: async metadata resolves before the operation filename is frozen', () => {
+  const source = sources.coupang;
+  const begin = functionDeclaration(source, 'beginDownloadOperation');
+  const build = functionDeclaration(source, 'buildSubtitleFile');
+  assert(!begin.includes('safeBaseFilename()'), 'click-time filename capture reintroduces the metadata race');
+  requireText(source, 'function ensureOperationBaseFilename(operation)', 'operation metadata barrier');
+  requireText(build, 'ensureOperationBaseFilename(operation)', 'download metadata barrier usage');
+  requireText(source, "state.outputFilename = operationOutputFilename(operation);", 'resolved output filename update');
+  requireText(functionDeclaration(source, 'ensureMediaMetadata'), "state.metadataFailedKey = '';", 'explicit-download metadata retry');
+});
+
+test('disney: Korean branding is removed and unscoped episode metadata is rejected', () => {
+  const source = sources.disney;
+  const ctx = evaluateFunctions(functionDeclarations(source, [
+    'cleanDisplayTitle', 'normalizedMediaTitleForComparison', 'mediaTitlesMatch'
+  ]));
+  assert.strictEqual(ctx.cleanDisplayTitle('무파사: 라이온 킹 | 디즈니+'), '무파사: 라이온 킹');
+  assert.strictEqual(ctx.mediaTitlesMatch('무파사: 라이온 킹', '무파사 라이온 킹'), true);
+  assert.strictEqual(ctx.mediaTitlesMatch('무파사: 라이온 킹', '다른 시리즈'), false);
+  requireText(source, 'if (hasEpisodeMetadata && !metadata.title)', 'unscoped episode metadata guard');
+  requireText(source, 'upnext|explore|recommend', 'related-content metadata exclusion');
+  requireText(source, '!mediaTitlesMatch(title, state.episodeMetadataTitle)', 'cross-title episode metadata guard');
+  const getTrack = functionDeclaration(source, 'getTrackVtt');
+  requireText(getTrack, 'return runSequential(segments', 'sequential Disney segment download');
+  assert(!getTrack.includes('Promise.all(segments.map'), 'Disney segments must not be parallelized');
 });
 
 test('netflix: document-start initialization tolerates a missing body', () => {
