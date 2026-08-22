@@ -207,10 +207,13 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   const source = sources.apple;
   const playback = {
     label: 'F1 더 무비',
+    titleNode: null,
     innerText: 'F1 더 무비 정보 계속 보기',
     textContent: 'F1 더 무비 정보 계속 보기',
     getAttribute(name) { return name === 'aria-label' ? this.label : ''; },
-    querySelector() { return null; },
+    querySelector(selector) {
+      return selector === '[data-testid="player-metadata-title"]' ? this.titleNode : null;
+    },
     querySelectorAll() { return []; }
   };
   const document = {
@@ -238,16 +241,18 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   assert.strictEqual(ctx.state.mediaTitle, 'F1 더 무비');
   assert.strictEqual(ctx.state.mediaTitlePriority, 4);
 
-  playback.label = "'테드 래소' - Ted Lasso";
-  playback.innerText = "'테드 래소' - Ted Lasso 정보 계속 보기";
+  playback.label = '파일럿';
+  playback.titleNode = { textContent: "'테드 래소' - Ted Lasso" };
+  playback.innerText = "시즌 1, 에피소드 1 · 파일럿\n'테드 래소' - Ted Lasso\n정보\n계속 보기";
   playback.textContent = playback.innerText;
-  ctx.state.mediaTitle = 'Ted Lasso';
+  ctx.state.mediaTitle = '파일럿';
   ctx.state.mediaTitlePriority = 3;
-  ctx.state.seasonNumber = 1;
-  ctx.state.episodeNumber = 1;
-  ctx.state.episodeTag = 'S01E01';
+  ctx.state.seasonNumber = null;
+  ctx.state.episodeNumber = null;
+  ctx.state.episodeTag = '';
   assert.strictEqual(ctx.safeBaseFilename(), "'테드 래소' - Ted Lasso.S01E01");
-  assert.strictEqual(ctx.state.episodeTag, 'S01E01', 'matching playback title should retain cached episode metadata');
+  assert.strictEqual(ctx.state.mediaTitle, "'테드 래소' - Ted Lasso", 'player metadata title must outrank the episode aria-label');
+  assert.strictEqual(ctx.state.episodeTag, 'S01E01', 'localized player metadata should supply season and episode numbers');
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {
@@ -342,6 +347,52 @@ test('netflix: active player DOM title fills a missing metadata cache entry', ()
   vm.runInContext(sources.netflix, context);
   const title = vm.runInContext('getTitleEntry()', context);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(title)), { type: 'movie', title: '설국열차' });
+});
+
+test('netflix: show filenames always include season and episode without duplicate labels', () => {
+  const titleNode = { textContent: '이 사랑 통역 되나요?' };
+  const seasonNode = { textContent: '리미티드 시리즈' };
+  const episodeNode = { textContent: '5화: 5화' };
+  const overlay = {
+    querySelector(selector) {
+      if(selector === 'h2') return titleNode;
+      if(selector === '[data-uia="evidence-overlay-season-title"]') return seasonNode;
+      if(selector === '[data-uia="evidence-overlay-episode-title"]') return episodeNode;
+      return null;
+    }
+  };
+  const player = {
+    querySelector(selector) {
+      return selector === '[data-uia="evidence-overlay"]' ? overlay : null;
+    }
+  };
+  const document = {
+    querySelector(selector) {
+      return selector === '[data-uia="watch-video"]' ? player : null;
+    }
+  };
+  const start = sources.netflix.indexOf('const getVideoId =');
+  const end = sources.netflix.indexOf('\nconst isUsableFormatCandidate =', start);
+  assert(start >= 0 && end > start, 'Netflix title helpers missing');
+  const block = [
+    'const titleCache = {}; const idOverrides = {}; let epTitleInFilename = true;',
+    sources.netflix.slice(start, end),
+    'titleCache["81697779"] = {type: "show", title: "이 사랑 통역 되나요?", season: 1, episode: 5, subtitle: "5화: 5화", hiddenNumber: true};',
+    'this.limitedSeriesFilename = getTitleFromCache()[0];',
+    'titleCache["81697779"] = {type: "show", title: "EBS 다큐프라임 - 주식의 시대", season: 1, episode: 1, subtitle: "1화: 1부. 우리는 왜 투자에 실패하는가", hiddenNumber: true};',
+    'this.documentaryFilename = getTitleFromCache()[0];',
+    'delete titleCache["81697779"];',
+    'this.domFallbackFilename = getTitleFromCache()[0];'
+  ].join('\n');
+  const ctx = evaluateFunctions(block, {
+    document,
+    window: { location: { pathname: '/watch/81697779' } },
+    unsafeWindow: {},
+    alert() { throw new Error('DOM metadata fallback should avoid the alert'); }
+  });
+  assert.strictEqual(ctx.limitedSeriesFilename, '이.사랑.통역.되나요.S01E05');
+  assert.strictEqual(ctx.documentaryFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
+  assert.strictEqual(ctx.domFallbackFilename, '이.사랑.통역.되나요.S01E05');
 });
 
 test('netflix: document-start initialization tolerates a missing body', () => {
