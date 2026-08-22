@@ -1,64 +1,96 @@
 # Streaming Subtitle Downloaders
 
-A collection of Tampermonkey userscripts for downloading subtitles from supported streaming services.
+Tampermonkey userscripts for downloading subtitles from Apple TV+, Coupang Play, Disney+, and Netflix.
 
-The repository currently includes subtitle downloaders for Apple TV+, Coupang Play, Disney+, and Netflix.
+Each downloader runs in the streaming service's web player, detects subtitle resources for the active playback session, and saves subtitles through the browser. No separate desktop application or local server is required.
 
 ## Supported services
 
-| Service      | Script                                               | Install |
-| ------------ | ---------------------------------------------------- | ------- |
-| Apple TV+    | `apple-tv-plus-subtitles-downloader.user.js`         | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/apple-tv-plus-subtitles-downloader.user.js) |
-| Coupang Play | `coupang-play-subtitles-downloader.user.js`          | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/coupang-play-subtitles-downloader.user.js) |
-| Disney+      | `disney-plus-subtitles-downloader.user.js`           | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/disney-plus-subtitles-downloader.user.js) |
-| Netflix      | `netflix-subtitles-downloader.user.js`               | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/netflix-subtitles-downloader.user.js) |
+| Service | Userscript | Install |
+| --- | --- | --- |
+| Apple TV+ | [`apple-tv-plus-subtitles-downloader.user.js`](scripts/apple-tv-plus-subtitles-downloader.user.js) | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/apple-tv-plus-subtitles-downloader.user.js) |
+| Coupang Play | [`coupang-play-subtitles-downloader.user.js`](scripts/coupang-play-subtitles-downloader.user.js) | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/coupang-play-subtitles-downloader.user.js) |
+| Disney+ | [`disney-plus-subtitles-downloader.user.js`](scripts/disney-plus-subtitles-downloader.user.js) | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/disney-plus-subtitles-downloader.user.js) |
+| Netflix | [`netflix-subtitles-downloader.user.js`](scripts/netflix-subtitles-downloader.user.js) | [Install](https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/netflix-subtitles-downloader.user.js) |
 
 ## Features
 
-* Downloads subtitle tracks directly from supported streaming services
-* Detects subtitle tracks associated with the current playback session
-* Supports multiple subtitle languages when available
-* Uses streaming metadata and network resources to identify subtitle tracks
-* Runs directly in the browser through a userscript manager
-* Does not require a separate desktop application or server
+### Apple TV+, Coupang Play, and Disney+
 
-Implementation details vary by streaming service because each platform exposes playback and subtitle information differently.
+- Detect subtitle tracks associated with the current playback session.
+- Select an individual track or download preferred English, Korean, English + Korean, or all detected tracks.
+- Include associated forced tracks when the selected language provides them.
+- Convert supported segmented subtitle formats to WebVTT and refuse to save incomplete downloads.
+- Provide track count, output format, download status, and a manual playback-resource rescan.
+- Build filenames from the active movie or show and add `SxxExx` when season and episode metadata is confirmed.
+
+Coupang Play additionally supports its DASH/TTML subtitle path. Apple TV+, Coupang Play, and Disney+ share the generated HLS segment and byte-range parser maintained in [`shared/hls-segment-parser.template.js`](shared/hls-segment-parser.template.js).
+
+### Netflix
+
+- Download subtitles for the current movie or episode.
+- For shows, batch-download from the current episode, the current season, or all available seasons.
+- Configure languages, preferred locale, subtitle format, batch delay, and whether episode titles are included in filenames.
+- Prefer WebVTT or XML-based Netflix subtitle variants, with fallback between available formats and mirrors.
+- Read live player metadata when API metadata is unavailable or stale.
+- Generate movie/show filenames and normalized TV episode names such as `Show.Title.S01E05` without duplicate episode labels.
 
 ## Requirements
 
-* A browser compatible with Tampermonkey or another compatible userscript manager
-* An active account for the corresponding streaming service
-* Access to the content whose subtitles you want to download
+- A browser with Tampermonkey or another compatible userscript manager.
+- An active account for the corresponding streaming service.
+- Permission to play the content whose subtitles you want to download.
+- Userscript permission to access the media hosts declared by each script's `@connect` metadata.
+
+Apple TV+, Coupang Play, and Disney+ fetch subtitle manifests and segments from media CDN domains. If Tampermonkey asks whether the script may connect to those domains, allow the request for the downloader to work. Disney+ playback commonly uses `*.dssott.com` and `*.dssedge.com`.
 
 ## Installation
 
 1. Install Tampermonkey or another compatible userscript manager.
-2. Select the desired script from the **Supported services** table.
-3. Open its **Install** link.
-4. Confirm installation in the userscript manager.
-5. Open the corresponding streaming service.
+2. Choose a service from the **Supported services** table and open its **Install** link.
+3. Confirm the userscript installation.
+4. Open or reload the corresponding streaming service.
 
-Automatic userscript updates are configured through each script's `@updateURL` and `@downloadURL`, which point to the corresponding raw file on the `main` branch.
-
-Userscript managers use the `@version` value to determine whether a newer script revision is available, so the version must be increased whenever a script is updated.
+To update an installed script, use the userscript manager's update command or reopen its **Install** link. Reload any already-open playback tab after updating.
 
 ## Usage
 
-Open the supported streaming service and start playback of the desired content.
+1. Start the movie or episode and wait for the web player to load.
+2. Move the pointer to the top-center of the player to reveal the downloader menu.
+3. Choose the desired track or download action.
+4. Check the browser's configured download directory for the generated VTT or ZIP file.
 
-The userscript detects available subtitle resources during playback and provides the subtitle downloading functionality implemented for that service.
+For Apple TV+, Coupang Play, and Disney+, use **Rescan playback resources** if the player was already open before the script loaded or no tracks have appeared yet. On Netflix, keep the playback overlay loaded long enough for the current title, season, and episode metadata to appear before downloading.
 
-Because streaming services frequently change their web applications, playback APIs, manifests, and metadata formats, a script may require updates when the corresponding service changes its implementation.
+Single-track downloads are normally saved as `.vtt`. A ZIP is used when an action produces multiple subtitle files, includes a matching forced track, or downloads a Netflix language set or episode batch.
+
+## Filename conventions
+
+- Movies use the detected playback title.
+- TV episodes use the show title followed by a normalized season/episode tag such as `.S01E05`.
+- A track suffix identifies the language and flags such as CC, SDH, or forced subtitles.
+- Netflix can optionally append the episode title and uses a series-level archive name for multi-episode batches.
+
+Filename characters that are unsafe on common desktop filesystems are sanitized before saving. The exact title and language labels depend on metadata supplied by the streaming service.
 
 ## Project structure
 
 ```text
 streaming-subtitle-downloaders/
+├── .github/
+│   └── workflows/
+│       └── regression.yml
 ├── scripts/
 │   ├── apple-tv-plus-subtitles-downloader.user.js
 │   ├── coupang-play-subtitles-downloader.user.js
 │   ├── disney-plus-subtitles-downloader.user.js
 │   └── netflix-subtitles-downloader.user.js
+├── shared/
+│   └── hls-segment-parser.template.js
+├── tests/
+│   └── regression.js
+├── tools/
+│   └── sync-hls-segment-parser.js
 ├── .gitattributes
 ├── .gitignore
 └── README.md
@@ -66,39 +98,45 @@ streaming-subtitle-downloaders/
 
 ## Runtime dependencies
 
-Some scripts load third-party libraries at runtime through userscript `@require` directives.
+The userscripts load their browser-side ZIP and file-saving dependencies through `@require` directives.
 
-The currently used libraries include:
+| Scripts | JSZip | FileSaver |
+| --- | --- | --- |
+| Apple TV+, Coupang Play, Disney+ | 3.5.0 | 2.0.2 |
+| Netflix | 3.7.1 | `file-saver-es` 2.0.5 |
 
-* JSZip
-* FileSaver / FileSaver.js
+No package installation is required to run the repository's current Node.js development tools and regression suite.
 
-Dependency versions may differ between scripts.
+## Development and validation
 
-## Development
+Node.js is required for the repository tools and tests. Before submitting a change, run:
 
-Each streaming service has its own implementation because subtitle discovery depends on platform-specific behavior such as:
+```bash
+node tools/sync-hls-segment-parser.js --check
+for file in scripts/*.user.js; do node --check "$file"; done
+node tests/regression.js
+git diff --check
+```
 
-* playback session detection
-* network request monitoring
-* manifest parsing
-* subtitle track discovery
-* content metadata extraction
-* filename generation
-* download and ZIP handling
+The synchronization check compares generated parser blocks byte-for-byte. On Windows, run it from an LF-preserving checkout; a CRLF-converted shared template can otherwise produce a line-1 mismatch even when the parser code is unchanged.
 
-Changes to a streaming provider's web player or backend interfaces can therefore affect one downloader without affecting the others.
+When changing the shared HLS parser, edit [`shared/hls-segment-parser.template.js`](shared/hls-segment-parser.template.js), regenerate the three userscript copies, and verify them:
+
+```bash
+node tools/sync-hls-segment-parser.js --write
+node tools/sync-hls-segment-parser.js --check
+```
+
+The `Regression tests` GitHub Actions workflow performs the shared-parser synchronization check, userscript syntax checks, whitespace validation, and the regression suite for pull requests and pushes to `main`.
+
+When a userscript changes, increment its `@version` so installed copies can receive the update.
 
 ## License and attribution
 
-License and author information for each downloader is defined in the userscript metadata at the beginning of the corresponding script.
-
-Some scripts are based on or derived from existing subtitle downloader projects and include their original attribution where applicable.
-
-Please refer to each script's metadata for the applicable license and attribution information.
+All four userscripts currently declare the MIT license. Author and upstream attribution is recorded in each userscript metadata block; some scripts are based on or derived from earlier subtitle downloader projects.
 
 ## Disclaimer
 
 These scripts are intended for personal use with content that you are authorized to access.
 
-Streaming services may change their websites, APIs, playback systems, or terms of service at any time. Users are responsible for ensuring that their use of these scripts complies with applicable laws and the terms of the corresponding streaming service.
+Streaming services may change their sites, APIs, playback systems, media hosts, or terms of service at any time. Users are responsible for ensuring that their use of these scripts complies with applicable laws and the terms of the corresponding streaming service.
