@@ -73,6 +73,15 @@ for (const [service, source] of Object.entries(sources)) {
 
 for (const service of ['apple', 'disney', 'coupang']) {
   const source = sources[service];
+  test(`${service}: filename preview omits language and extension suffixes`, () => {
+    const preview = functionDeclaration(source, 'previewSelectedFilename');
+    const ctx = evaluateFunctions(preview, { safeBaseFilename: () => 'Show.Title.S01E02' });
+    assert.strictEqual(ctx.previewSelectedFilename('ko'), 'Show.Title.S01E02');
+    assert(!preview.includes('safeTrackName'), 'preview must not include a language suffix');
+    assert(!/\.vtt|\.zip/.test(preview), 'preview must not include an extension');
+    requireText(source, 'state.outputFilename = operation.baseFilename;', 'active-download base filename display');
+  });
+
   test(`${service}: HLS byte-range semantics`, () => {
     const block = functionDeclarations(source, ['parseHlsByteRange', 'isSafeHlsByteInteger', 'resolveHlsByteRange']);
     const ctx = evaluateFunctions(block);
@@ -332,6 +341,17 @@ test('netflix: filename preview cannot create an unbounded DOM observer loop', (
   assert(!observer.includes('syncPlaybackMetadataState(menu);'), 'DOM observer must not synchronously rescan metadata');
 });
 
+test('netflix: filename preview follows playback and omits the archive extension', () => {
+  const source = sources.netflix;
+  const previewStart = source.indexOf('const predictedOutputFilename = () =>');
+  const previewEnd = source.indexOf('\nconst applyDownloadUi =', previewStart);
+  assert(previewStart >= 0 && previewEnd > previewStart, 'Netflix filename preview block missing');
+  const preview = source.slice(previewStart, previewEnd);
+  assert(!preview.includes("+ '.zip'"), 'Netflix preview must not include the ZIP extension');
+  assert(!source.includes('keepResultFilename'), 'completed downloads must not pin a stale preview filename');
+  requireText(source, 'const playbackMetadataChanged = (cached, dom, cachedIsDomDerived) =>', 'playback-change detector');
+});
+
 test('netflix: active player DOM title fills a missing metadata cache entry', () => {
   const listeners = {};
   const parent = {
@@ -425,7 +445,7 @@ test('netflix: show filenames always include season and episode without duplicat
   const end = sources.netflix.indexOf('\nconst isUsableFormatCandidate =', start);
   assert(start >= 0 && end > start, 'Netflix title helpers missing');
   const block = [
-    'const titleCache = {}; const idOverrides = {}; let epTitleInFilename = true; const isWatchPage = () => true;',
+    'const titleCache = {}; const idOverrides = {}; const domDerivedTitleIds = {}; let epTitleInFilename = true; const isWatchPage = () => true;',
     sources.netflix.slice(start, end),
     'titleCache["81697779"] = {type: "show", title: "이 사랑 통역 되나요?", season: 1, episode: 5, subtitle: "5화: 5화", hiddenNumber: true};',
     'this.limitedSeriesFilename = getTitleFromCache()[0];',
@@ -451,7 +471,19 @@ test('netflix: show filenames always include season and episode without duplicat
     'modernHeading.textContent = "EBS 다큐프라임 - 주식의 시대";',
     'modernTitleContainer.textContent = "EBS 다큐프라임 - 주식의 시대1화1부 우리는 왜 투자에 실패하는가";',
     'delete titleCache["81697779"];',
-    'this.modernDocumentaryFilename = getTitleFromCache()[0];'
+    'this.modernDocumentaryFilename = getTitleFromCache()[0];',
+    'document.modernVisible = false;',
+    'document.overlayVisible = true;',
+    'document.titleNode.textContent = "이 사랑 통역 되나요?";',
+    'document.seasonNode.textContent = "리미티드 시리즈";',
+    'document.episodeNode.textContent = "6화: 마지막 화";',
+    'titleCache["81697779"] = {type: "show", title: "이 사랑 통역 되나요?", season: 1, episode: 5, subtitle: "5화: 5화"};',
+    'this.nextEpisodeFilename = getTitleFromCache()[0];',
+    'document.titleNode.textContent = "F1 더 무비";',
+    'document.seasonNode.textContent = "";',
+    'document.episodeNode.textContent = "";',
+    'titleCache["81697779"] = {type: "movie", title: "테드 래소"};',
+    'this.nextMovieFilename = getTitleFromCache()[0];'
   ].join('\n');
   const ctx = evaluateFunctions(block, {
     document,
@@ -471,6 +503,8 @@ test('netflix: show filenames always include season and episode without duplicat
   assert.strictEqual(ctx.defaultDomFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01');
   assert.strictEqual(ctx.modernLimitedFilename, '이.사랑.통역.되나요.S01E05');
   assert.strictEqual(ctx.modernDocumentaryFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
+  assert.strictEqual(ctx.nextEpisodeFilename, '이.사랑.통역.되나요.S01E06.마지막.화');
+  assert.strictEqual(ctx.nextMovieFilename, 'F1.더.무비');
 });
 
 test('coupang: async metadata resolves before the operation filename is frozen', () => {
@@ -480,7 +514,7 @@ test('coupang: async metadata resolves before the operation filename is frozen',
   assert(!begin.includes('safeBaseFilename()'), 'click-time filename capture reintroduces the metadata race');
   requireText(source, 'function ensureOperationBaseFilename(operation)', 'operation metadata barrier');
   requireText(build, 'ensureOperationBaseFilename(operation)', 'download metadata barrier usage');
-  requireText(source, "state.outputFilename = operationOutputFilename(operation);", 'resolved output filename update');
+  requireText(source, 'state.outputFilename = operation.baseFilename;', 'resolved base filename update');
   requireText(functionDeclaration(source, 'ensureMediaMetadata'), "state.metadataFailedKey = '';", 'explicit-download metadata retry');
 });
 
