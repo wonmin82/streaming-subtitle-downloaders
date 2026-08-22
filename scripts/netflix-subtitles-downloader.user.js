@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.5
+// @version    1.0.7
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -490,7 +490,9 @@ const episodeNumberFromLabel = value => {
     /(?:episode|ep\.?|\uC5D0\uD53C\uC18C\uB4DC)\s*(\d{1,4})/i,
     /^\s*E\s*(\d{1,4})(?:\D|$)/i,
     /^\s*(\d{1,4})\s*(?:\uD654|\uD68C)(?:\D|$)/i,
-    /^\s*(\d{1,4})\s*[:.\-\u2013\u2014]/
+    /^\s*(\d{1,4})\s*[:.\-\u2013\u2014]/,
+    /(\d{1,4})\s*(?:\uD654|\uD68C)\s*$/i,
+    /\bE\s*(\d{1,4})\s*$/i
   ];
   for(const pattern of patterns) {
     const match = label.match(pattern);
@@ -515,6 +517,17 @@ const cleanEpisodeSubtitle = (value, episodeNumber) => {
     for(const prefix of prefixes) {
       if(prefix.test(subtitle)) {
         subtitle = subtitle.replace(prefix, '').trim();
+        break;
+      }
+    }
+
+    const suffixes = [
+      new RegExp('\\s*[:.\\-\\u2013\\u2014]?\\s*0*' + number + '\\s*(?:\\uD654|\\uD68C)\\s*$', 'i'),
+      new RegExp('\\s*[:.\\-\\u2013\\u2014]?\\s*(?:episode|ep\\.?|e)\\s*0*' + number + '\\s*$', 'i')
+    ];
+    for(const suffix of suffixes) {
+      if(suffix.test(subtitle)) {
+        subtitle = subtitle.replace(suffix, '').trim();
         break;
       }
     }
@@ -611,17 +624,28 @@ const mergeTitleEntryWithDom = (cached, dom) => {
 const getTitleEntry = silent => {
   const cached = getXFromCache(titleCache, 'title', true);
   const dom = playbackMetadataFromDom();
-  if(cached !== null)
-    return mergeTitleEntryWithDom(cached, dom);
-
-  if(dom) {
-    titleCache[getVideoId()] = dom;
-    return dom;
+  const resolved = cached !== null ? mergeTitleEntryWithDom(cached, dom) : dom;
+  if(resolved) {
+    titleCache[getVideoId()] = resolved;
+    return resolved;
   }
 
   if(silent === true)
     return null;
   return getXFromCache(titleCache, 'title');
+};
+
+const syncPlaybackMetadataState = menu => {
+  const title = getTitleEntry(true);
+  if(!title)
+    return null;
+  if(menu && menu.classList) {
+    if(title.type === 'show')
+      menu.classList.add('series');
+    else
+      menu.classList.remove('series');
+  }
+  return title;
 };
 
 const pad = (number, letter) => `${letter}${number.toString().padStart(2, '0')}`;
@@ -753,12 +777,12 @@ const _download = async _zip => {
     stop = true;
   progress.destroy();
 
-  return [seriesTitle, stop];
+  return [title, seriesTitle, stop];
 };
 
 const downloadThis = async () => {
   const _zip = new JSZip();
-  const [title, stop] = await _download(_zip);
+  const [title] = await _download(_zip);
   _save(_zip, title);
 };
 
@@ -809,7 +833,7 @@ const downloadBatch = async auto => {
     zip = new JSZip();
 
   try {
-    [title, stop] = await _download(zip);
+    [, title, stop] = await _download(zip);
   }
   catch(error) {
     title = 'unknown';
@@ -1020,7 +1044,8 @@ const s = document.createElement('style');
 s.innerHTML = SCRIPT_CSS;
 
 const observer = new MutationObserver(function(mutations) {
-  ensureMenu();
+  const menu = ensureMenu();
+  syncPlaybackMetadataState(menu);
   mutations.forEach(function(mutation) {
     mutation.addedNodes.forEach(function(node) {
       // add scrollbar - Netflix doesn't expect you to have this manu languages to choose from...
@@ -1039,7 +1064,8 @@ const initializeDom = () => {
   const parent = document.head || document.documentElement;
   if(parent && !s.isConnected)
     parent.appendChild(s);
-  ensureMenu();
+  const menu = ensureMenu();
+  syncPlaybackMetadataState(menu);
   if(!observerStarted) {
     observer.observe(document.body, { childList: true, subtree: true });
     observerStarted = true;
