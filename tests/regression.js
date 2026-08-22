@@ -317,38 +317,64 @@ test('disney: active player metadata is scoped and Korean episode labels are par
   assert.strictEqual(ctx.seasonEpisodeTag('시즌 3: 2회, 챕터 18: 만달로어 광산'), 'S03E02');
 });
 
-test('disney: playerExperience metadata supplies the active episode', () => {
+test('disney: current episode metadata comes from the title overlay Shadow DOM', () => {
   const source = sources.disney;
+  const observed = [];
+  const titleRoot = { innerText: '만달로리안\n시즌 3: 2회 챕터 18: 만달로어 광산' };
+  const titleBug = { shadowRoot: titleRoot };
+  const controlsRoot = {
+    querySelector(selector) {
+      assert.strictEqual(selector, 'title-bug');
+      return titleBug;
+    }
+  };
+  const document = {
+    querySelector(selector) {
+      assert.strictEqual(selector, 'main-app-controls-overlay');
+      return { shadowRoot: controlsRoot };
+    }
+  };
+  function FakeMutationObserver(callback) {
+    this.callback = callback;
+    this.disconnect = () => {};
+    this.observe = (target, options) => observed.push({ target, options });
+  }
   const block = functionDeclarations(source, [
-    'inspectMetadataResponse', 'isPlayerExperienceMetadataUrl', 'shouldInspectMetadataUrl',
-    'extractMetadataFromText', 'collectMetadataFromJson', 'seasonEpisodeTag',
-    'formatSeasonEpisode', 'padNumber'
+    'disconnectShadowObserver', 'shadowMutationObserver', 'scheduleShadowMetadataRefresh',
+    'firstShadowPlaybackTitle', 'shadowPlaybackMetadata', 'connectShadowTitleObserver',
+    'observeShadowPlaybackMetadata', 'seasonEpisodeTag', 'formatSeasonEpisode', 'padNumber'
   ]);
-  let captured = null;
   const ctx = evaluateFunctions(block, {
-    state: { playbackSessionId: 'current' },
-    isPlaybackSessionCurrent(sessionId) { return sessionId === 'current'; },
-    normalizeUrl(url) { return String(url || ''); },
+    state: {
+      playbackSessionId: 'current', shadowControlsRoot: null, shadowControlsObserver: null,
+      shadowTitleRoot: null, shadowTitleObserver: null, shadowMetadataUiTimer: null
+    },
+    targetWindow: { MutationObserver: FakeMutationObserver },
+    window: {},
+    document,
     activePlaybackContainer() { return {}; },
     activePlaybackTitle() { return '만달로리안'; },
     displayTitle() { return 'DisneyPlus'; },
     playbackInfoText() { return ''; },
-    updateMediaMetadata(metadata) { captured = metadata; },
-    shortUrl(url) { return url; },
-    debuglog() {}
+    cleanDisplayTitle(value) { return String(value || '').trim() || 'DisneyPlus'; }
   });
-  const playerUrl = 'https://disney.api.edge.bamgrid.com/explore/v1.6/playerExperience/current-id';
-  assert.strictEqual(ctx.shouldInspectMetadataUrl(playerUrl), true, 'playerExperience must bypass the generic explore exclusion');
-  assert.strictEqual(ctx.shouldInspectMetadataUrl('https://disney.api.edge.bamgrid.com/explore/v1.18/upNext?contentId=current-id'), false);
-  ctx.inspectMetadataResponse(playerUrl, JSON.stringify({
-    seasonSequenceNumber: 3,
-    episodeSequenceNumber: 2
-  }), 'current');
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(captured)), {
-    seasonNumber: 3,
-    episodeNumber: 2,
-    title: '만달로리안'
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.observeShadowPlaybackMetadata())), {
+    title: '만달로리안',
+    episodeTag: 'S03E02'
   });
+  assert.strictEqual(observed.length, 2, 'controls and title ShadowRoots must both be observed');
+  assert.strictEqual(observed[0].target, controlsRoot);
+  assert.strictEqual(observed[1].target, titleRoot);
+  assert.strictEqual(observed[1].options.characterData, true, 'title text mutations must be observed');
+
+  const observer = functionDeclaration(source, 'observeShadowPlaybackMetadata');
+  requireText(observer, "document.querySelector('main-app-controls-overlay')", 'current controls overlay');
+  const connector = functionDeclaration(source, 'connectShadowTitleObserver');
+  requireText(connector, "querySelector('title-bug')", 'current title overlay');
+  assert(!observer.includes('pivot-tray'), 'next-episode tray must not supply current metadata');
+  assert(!connector.includes('pivot-tray'), 'next-episode tray must not be observed');
+  requireText(functionDeclaration(source, 'resetShadowMetadataObservers'), 'state.shadowTitleRoot = null;', 'playback-change metadata reset');
+  requireText(functionDeclaration(source, 'refreshMediaMetadataFromDom'), 'observeShadowPlaybackMetadata()', 'Shadow DOM metadata refresh');
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {
