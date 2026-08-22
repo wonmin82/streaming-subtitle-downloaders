@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.15
+// @version    1.0.16
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -931,9 +931,7 @@
     }
 
     function previewSelectedFilename(trackKey) {
-        var track = findTrackByKey(trackKey);
-        if (!track) return 'Waiting for a subtitle track...';
-        return trackDownloadFilename(track, tracksWithForcedCompanion(track), safeBaseFilename());
+        return safeBaseFilename();
     }
 
     function trackDownloadFilename(track, tracks, baseFilename) {
@@ -1943,7 +1941,7 @@
         };
         if (!operation.outputFilename) operation.outputFilename = operation.baseFilename + '.subtitles.zip';
         state.activeDownloadOperationId = operation.id;
-        state.outputFilename = operation.outputFilename;
+        state.outputFilename = operation.baseFilename;
         state.progressCompleted = 0;
         state.progressTotal = 0;
         state.progressLabel = 'Preparing...';

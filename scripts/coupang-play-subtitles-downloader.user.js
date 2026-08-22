@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.24
+// @version    1.0.25
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -938,9 +938,7 @@
     }
 
     function previewSelectedFilename(trackKey) {
-        var track = findTrackByKey(trackKey);
-        if (!track) return 'Waiting for a subtitle track...';
-        return safeBaseFilename() + '.' + safeTrackName(track) + '.vtt';
+        return safeBaseFilename();
     }
 
     function operationOutputFilename(operation) {
@@ -2189,7 +2187,7 @@
         operation.metadataPromise = ensureMediaMetadata().then(function () {
             assertDownloadOperationCurrent(operation);
             operation.baseFilename = safeBaseFilename();
-            state.outputFilename = operationOutputFilename(operation);
+            state.outputFilename = operation.baseFilename;
             state.progressLabel = 'Preparing download...';
             updateUi();
             return operation.baseFilename;

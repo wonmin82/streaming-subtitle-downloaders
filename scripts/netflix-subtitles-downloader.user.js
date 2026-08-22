@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.10
+// @version    1.0.11
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -147,6 +147,7 @@ const SUB_TYPES = {
 let idOverrides = {};
 let subCache = {};
 let titleCache = {};
+let domDerivedTitleIds = {};
 let subCacheWaitGeneration = 0;
 let batchDownloadInProgress = false;
 let downloadUiState = {
@@ -442,6 +443,7 @@ const processMetadata = data => {
           subtitle: episode.title,
           hiddenNumber: episode.hiddenEpisodeNumbers
         };
+        delete domDerivedTitleIds[episode.id];
       }
     }
 
@@ -459,6 +461,7 @@ const processMetadata = data => {
   }
   else if(type === 'movie' || type === 'supplemental') {
     titleCache[result.id] = {type, title};
+    delete domDerivedTitleIds[result.id];
   }
   else {
     console.debug('[Netflix Subtitle Downloader] unknown video type:', type, result)
@@ -675,11 +678,45 @@ const playbackTitleFromDom = () => {
   return metadata ? metadata.title : '';
 };
 
+const normalizedPlaybackTitle = value => normalizeDomTitle(value).toLowerCase();
+const playbackMetadataChanged = (cached, dom, cachedIsDomDerived) => {
+  if(!cached || !dom)
+    return false;
+  const cachedTitle = normalizedPlaybackTitle(cached.title);
+  const domTitle = normalizedPlaybackTitle(dom.title);
+  if(cachedTitle && domTitle && cachedTitle !== domTitle)
+    return cachedIsDomDerived === true;
+  if(cached.type !== 'show' || dom.type !== 'show')
+    return false;
+  const cachedSeason = positiveInteger(cached.season);
+  const domSeason = positiveInteger(dom.season);
+  const cachedEpisode = positiveInteger(cached.episode);
+  const domEpisode = positiveInteger(dom.episode);
+  return (cachedSeason !== null && domSeason !== null && cachedSeason !== domSeason) ||
+    (cachedEpisode !== null && domEpisode !== null && cachedEpisode !== domEpisode);
+};
+
+const currentDomMetadata = (cached, dom) => {
+  if(dom.type !== 'show')
+    return dom;
+  const sameTitle = normalizedPlaybackTitle(cached.title) === normalizedPlaybackTitle(dom.title);
+  return {
+    ...cached,
+    ...dom,
+    title: dom.title || cached.title,
+    season: positiveInteger(dom.season) || (sameTitle ? positiveInteger(cached.season) : null) || 1,
+    episode: positiveInteger(dom.episode),
+    subtitle: dom.subtitle || ''
+  };
+};
+
 const mergeTitleEntryWithDom = (cached, dom) => {
   if(!cached)
     return dom;
   if(!dom)
     return cached;
+  if(playbackMetadataChanged(cached, dom))
+    return currentDomMetadata(cached, dom);
   if(cached.type !== 'show' && dom.type === 'show')
     return {...cached, ...dom};
   if(cached.type !== 'show')
@@ -694,11 +731,17 @@ const mergeTitleEntryWithDom = (cached, dom) => {
 };
 
 const getTitleEntry = silent => {
+  const videoId = getVideoId();
   const cached = getXFromCache(titleCache, 'title', true);
   const dom = playbackMetadataFromDom();
-  const resolved = cached !== null ? mergeTitleEntryWithDom(cached, dom) : dom;
+  const changed = cached !== null && dom !== null &&
+    playbackMetadataChanged(cached, dom, domDerivedTitleIds[videoId] === true);
+  const resolved = changed ? currentDomMetadata(cached, dom) :
+    (cached !== null ? mergeTitleEntryWithDom(cached, dom) : dom);
   if(resolved) {
-    titleCache[getVideoId()] = resolved;
+    titleCache[videoId] = resolved;
+    if(cached === null || changed)
+      domDerivedTitleIds[videoId] = true;
     return resolved;
   }
 
@@ -795,7 +838,7 @@ const predictedOutputFilename = () => {
   if(!title)
     return 'Waiting for title metadata...';
   try {
-    return getTitleFromCache(title)[0] + '.zip';
+    return getTitleFromCache(title)[0];
   }
   catch(ignore) {
     return 'Waiting for title metadata...';
@@ -812,8 +855,7 @@ const applyDownloadUi = menu => {
   const progress = menu.querySelector('.download-progress progress');
   const completed = Math.max(0, Number(downloadUiState.completed) || 0);
   const total = Math.max(0, Number(downloadUiState.total) || 0);
-  const keepResultFilename = downloadUiState.label === 'Complete' || downloadUiState.label === 'Failed';
-  const filenameText = (downloadUiState.active || keepResultFilename) && downloadUiState.filename
+  const filenameText = downloadUiState.active && downloadUiState.filename
     ? downloadUiState.filename
     : predictedOutputFilename();
   const progressLabel = total > 0
@@ -868,16 +910,16 @@ const pickFormat = formats => {
 
 const _save = async (_zip, title) => {
   const filename = title + '.zip';
-  setMenuDownloadProgress(0, 100, 'Creating ZIP...', true, filename);
+  setMenuDownloadProgress(0, 100, 'Creating ZIP...', true, title);
   try {
     const content = await _zip.generateAsync({type:'blob'}, metadata => {
-      setMenuDownloadProgress(Math.round(metadata.percent || 0), 100, 'Creating ZIP...', true, filename);
+      setMenuDownloadProgress(Math.round(metadata.percent || 0), 100, 'Creating ZIP...', true, title);
     });
     saveAs(content, filename);
-    setMenuDownloadProgress(100, 100, 'Complete', false, filename);
+    setMenuDownloadProgress(100, 100, 'Complete', false, title);
   }
   catch(error) {
-    setMenuDownloadProgress(0, 0, 'Failed', false, filename);
+    setMenuDownloadProgress(0, 0, 'Failed', false, title);
     throw error;
   }
 };
@@ -901,7 +943,7 @@ const _download = async _zip => {
     }
   }
 
-  setMenuDownloadProgress(0, filteredLangs.length, 'Downloading subtitle tracks...', true, title + '.zip');
+  setMenuDownloadProgress(0, filteredLangs.length, 'Downloading subtitle tracks...', true, title);
   const progress = new ProgressBar(filteredLangs.length);
   let stop = false;
   for(const lang of filteredLangs) {
@@ -964,7 +1006,7 @@ const _download = async _zip => {
   if(await Promise.race([progress.stop, {}]) === STOP_THE_DOWNLOAD)
     stop = true;
   progress.destroy();
-  setMenuDownloadProgress(progress.current, progress.max, 'Preparing ZIP...', true, title + '.zip');
+  setMenuDownloadProgress(progress.current, progress.max, 'Preparing ZIP...', true, title);
 
   return [title, seriesTitle, stop];
 };
