@@ -305,6 +305,8 @@ for (const service of ['apple', 'disney']) {
 test('disney: active player metadata is scoped and Korean episode labels are parsed', () => {
   const source = sources.disney;
   requireText(source, "var playbackKey = playbackPage ? location.href.split('#')[0] : '';", 'full playback URL session key');
+  requireText(source, '[data-testid="disney-web-player-wrapper"]', 'current Disney player wrapper');
+  requireText(source, "'video[aria-label]'", 'player video title fallback');
   const refresh = functionDeclaration(source, 'refreshMediaMetadataFromDom');
   requireText(refresh, 'activePlaybackContainer()', 'active playback container');
   requireText(refresh, 'activePlaybackInfoText(container)', 'scoped playback text');
@@ -313,6 +315,40 @@ test('disney: active player metadata is scoped and Korean episode labels are par
   const parser = functionDeclarations(source, ['seasonEpisodeTag', 'formatSeasonEpisode', 'padNumber']);
   const ctx = evaluateFunctions(parser, { playbackInfoText() { return ''; } });
   assert.strictEqual(ctx.seasonEpisodeTag('시즌 3: 2회, 챕터 18: 만달로어 광산'), 'S03E02');
+});
+
+test('disney: playerExperience metadata supplies the active episode', () => {
+  const source = sources.disney;
+  const block = functionDeclarations(source, [
+    'inspectMetadataResponse', 'isPlayerExperienceMetadataUrl', 'shouldInspectMetadataUrl',
+    'extractMetadataFromText', 'collectMetadataFromJson', 'seasonEpisodeTag',
+    'formatSeasonEpisode', 'padNumber'
+  ]);
+  let captured = null;
+  const ctx = evaluateFunctions(block, {
+    state: { playbackSessionId: 'current' },
+    isPlaybackSessionCurrent(sessionId) { return sessionId === 'current'; },
+    normalizeUrl(url) { return String(url || ''); },
+    activePlaybackContainer() { return {}; },
+    activePlaybackTitle() { return '만달로리안'; },
+    displayTitle() { return 'DisneyPlus'; },
+    playbackInfoText() { return ''; },
+    updateMediaMetadata(metadata) { captured = metadata; },
+    shortUrl(url) { return url; },
+    debuglog() {}
+  });
+  const playerUrl = 'https://disney.api.edge.bamgrid.com/explore/v1.6/playerExperience/current-id';
+  assert.strictEqual(ctx.shouldInspectMetadataUrl(playerUrl), true, 'playerExperience must bypass the generic explore exclusion');
+  assert.strictEqual(ctx.shouldInspectMetadataUrl('https://disney.api.edge.bamgrid.com/explore/v1.18/upNext?contentId=current-id'), false);
+  ctx.inspectMetadataResponse(playerUrl, JSON.stringify({
+    seasonSequenceNumber: 3,
+    episodeSequenceNumber: 2
+  }), 'current');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(captured)), {
+    seasonNumber: 3,
+    episodeNumber: 2,
+    title: '만달로리안'
+  });
 });
 
 test('netflix: modern subtitle format fallbacks remain available', () => {
