@@ -281,6 +281,9 @@ test('netflix: download fallback skips unusable candidates and failed mirrors', 
   requireText(source, 'subtitle fetch failed, trying another URL', 'network mirror fallback');
   requireText(source, 'subtitle fetch timed out, trying another URL', 'timeout mirror fallback');
   requireText(source, 'subtitle response could not be read, trying another URL', 'body-read mirror fallback');
+  requireText(source, 'return [title, seriesTitle, stop];', 'episode and batch archive titles');
+  requireText(source, 'const [title] = await _download(_zip);', 'single-episode archive title');
+  requireText(source, '[, title, stop] = await _download(zip);', 'batch archive series title');
 });
 
 test('netflix: menu lifecycle does not depend on metadata readiness', () => {
@@ -363,10 +366,14 @@ test('netflix: show filenames always include season and episode without duplicat
   };
   const player = {
     querySelector(selector) {
-      return selector === '[data-uia="evidence-overlay"]' ? overlay : null;
+      return selector === '[data-uia="evidence-overlay"]' && document.overlayVisible ? overlay : null;
     }
   };
   const document = {
+    overlayVisible: true,
+    titleNode,
+    seasonNode,
+    episodeNode,
     querySelector(selector) {
       return selector === '[data-uia="watch-video"]' ? player : null;
     }
@@ -382,7 +389,18 @@ test('netflix: show filenames always include season and episode without duplicat
     'titleCache["81697779"] = {type: "show", title: "EBS 다큐프라임 - 주식의 시대", season: 1, episode: 1, subtitle: "1화: 1부. 우리는 왜 투자에 실패하는가", hiddenNumber: true};',
     'this.documentaryFilename = getTitleFromCache()[0];',
     'delete titleCache["81697779"];',
-    'this.domFallbackFilename = getTitleFromCache()[0];'
+    'this.domFallbackFilename = getTitleFromCache()[0];',
+    'document.titleNode.textContent = "EBS 다큐프라임 - 주식의 시대";',
+    'document.seasonNode.textContent = "EBS 다큐프라임 - 주식의 시대";',
+    'document.episodeNode.textContent = "1부 우리는 왜 투자에 실패하는가: 1화";',
+    'delete titleCache["81697779"];',
+    'const menu = {classList: {series: false, add(value) { if(value === "series") this.series = true; }, remove(value) { if(value === "series") this.series = false; }}};',
+    'this.syncedDomTitle = syncPlaybackMetadataState(menu);',
+    'this.syncedMenuIsSeries = menu.classList.series;',
+    'document.overlayVisible = false;',
+    'this.persistedDomFilename = getTitleFromCache()[0];',
+    'epTitleInFilename = false;',
+    'this.defaultDomFilename = getTitleFromCache()[0];'
   ].join('\n');
   const ctx = evaluateFunctions(block, {
     document,
@@ -393,6 +411,11 @@ test('netflix: show filenames always include season and episode without duplicat
   assert.strictEqual(ctx.limitedSeriesFilename, '이.사랑.통역.되나요.S01E05');
   assert.strictEqual(ctx.documentaryFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
   assert.strictEqual(ctx.domFallbackFilename, '이.사랑.통역.되나요.S01E05');
+  assert.strictEqual(ctx.syncedDomTitle.episode, 1);
+  assert.strictEqual(ctx.syncedDomTitle.subtitle, '1부 우리는 왜 투자에 실패하는가');
+  assert.strictEqual(ctx.syncedMenuIsSeries, true);
+  assert.strictEqual(ctx.persistedDomFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
+  assert.strictEqual(ctx.defaultDomFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01');
 });
 
 test('netflix: document-start initialization tolerates a missing body', () => {
