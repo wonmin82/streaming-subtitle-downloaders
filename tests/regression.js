@@ -145,6 +145,15 @@ test('coupang: DASH Number/Time template token semantics', () => {
   assert.strictEqual(ctx.dashFormatTemplate('sub-$Unknown$.vtt', 'r', '100', 3, 0), '');
 });
 
+test('coupang: playback session timing helper remains callable', () => {
+  const block = functionDeclaration(sources.coupang, 'performanceNow');
+  const ctx = evaluateFunctions(block, {
+    targetWindow: { performance: { now: () => 123.5 } },
+    window: {}
+  });
+  assert.strictEqual(ctx.performanceNow(), 123.5);
+});
+
 test('coupang: TTML fidelity features stay wired together', () => {
   const source = sources.coupang;
   for (const fn of [
@@ -175,6 +184,22 @@ for (const service of ['apple', 'coupang']) {
   });
 }
 
+test('apple: network title is not downgraded by generic DOM metadata', () => {
+  const source = sources.apple;
+  const block = [
+    'var state = { mediaTitle: "", mediaTitlePriority: 0, seasonNumber: null, episodeNumber: null, episodeTag: "" };',
+    functionDeclarations(source, [
+      'isGenericMediaTitle', 'shouldReplaceMediaTitle', 'updateMediaMetadata',
+      'cleanDisplayTitle', 'formatSeasonEpisode', 'padNumber'
+    ])
+  ].join('\n');
+  const ctx = evaluateFunctions(block);
+  ctx.updateMediaMetadata({ title: 'Severance' }, 3);
+  ctx.updateMediaMetadata({ title: '\u200eApple TV' }, 1);
+  assert.strictEqual(ctx.state.mediaTitle, 'Severance');
+  assert.strictEqual(ctx.state.mediaTitlePriority, 3);
+});
+
 test('netflix: modern subtitle format fallbacks remain available', () => {
   const source = sources.netflix;
   requireText(source, "const DFXP = 'dfxp-ls-sdh';", 'DFXP format');
@@ -201,6 +226,62 @@ test('netflix: download fallback skips unusable candidates and failed mirrors', 
   requireText(source, 'subtitle fetch failed, trying another URL', 'network mirror fallback');
   requireText(source, 'subtitle fetch timed out, trying another URL', 'timeout mirror fallback');
   requireText(source, 'subtitle response could not be read, trying another URL', 'body-read mirror fallback');
+});
+
+test('netflix: menu lifecycle does not depend on metadata readiness', () => {
+  const source = sources.netflix;
+  requireText(source, '// @run-at     document-start', 'early Netflix hook installation');
+  requireText(source, 'const ensureMenu = () =>', 'standalone menu initializer');
+  requireText(source, 'const menu = ensureMenu();', 'metadata-independent menu creation');
+  requireText(source, "document.addEventListener('DOMContentLoaded', initializeDom, {once: true});", 'DOM-ready menu creation');
+  requireText(source, 'injectPageHooks();', 'early page hook injection');
+  const start = source.indexOf('const processMetadata = data =>');
+  const end = source.indexOf('\nconst getVideoId =', start);
+  assert(start >= 0 && end > start, 'processMetadata block missing');
+  assert(!source.slice(start, end).includes("menu.style.display = 'none'"), 'metadata processing must not hide the menu');
+});
+
+test('netflix: document-start initialization tolerates a missing body', () => {
+  const listeners = {};
+  const parent = {
+    appendChild(node) { node.isConnected = true; node.parentNode = this; },
+    removeChild(node) { node.isConnected = false; node.parentNode = null; }
+  };
+  const document = {
+    body: null,
+    head: null,
+    documentElement: parent,
+    location: { pathname: '/watch/123', href: 'https://www.netflix.com/watch/123' },
+    createElement(tag) {
+      return { tagName: String(tag).toUpperCase(), textContent: '', innerHTML: '', isConnected: false, style: {} };
+    },
+    addEventListener(type, handler) { listeners[type] = handler; },
+    querySelector() { return null; }
+  };
+  const context = {
+    console: { log() {}, warn() {}, debug() {}, error() {} },
+    document,
+    location: document.location,
+    localStorage: { getItem() { return null; }, setItem() {} },
+    sessionStorage: { getItem() { return null; }, setItem() {} },
+    MutationObserver: function () { this.observe = function () {}; },
+    setTimeout() {},
+    clearTimeout() {},
+    CustomEvent: function () {},
+    Blob: function () {},
+    FileReader: function () {},
+    JSZip: function () {},
+    saveAs() {},
+    caches: {},
+    alert() {},
+    URL,
+    addEventListener() {},
+    dispatchEvent() {}
+  };
+  context.window = context;
+  context.unsafeWindow = context;
+  vm.runInNewContext(sources.netflix, context);
+  assert.strictEqual(typeof listeners.DOMContentLoaded, 'function');
 });
 
 console.log(`# ${passed} regression groups passed`);
