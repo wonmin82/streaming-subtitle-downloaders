@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.13
+// @version    1.0.14
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -590,22 +590,32 @@
         var metadata = extractMetadataFromText(text);
         var hasEpisodeMetadata = metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber);
         if (hasEpisodeMetadata && !metadata.title) {
-            delete metadata.episodeTag;
-            delete metadata.seasonNumber;
-            delete metadata.episodeNumber;
-            debuglog('Ignored episode metadata without a matching series title from ' + shortUrl(url));
+            if (isPlayerExperienceMetadataUrl(url)) {
+                metadata.title = activePlaybackTitle(activePlaybackContainer()) || displayTitle();
+            } else {
+                delete metadata.episodeTag;
+                delete metadata.seasonNumber;
+                delete metadata.episodeNumber;
+                debuglog('Ignored episode metadata without a matching series title from ' + shortUrl(url));
+            }
         }
         if (metadata.title || metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber)) {
             updateMediaMetadata(metadata);
         }
     }
 
+    function isPlayerExperienceMetadataUrl(url) {
+        url = normalizeUrl(url);
+        return /(?:disney|bamgrid)\./i.test(url) && /(?:^|\/)playerExperience(?:\/|[?#]|$)/i.test(url);
+    }
+
     function shouldInspectMetadataUrl(url) {
         url = normalizeUrl(url);
         if (!url) return false;
         if (/\.(m3u8|vtt|mp4|mp4a|m4s|bif|png|jpg|jpeg|webp|woff2?)(?:[?#]|$)/i.test(url)) return false;
+        if (isPlayerExperienceMetadataUrl(url)) return true;
         if (/(?:upnext|explore|recommend(?:ation)?s?)/i.test(url)) return false;
-        return /disney|bamgrid|dssott|dssedge|graphql|playerExperience|deeplink/i.test(url);
+        return /disney|bamgrid|dssott|dssedge|graphql|deeplink/i.test(url);
     }
 
     function extractMetadataFromText(text) {
@@ -717,6 +727,8 @@
 
     function activePlaybackContainer() {
         var selectors = [
+            '[data-testid="disney-web-player-wrapper"]',
+            '[data-testid="disney-web-player-container"]',
             '[data-testid="playback-view"]',
             '[data-testid="video-player"]',
             '[data-testid="player-container"]',
@@ -744,13 +756,15 @@
             '[data-testid="playback-title"]',
             '[data-testid="video-title"]',
             '[data-testid*="player"][data-testid*="title"]',
+            'video[aria-label]',
             'h1',
             'h2'
         ];
         for (var i = 0; i < selectors.length; i++) {
             try {
                 var node = container.querySelector(selectors[i]);
-                var title = cleanDisplayTitle(node && node.textContent);
+                var rawTitle = node && (node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent);
+                var title = cleanDisplayTitle(rawTitle);
                 if (title && title !== 'DisneyPlus' && !/^S\d{1,2}E\d{1,3}$/i.test(title)) return title;
             } catch (err) {}
         }
