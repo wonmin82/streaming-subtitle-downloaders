@@ -2,7 +2,7 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.9
+// @version    1.0.10
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -281,19 +281,25 @@ const isWatchPage = () => document.location.pathname.split('/')[1] === 'watch';
 const syncMenuVisibility = menu => {
   if(!menu || !menu.isConnected)
     return;
-  menu.style.display = (isWatchPage() ? '' : 'none');
+  const display = (isWatchPage() ? '' : 'none');
+  if(menu.style.display !== display)
+    menu.style.display = display;
 };
 
+let downloaderMenu = null;
 const ensureMenu = () => {
   if(!document.body)
     return null;
 
-  let menu = document.querySelector('#subtitle-downloader-menu');
+  let menu = downloaderMenu && downloaderMenu.isConnected ? downloaderMenu :
+    document.querySelector('#subtitle-downloader-menu');
+  let created = false;
   if(menu === null) {
     menu = document.createElement('div');
     menu.id = 'subtitle-downloader-menu';
     menu.innerHTML = DOWNLOAD_MENU;
     document.body.appendChild(menu);
+    created = true;
     menu.querySelector('.download').addEventListener('click', downloadThis);
     menu.querySelector('.download-to-end').addEventListener('click', downloadToEnd);
     menu.querySelector('.download-season').addEventListener('click', downloadSeason);
@@ -311,8 +317,10 @@ const ensureMenu = () => {
     setFormatText();
     setBatchDelayText();
   }
+  downloaderMenu = menu;
   syncMenuVisibility(menu);
-  applyDownloadUi(menu);
+  if(created)
+    applyDownloadUi(menu);
   return menu;
 };
 
@@ -456,6 +464,7 @@ const processMetadata = data => {
     console.debug('[Netflix Subtitle Downloader] unknown video type:', type, result)
     return;
   }
+  syncPlaybackMetadataState(menu);
   checkSubsCache(menu);
 };
 
@@ -699,6 +708,8 @@ const getTitleEntry = silent => {
 };
 
 const syncPlaybackMetadataState = menu => {
+  if(!isWatchPage())
+    return null;
   const title = getTitleEntry(true);
   if(!title) {
     applyDownloadUi(menu);
@@ -778,6 +789,8 @@ const getTitleFromCache = titleEntry => {
 };
 
 const predictedOutputFilename = () => {
+  if(!isWatchPage())
+    return 'Waiting for title metadata...';
   const title = getTitleEntry(true);
   if(!title)
     return 'Waiting for title metadata...';
@@ -800,21 +813,28 @@ const applyDownloadUi = menu => {
   const completed = Math.max(0, Number(downloadUiState.completed) || 0);
   const total = Math.max(0, Number(downloadUiState.total) || 0);
   const keepResultFilename = downloadUiState.label === 'Complete' || downloadUiState.label === 'Failed';
+  const filenameText = (downloadUiState.active || keepResultFilename) && downloadUiState.filename
+    ? downloadUiState.filename
+    : predictedOutputFilename();
+  const progressLabel = total > 0
+    ? `${downloadUiState.label} (${completed}/${total}, ${Math.floor(completed * 100 / total)}%)`
+    : downloadUiState.label;
 
-  if(filenameNode)
-    filenameNode.textContent = (downloadUiState.active || keepResultFilename) && downloadUiState.filename
-      ? downloadUiState.filename
-      : predictedOutputFilename();
-  if(progressText)
-    progressText.textContent = total > 0
-      ? `${downloadUiState.label} (${completed}/${total}, ${Math.floor(completed * 100 / total)}%)`
-      : downloadUiState.label;
+  if(filenameNode && filenameNode.textContent !== filenameText)
+    filenameNode.textContent = filenameText;
+  if(progressText && progressText.textContent !== progressLabel)
+    progressText.textContent = progressLabel;
   if(progress) {
-    progress.max = Math.max(1, total);
-    if(downloadUiState.active && total === 0)
-      progress.removeAttribute('value');
-    else
-      progress.value = Math.min(completed, Math.max(1, total));
+    const progressMax = Math.max(1, total);
+    const progressValue = Math.min(completed, progressMax);
+    if(Number(progress.max) !== progressMax)
+      progress.max = progressMax;
+    if(downloadUiState.active && total === 0) {
+      if(progress.hasAttribute('value'))
+        progress.removeAttribute('value');
+    }
+    else if(Number(progress.value) !== progressValue)
+      progress.value = progressValue;
   }
 };
 
@@ -1218,10 +1238,39 @@ injectPageHooks();
 const s = document.createElement('style');
 s.innerHTML = SCRIPT_CSS;
 
+const PLAYBACK_METADATA_SYNC_DELAY_MS = 250;
+let playbackMetadataSyncTimer = null;
+const schedulePlaybackMetadataSync = menu => {
+  if(!isWatchPage() || playbackMetadataSyncTimer !== null)
+    return;
+  playbackMetadataSyncTimer = window.setTimeout(() => {
+    playbackMetadataSyncTimer = null;
+    if(isWatchPage())
+      syncPlaybackMetadataState(menu && menu.isConnected ? menu : ensureMenu());
+  }, PLAYBACK_METADATA_SYNC_DELAY_MS);
+};
+
+const isDownloaderMenuMutation = (mutation, menu) => {
+  if(!mutation || !menu)
+    return false;
+  const target = mutation.target;
+  if(target === menu || (target && typeof menu.contains === 'function' && menu.contains(target)))
+    return true;
+  const addedNodes = mutation.addedNodes || [];
+  return addedNodes.length > 0 && Array.prototype.every.call(addedNodes, node =>
+    node === menu || (typeof menu.contains === 'function' && menu.contains(node))
+  );
+};
+
 const observer = new MutationObserver(function(mutations) {
   const menu = ensureMenu();
-  syncPlaybackMetadataState(menu);
-  mutations.forEach(function(mutation) {
+  if(!isWatchPage())
+    return;
+  const pageMutations = mutations.filter(mutation => !isDownloaderMenuMutation(mutation, menu));
+  if(pageMutations.length === 0)
+    return;
+  schedulePlaybackMetadataSync(menu);
+  pageMutations.forEach(function(mutation) {
     mutation.addedNodes.forEach(function(node) {
       // add scrollbar - Netflix doesn't expect you to have this manu languages to choose from...
       try {

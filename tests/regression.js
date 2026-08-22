@@ -315,6 +315,23 @@ test('netflix: menu lifecycle does not depend on metadata readiness', () => {
   requireText(source, "Couldn't find the episode number", 'incomplete show metadata guard');
 });
 
+test('netflix: filename preview cannot create an unbounded DOM observer loop', () => {
+  const source = sources.netflix;
+  requireText(source, 'const PLAYBACK_METADATA_SYNC_DELAY_MS = 250;', 'bounded metadata refresh interval');
+  requireText(source, 'const isDownloaderMenuMutation = (mutation, menu) =>', 'downloader menu mutation filter');
+  requireText(source, 'if(!isWatchPage())\n    return null;', 'non-playback metadata guard');
+  requireText(source, 'if(filenameNode && filenameNode.textContent !== filenameText)', 'idempotent filename update');
+  requireText(source, 'if(progressText && progressText.textContent !== progressLabel)', 'idempotent progress update');
+
+  const observerStart = source.indexOf('const observer = new MutationObserver');
+  const observerEnd = source.indexOf('\nlet observerStarted', observerStart);
+  assert(observerStart >= 0 && observerEnd > observerStart, 'Netflix DOM observer block missing');
+  const observer = source.slice(observerStart, observerEnd);
+  requireText(observer, 'schedulePlaybackMetadataSync(menu);', 'throttled metadata refresh');
+  requireText(observer, 'mutations.filter(mutation => !isDownloaderMenuMutation(mutation, menu))', 'menu mutation exclusion');
+  assert(!observer.includes('syncPlaybackMetadataState(menu);'), 'DOM observer must not synchronously rescan metadata');
+});
+
 test('netflix: active player DOM title fills a missing metadata cache entry', () => {
   const listeners = {};
   const parent = {
@@ -408,7 +425,7 @@ test('netflix: show filenames always include season and episode without duplicat
   const end = sources.netflix.indexOf('\nconst isUsableFormatCandidate =', start);
   assert(start >= 0 && end > start, 'Netflix title helpers missing');
   const block = [
-    'const titleCache = {}; const idOverrides = {}; let epTitleInFilename = true;',
+    'const titleCache = {}; const idOverrides = {}; let epTitleInFilename = true; const isWatchPage = () => true;',
     sources.netflix.slice(start, end),
     'titleCache["81697779"] = {type: "show", title: "이 사랑 통역 되나요?", season: 1, episode: 5, subtitle: "5화: 5화", hiddenNumber: true};',
     'this.limitedSeriesFilename = getTitleFromCache()[0];',
