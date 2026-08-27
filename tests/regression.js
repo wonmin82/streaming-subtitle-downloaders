@@ -642,7 +642,7 @@ test('coupang: async metadata resolves before the operation filename is frozen',
   requireText(functionDeclaration(source, 'ensureMediaMetadata'), "state.metadataFailedKey = '';", 'explicit-download metadata retry');
 });
 
-test('disney: Korean branding is removed and unscoped episode metadata is rejected', () => {
+test('disney: current playback metadata is scoped and incomplete episode filenames stay blocked', () => {
   const source = sources.disney;
   const ctx = evaluateFunctions(functionDeclarations(source, [
     'cleanDisplayTitle', 'normalizedMediaTitleForComparison', 'mediaTitlesMatch'
@@ -651,6 +651,10 @@ test('disney: Korean branding is removed and unscoped episode metadata is reject
   assert.strictEqual(ctx.mediaTitlesMatch('무파사: 라이온 킹', '무파사 라이온 킹'), true);
   assert.strictEqual(ctx.mediaTitlesMatch('무파사: 라이온 킹', '다른 시리즈'), false);
   requireText(source, 'if (hasEpisodeMetadata && !metadata.title)', 'unscoped episode metadata guard');
+  requireText(source, 'rememberPlaybackResponseMetadata(metadata, sessionId, url)', 'trusted playback response metadata retention');
+  requireText(source, "captureDisney('metadata.pending'", 'pending episode metadata capture');
+  requireText(functionDeclaration(source, 'safeBaseFilename'), 'if (!isPlaybackMetadataReady()) return', 'incomplete filename guard');
+  requireText(functionDeclaration(source, 'updateUi'), 'state.wait || !metadataReady', 'metadata-ready download gate');
   requireText(source, 'upnext|explore|recommend', 'related-content metadata exclusion');
   requireText(source, '!mediaTitlesMatch(title, state.episodeMetadataTitle)', 'cross-title episode metadata guard');
   const getTrack = functionDeclaration(source, 'getTrackVtt');

@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "name": "synthetic-metadata",
+  "service": "disney",
+  "source": {
+    "captureToolVersion": "1.0.0",
+    "scriptVersion": "fixture",
+    "sanitization": {
+      "version": 1,
+      "redactions": 3,
+      "warnings": []
+    }
+  },
+  "page": {
+    "host": "www.disneyplus.com",
+    "path": "/play/TOKEN_1"
+  },
+  "capture": {
+    "startedAt": "2026-01-01T00:00:00.000Z",
+    "durationMs": 1200,
+    "truncated": false,
+    "limits": {
+      "maxEvents": 3000,
+      "maxSnapshots": 500,
+      "maxArtifacts": 200,
+      "maxArtifactBytes": 1048576,
+      "maxCaptureBytes": 20971520,
+      "maxStringBytes": 4096,
+      "maxArrayItems": 200,
+      "maxObjectKeys": 200,
+      "maxDepth": 8
+    }
+  },
+  "replay": {
+    "driver": "disney-metadata-v1",
+    "input": "ARTIFACT_1"
+  },
+  "events": [
+    {
+      "seq": 1,
+      "t": 0,
+      "type": "session.start",
+      "session": "SESSION_1",
+      "data": {
+        "reason": "navigation"
+      }
+    },
+    {
+      "seq": 2,
+      "t": 900,
+      "type": "metadata.accepted",
+      "session": "SESSION_1",
+      "data": {
+        "source": "synthetic",
+        "title": "SHOW_001",
+        "episodeTag": "S03E02"
+      }
+    }
+  ],
+  "snapshots": [
+    {
+      "seq": 3,
+      "t": 1000,
+      "kind": "metadata",
+      "session": "SESSION_1",
+      "data": {
+        "title": "SHOW_001",
+        "season": 3,
+        "episode": 2
+      }
+    }
+  ],
+  "artifacts": {
+    "ARTIFACT_1": {
+      "kind": "metadata",
+      "format": "json",
+      "url": "https://disney.api.edge.bamgrid.com/TOKEN_1/metadata",
+      "byteLength": 208,
+      "input": "input/artifact-001.json"
+    }
+  }
+}

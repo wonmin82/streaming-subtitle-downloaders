@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "name": "playback-response-episode",
+  "service": "disney",
+  "source": {
+    "captureToolVersion": "1.0.0",
+    "scriptVersion": "1.0.21",
+    "sanitization": {
+      "version": 1,
+      "redactions": 1,
+      "warnings": []
+    }
+  },
+  "page": {
+    "host": "www.disneyplus.com",
+    "path": "/play/TOKEN_1"
+  },
+  "capture": {
+    "startedAt": "2026-08-25T00:00:00.000Z",
+    "durationMs": 1500,
+    "truncated": false,
+    "limits": {
+      "maxEvents": 3000,
+      "maxSnapshots": 500,
+      "maxArtifacts": 200,
+      "maxArtifactBytes": 1048576,
+      "maxCaptureBytes": 20971520,
+      "maxStringBytes": 4096,
+      "maxArrayItems": 200,
+      "maxObjectKeys": 200,
+      "maxDepth": 8
+    }
+  },
+  "replay": {
+    "driver": "disney-playback-resolution-v1",
+    "input": "ARTIFACT_1"
+  },
+  "events": [
+    {
+      "seq": 1,
+      "t": 0,
+      "type": "session.start",
+      "session": "SESSION_1",
+      "data": {
+        "reason": "navigation"
+      }
+    },
+    {
+      "seq": 2,
+      "t": 900,
+      "type": "metadata.observed",
+      "session": "SESSION_1",
+      "data": {
+        "source": "playback-response",
+        "episodeTag": "S01E03"
+      }
+    },
+    {
+      "seq": 3,
+      "t": 901,
+      "type": "metadata.pending",
+      "session": "SESSION_1",
+      "data": {
+        "mediaKind": "episode",
+        "episodeTag": "S01E03"
+      }
+    },
+    {
+      "seq": 4,
+      "t": 920,
+      "type": "metadata.accepted",
+      "session": "SESSION_1",
+      "data": {
+        "source": "active-player+playback-response",
+        "title": "SHOW_001",
+        "episodeTag": "S01E03"
+      }
+    }
+  ],
+  "snapshots": [
+    {
+      "seq": 5,
+      "t": 910,
+      "kind": "active-player",
+      "session": "SESSION_1",
+      "data": {
+        "title": "SHOW_001",
+        "episodeTag": ""
+      }
+    }
+  ],
+  "artifacts": {
+    "ARTIFACT_1": {
+      "kind": "metadata-structure",
+      "format": "json",
+      "url": "https://disney.playback.edge.bamgrid.com/v7/playback/ctr-regular",
+      "byteLength": 74,
+      "input": "input/artifact-001.json"
+    }
+  }
+}

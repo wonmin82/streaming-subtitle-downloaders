@@ -2,14 +2,16 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.15
+// @version    1.0.16
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
 // @downloadURL https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/disney-plus-subtitles-downloader.user.js
 // @updateURL  https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/disney-plus-subtitles-downloader.user.js
 // @match      https://www.disneyplus.com/*
+// @grant      GM_info
 // @grant      GM_xmlhttpRequest
+// @grant      GM_registerMenuCommand
 // @grant      unsafeWindow
 // @connect    *.dssott.com
 // @connect    *.dssedge.com
@@ -29,7 +31,10 @@
     var MAX_RETRIES = 5;
     var RETRY_BASE_DELAY_MS = 250;
     var RETRY_MAX_DELAY_MS = 4000;
+    var PLAYBACK_METADATA_SETTLE_MS = 3000;
     var LOG_PREFIX = '[Disney+ Subtitles DL]';
+    var FIXTURE_CAPTURE_ARM_KEY = 'ssd:fixture-capture:disney:armed-until';
+    var FIXTURE_CAPTURE_ARM_TTL_MS = 2 * 60 * 1000;
     var targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
     var state = {
@@ -56,6 +61,14 @@
         episodeNumber: null,
         episodeTag: '',
         episodeMetadataTitle: '',
+        mediaKind: 'unknown',
+        metadataReady: false,
+        metadataSource: '',
+        pendingEpisodeTag: '',
+        playbackMetadataResponseSeen: false,
+        playbackMetadataUnresolvedLogged: false,
+        playbackMetadataSettlingUntil: 0,
+        playbackMetadataSettlingTimer: null,
         shadowControlsRoot: null,
         shadowControlsObserver: null,
         shadowTitleRoot: null,
@@ -74,12 +87,935 @@
         zip: null
     };
 
+    // BEGIN SHARED FIXTURE CAPTURE CORE
+    function createFixtureCapture(options) {
+        'use strict';
+
+        options = options && typeof options === 'object' ? options : {};
+
+        var CAPTURE_TOOL_VERSION = '1.0.0';
+        var SANITIZATION_VERSION = 1;
+        var HARD_LIMITS = {
+            maxEvents: 3000,
+            maxSnapshots: 500,
+            maxArtifacts: 200,
+            maxArtifactBytes: 1024 * 1024,
+            maxCaptureBytes: 20 * 1024 * 1024,
+            maxStringBytes: 4096,
+            maxArrayItems: 200,
+            maxObjectKeys: 200,
+            maxDepth: 12
+        };
+        var MIN_LIMITS = {
+            maxEvents: 1,
+            maxSnapshots: 1,
+            maxArtifacts: 1,
+            maxArtifactBytes: 128,
+            maxCaptureBytes: 2048,
+            maxStringBytes: 64,
+            maxArrayItems: 1,
+            maxObjectKeys: 1,
+            maxDepth: 1
+        };
+        var SAFE_QUERY_VALUES = /^(?:lang(?:uage)?|locale|format|_HLS_msn|_HLS_part)$/i;
+        var SENSITIVE_KEY = /(?:^|_)(?:authorization|cookies?|set_cookie|password|passwd|secrets?|access_tokens?|refresh_tokens?|id_tokens?|tokens?|signatures?|polic(?:y|ies)|credentials?|api_keys?|private_keys?)(?:$|_)/i;
+        var SESSION_KEY = /(?:^|_)(?:playback_)?session(?:_?id)?(?:$|_)/i;
+        var URL_KEY = /(?:^|_)(?:url|uri|href|src|manifest|playlist)(?:$|_)/i;
+        var CONTENT_TEXT_KEY = /(?:^|_)(?:caption|subtitle|transcript|dialogue|body|description|synopsis|overview|summary|plot)(?:$|_)/i;
+        var ID_KEY = /(?:^|_)(?:id|(?:movie|content|playable|episode|asset|account|profile|subscriber|customer|user|viewer|device)_?id)(?:$|_)/i;
+        var PII_KEY = /(?:^|_)(?:(?:first|middle|last|full|given|family|display|profile|user|account|subscriber|customer|viewer)_?name|e_?mail|phone(?:_number)?|address|birth(?:date)?|date_of_birth|gender)(?:$|_)/i;
+        var PII_CONTAINER_KEY = /^(?:accounts?|profiles?|subscribers?|customers?|users?|viewers?|persons?|members?)$/i;
+        var DRM_KEY = /(?:^|_)(?:pssh|drm_data|license_data|license_challenge|license_response|certificate_data|widevine_data|fairplay_data|playready_data)(?:$|_)/i;
+        var DRM_ARTIFACT = /^(?:drm|license|certificate|cert|pssh|widevine|fairplay|playready|cenc)$/i;
+        var PROHIBITED_ARTIFACT = /^(?:dom|html|har|media|video|audio|image|binary|blob)$/i;
+        var DRM_PATH = /\/(?:drm|license|licenses|widevine|fairplay|playready|certificate|cert)(?:\/|$)/i;
+        var SIGNED_PATH_SEGMENT = /(?:^|[~;,])(?:dvt\d*|exp(?:ires)?|signature|sig|policy|tokens?|auth(?:orization)?|credentials?|psid|playback_?session_?id)=/i;
+        var limits = resolveLimits(options.limits);
+        var state = 'idle';
+        var data = null;
+        var startedAtMs = 0;
+        var capturedBytes = 0;
+        var artifactSequence = 0;
+        var eventSequence = 0;
+        var captionSequence = 0;
+        var textSequence = 0;
+        var sessionValues = [];
+        var tokenValues = [];
+        var warningKeys = Object.create(null);
+        var securityBlocked = false;
+        var lastError = '';
+
+        function resolveLimits(requested) {
+            var source = requested && typeof requested === 'object' ? requested : {};
+            var result = {};
+            Object.keys(HARD_LIMITS).forEach(function (key) {
+                var value = Number(source[key]);
+                if (!isFinite(value)) value = HARD_LIMITS[key];
+                value = Math.floor(value);
+                result[key] = Math.max(MIN_LIMITS[key], Math.min(HARD_LIMITS[key], value));
+            });
+            return result;
+        }
+
+        function safeNow() {
+            try {
+                var value = typeof options.now === 'function' ? Number(options.now()) : Date.now();
+                return isFinite(value) ? value : Date.now();
+            } catch (error) {
+                return Date.now();
+            }
+        }
+
+        function safeIsoTime(value) {
+            try {
+                return new Date(value).toISOString();
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function byteLength(value) {
+            var string = String(value == null ? '' : value);
+            var bytes = 0;
+            for (var index = 0; index < string.length; index++) {
+                var code = string.charCodeAt(index);
+                if (code < 0x80) {
+                    bytes += 1;
+                } else if (code < 0x800) {
+                    bytes += 2;
+                } else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < string.length &&
+                    string.charCodeAt(index + 1) >= 0xDC00 && string.charCodeAt(index + 1) <= 0xDFFF) {
+                    bytes += 4;
+                    index++;
+                } else {
+                    bytes += 3;
+                }
+            }
+            return bytes;
+        }
+
+        function truncateUtf8(value, maximum) {
+            var string = String(value == null ? '' : value);
+            if (byteLength(string) <= maximum) return string;
+            var bytes = 0;
+            var output = '';
+            for (var index = 0; index < string.length; index++) {
+                var code = string.charCodeAt(index);
+                var width = code < 0x80 ? 1 : (code < 0x800 ? 2 : 3);
+                var chunk = string.charAt(index);
+                if (code >= 0xD800 && code <= 0xDBFF && index + 1 < string.length &&
+                    string.charCodeAt(index + 1) >= 0xDC00 && string.charCodeAt(index + 1) <= 0xDFFF) {
+                    width = 4;
+                    chunk += string.charAt(++index);
+                }
+                if (bytes + width > maximum) break;
+                output += chunk;
+                bytes += width;
+            }
+            return output;
+        }
+
+        function safeJson(value) {
+            try {
+                return JSON.stringify(value);
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function cloneJson(value) {
+            try {
+                return JSON.parse(JSON.stringify(value));
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function sanitizeIdentifier(value, fallback) {
+            var result = String(value == null ? '' : value).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+            return truncateUtf8(result || fallback || 'unknown', 80);
+        }
+
+        function sanitizeEventType(value) {
+            var parts = String(value == null ? '' : value).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(function (part) {
+                return /^[a-z]/.test(part) ? part : 'x' + part;
+            });
+            if (!parts.length) parts = ['custom', 'event'];
+            if (parts.length === 1) parts.unshift('custom');
+            return truncateUtf8(parts.join('.'), 80).replace(/\.+$/, '') || 'custom.event';
+        }
+
+        function sanitizeKind(value, fallback) {
+            var result = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
+            if (!result) result = fallback || 'item';
+            if (!/^[a-z]/.test(result)) result = 'item-' + result;
+            return truncateUtf8(result, 80).replace(/[.-]+$/, '') || 'item';
+        }
+
+        function sanitizeFormat(value) {
+            var result = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9.+-]+/g, '-').replace(/^[.+-]+|[.+-]+$/g, '');
+            return truncateUtf8(result || 'text', 32).replace(/[.+-]+$/, '') || 'text';
+        }
+
+        function resetMappings() {
+            sessionValues = [];
+            tokenValues = [];
+            captionSequence = 0;
+            textSequence = 0;
+        }
+
+        function mappedValue(collection, prefix, value) {
+            var string = String(value == null ? '' : value);
+            var index = collection.indexOf(string);
+            if (index < 0) {
+                collection.push(string);
+                index = collection.length - 1;
+            }
+            return prefix + '_' + (index + 1);
+        }
+
+        function mapSession(value) {
+            if (value == null || value === '') return '';
+            return mappedValue(sessionValues, 'SESSION', value);
+        }
+
+        function mapToken(value) {
+            if (value == null || value === '') return '';
+            return mappedValue(tokenValues, 'TOKEN', value);
+        }
+
+        function looksOpaque(value) {
+            var string = String(value == null ? '' : value);
+            return /^[0-9]{10,}$/.test(string) ||
+                /^[0-9a-f]{16,}$/i.test(string) ||
+                /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(string) ||
+                (/^[A-Za-z0-9_-]{20,}$/.test(string) && /[0-9]/.test(string));
+        }
+
+        function normalizedKey(value) {
+            return String(value == null ? '' : value)
+                .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+                .replace(/[-:\s]+/g, '_')
+                .toLowerCase();
+        }
+
+        function addWarning(code) {
+            if (!data || warningKeys[code]) return;
+            warningKeys[code] = true;
+            if (data.sanitization.warnings.length < 50) data.sanitization.warnings.push(truncateUtf8(code, 120));
+        }
+
+        function markTruncated(code) {
+            if (data) data.capture.truncated = true;
+            addWarning('limit:' + code);
+        }
+
+        function redact() {
+            if (data) data.sanitization.redactions++;
+            return 'REDACTED';
+        }
+
+        function flagCriticalSecret(code) {
+            securityBlocked = true;
+            addWarning('security:' + code);
+            if (data) data.sanitization.redactions++;
+        }
+
+        function containsCriticalSecret(value, key) {
+            var string = String(value == null ? '' : value);
+            if ((/(?:authorization|cookie|set-cookie)/i.test(String(key || '')) && string && string !== 'REDACTED') ||
+                /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(string) ||
+                /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(string) ||
+                /\b(?:Cookie|Set-Cookie|Authorization)\s*:\s*\S+/i.test(string) ||
+                /\bAKIA[0-9A-Z]{16}\b/.test(string) ||
+                /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(string) ||
+                (!/\s/.test(string) && /^(?:[A-Za-z0-9+/]{256,}={0,2})$/.test(string)) ||
+                /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(string)) {
+                return true;
+            }
+            return false;
+        }
+
+        function sanitizeUrl(value) {
+            try {
+                var input = truncateUtf8(value, limits.maxStringBytes * 4);
+                if (!input) return '';
+                if (/^(?:data|blob|javascript):/i.test(input)) return redact() + '_URL';
+                var absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(input) || /^\/\//.test(input);
+                var url = new URL(input, 'https://fixture.invalid/');
+                if (!/^https?:$/.test(url.protocol)) return redact() + '_URL';
+                if (DRM_PATH.test(url.pathname)) {
+                    flagCriticalSecret('drm-url');
+                    return 'REDACTED_URL';
+                }
+                url.username = '';
+                url.password = '';
+                var pathParts = url.pathname.split('/').map(function (part) {
+                    if (!part) return part;
+                    var decodedPart = part;
+                    try { decodedPart = decodeURIComponent(part); } catch (error) {}
+                    if (SIGNED_PATH_SEGMENT.test(decodedPart)) return mapToken(part);
+                    var extensionMatch = part.match(/^(.*?)(\.[A-Za-z0-9]{1,8})$/);
+                    var stem = extensionMatch ? extensionMatch[1] : part;
+                    var extension = extensionMatch ? extensionMatch[2] : '';
+                    return looksOpaque(stem) ? mapToken(stem) + extension : truncateUtf8(part, 160);
+                });
+                url.pathname = pathParts.join('/');
+                var query = [];
+                url.searchParams.forEach(function (queryValue, queryKey) {
+                    var safeKey = truncateUtf8(queryKey.replace(/[^A-Za-z0-9_.-]/g, '_'), 80);
+                    var safeValue = SAFE_QUERY_VALUES.test(queryKey) && /^[A-Za-z0-9_.-]{1,40}$/.test(queryValue) ? queryValue : redact();
+                    query.push(encodeURIComponent(safeKey) + '=' + encodeURIComponent(safeValue));
+                });
+                url.search = query.length ? '?' + query.join('&') : '';
+                url.hash = '';
+                if (!absolute) return url.pathname + url.search;
+                if (/^\/\//.test(input)) return '//' + url.host + url.pathname + url.search;
+                return url.protocol + '//' + url.host + url.pathname + url.search;
+            } catch (error) {
+                if (data) data.sanitization.redactions++;
+                return 'REDACTED_URL';
+            }
+        }
+
+        function sanitizeInlineString(value, key) {
+            var string = String(value == null ? '' : value);
+            if (containsCriticalSecret(string, key)) {
+                flagCriticalSecret('high-risk-value');
+                return 'REDACTED_SECRET';
+            }
+            var normalized = normalizedKey(key);
+            if (DRM_KEY.test(normalized)) {
+                if (data) data.sanitization.redactions++;
+                addWarning('sanitizer:drm-field-removed');
+                return 'REDACTED';
+            }
+            if (PII_KEY.test(normalized) || PII_CONTAINER_KEY.test(normalized)) return redact();
+            if (SENSITIVE_KEY.test(normalized)) return redact();
+            if (SESSION_KEY.test(normalized)) return mapSession(string);
+            if (CONTENT_TEXT_KEY.test(normalized)) {
+                textSequence++;
+                if (data) data.sanitization.redactions++;
+                return 'TEXT_' + textSequence;
+            }
+            if (URL_KEY.test(normalized) || /^(?:https?:)?\/\//i.test(string)) return sanitizeUrl(string);
+            if (ID_KEY.test(normalized) && string) return mapToken(string);
+            if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(string)) {
+                if (data) data.sanitization.redactions++;
+                string = string.replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, 'REDACTED_EMAIL');
+            }
+            string = string.replace(/([?&](?:token|sig|signature|policy|key|auth|credential)=)[^&#\s]*/ig, '$1REDACTED');
+            if (byteLength(string) > limits.maxStringBytes) {
+                markTruncated('maxStringBytes');
+                string = truncateUtf8(string, limits.maxStringBytes);
+            }
+            return string;
+        }
+
+        function sanitizeValue(value, key, depth, seen) {
+            var normalized = normalizedKey(key);
+            if (value == null) return value;
+            if (typeof value === 'boolean') {
+                if (DRM_KEY.test(normalized) || SENSITIVE_KEY.test(normalized) || PII_KEY.test(normalized) ||
+                    PII_CONTAINER_KEY.test(normalized) || SESSION_KEY.test(normalized) || ID_KEY.test(normalized)) return redact();
+                return value;
+            }
+            if (typeof value !== 'string') {
+                if (DRM_KEY.test(normalized) || SENSITIVE_KEY.test(normalized) || PII_KEY.test(normalized) ||
+                    (PII_CONTAINER_KEY.test(normalized) && typeof value === 'object')) return redact();
+                if (SESSION_KEY.test(normalized) && (typeof value === 'number' || typeof value === 'bigint')) return mapSession(value);
+                if (ID_KEY.test(normalized) && (typeof value === 'number' || typeof value === 'bigint')) return mapToken(value);
+                if (CONTENT_TEXT_KEY.test(normalized) && typeof value === 'object') {
+                    textSequence++;
+                    if (data) data.sanitization.redactions++;
+                    return 'TEXT_' + textSequence;
+                }
+            }
+            if (typeof value === 'number') return isFinite(value) ? value : null;
+            if (typeof value === 'bigint') return sanitizeInlineString(String(value), key);
+            if (typeof value === 'string') return sanitizeInlineString(value, key);
+            if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') return null;
+            if (depth >= limits.maxDepth) {
+                markTruncated('maxDepth');
+                return '[MAX_DEPTH]';
+            }
+            if (seen.indexOf(value) >= 0) {
+                addWarning('sanitizer:cyclic-value');
+                return '[CIRCULAR]';
+            }
+            seen.push(value);
+            try {
+                if (Array.isArray(value)) {
+                    if (value.length > limits.maxArrayItems) markTruncated('maxArrayItems');
+                    return value.slice(0, limits.maxArrayItems).map(function (item) {
+                        return sanitizeValue(item, key, depth + 1, seen);
+                    });
+                }
+                var result = Object.create(null);
+                var keys;
+                try {
+                    keys = Object.keys(value);
+                } catch (error) {
+                    addWarning('sanitizer:unreadable-object');
+                    return '[UNREADABLE]';
+                }
+                if (keys.length > limits.maxObjectKeys) markTruncated('maxObjectKeys');
+                keys.slice(0, limits.maxObjectKeys).forEach(function (property) {
+                    var propertyValue;
+                    try {
+                        propertyValue = value[property];
+                    } catch (error) {
+                        addWarning('sanitizer:unreadable-property');
+                        result[property] = '[UNREADABLE]';
+                        return;
+                    }
+                    var safeProperty = truncateUtf8(String(property), 120);
+                    result[safeProperty] = sanitizeValue(propertyValue, property, depth + 1, seen);
+                });
+                return result;
+            } finally {
+                seen.pop();
+            }
+        }
+
+        function sanitizeJsonText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            try {
+                return JSON.stringify(sanitizeValue(JSON.parse(input), '', 0, []), null, 2);
+            } catch (error) {
+                addWarning('sanitizer:invalid-json');
+                return '[REDACTED_INVALID_JSON]';
+            }
+        }
+
+        function sanitizeManifestText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            var lines = input.split(/\r\n|\r|\n/);
+            return lines.map(function (line) {
+                var trimmed = line.trim();
+                if (!trimmed) return '';
+                if (/^#EXT-X-(?:SESSION-)?KEY\s*:/i.test(trimmed)) {
+                    if (data) data.sanitization.redactions++;
+                    addWarning('sanitizer:drm-hls-removed');
+                    return trimmed.replace(/:.*/, ':REDACTED');
+                }
+                if (/^(?:https?:)?\/\//i.test(trimmed) || (!/^#/.test(trimmed) && /[/?]/.test(trimmed))) {
+                    return sanitizeUrl(trimmed);
+                }
+                var output = line.replace(/(URI\s*=\s*)(["'])(.*?)(\2)/ig, function (_, prefix, quote, uri) {
+                    return prefix + quote + sanitizeUrl(uri) + quote;
+                });
+                output = output.replace(/(https?:\/\/[^\s,"']+)/ig, function (url) {
+                    return sanitizeUrl(url);
+                });
+                return sanitizeInlineString(output, 'structure_line');
+            }).join('\n');
+        }
+
+        function sanitizeCueMarkup(line) {
+            var parts = String(line).split(/(<[^>]*>)/g);
+            var wroteCaption = false;
+            return parts.map(function (part) {
+                if (!part) return '';
+                if (/^<[^>]*>$/.test(part)) {
+                    if (/^<v(?:\s|>)/i.test(part)) return part.replace(/^<v[^>]*>/i, '<v SPEAKER>');
+                    return truncateUtf8(part.replace(/\s(?:id|data-[\w-]+)=(['"])[\s\S]*?\1/ig, ''), 240);
+                }
+                if (!part.trim()) return part;
+                if (wroteCaption) return '';
+                captionSequence++;
+                wroteCaption = true;
+                if (data) data.sanitization.redactions++;
+                return 'CAPTION_' + captionSequence;
+            }).join('');
+        }
+
+        function sanitizeWebVttText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            var lines = input.split(/\r\n|\r|\n/);
+            var inCue = false;
+            var inNote = false;
+            var structuralBlock = '';
+            return lines.map(function (line) {
+                var trimmed = line.trim();
+                if (!trimmed) {
+                    inCue = false;
+                    inNote = false;
+                    structuralBlock = '';
+                    return '';
+                }
+                if (/^WEBVTT(?:\s|$)/i.test(trimmed)) return 'WEBVTT';
+                if (/^NOTE(?:\s|$)/i.test(trimmed)) {
+                    inNote = true;
+                    textSequence++;
+                    if (data) data.sanitization.redactions++;
+                    return 'NOTE TEXT_' + textSequence;
+                }
+                if (inNote) return '';
+                if (/^(?:STYLE|REGION)$/i.test(trimmed)) {
+                    structuralBlock = trimmed.toUpperCase();
+                    return structuralBlock;
+                }
+                if (/-->/.test(line)) {
+                    inCue = true;
+                    structuralBlock = '';
+                    return sanitizeInlineString(line, 'cue_timing');
+                }
+                if (inCue) return sanitizeCueMarkup(line);
+                if (structuralBlock) {
+                    return sanitizeInlineString(line.replace(/url\((['"]?)(.*?)\1\)/ig, function (_, quote, url) {
+                        return 'url(' + quote + sanitizeUrl(url) + quote + ')';
+                    }), 'vtt_structure');
+                }
+                if (/^(?:X-TIMESTAMP-MAP|Kind|Language)\s*[:=]/i.test(trimmed)) return sanitizeManifestText(line);
+                textSequence++;
+                if (data) data.sanitization.redactions++;
+                return 'CUE_' + textSequence;
+            }).join('\n');
+        }
+
+        function sanitizeXmlTag(tag) {
+            return tag.replace(/\s([:\w.-]+)\s*=\s*(["'])([\s\S]*?)\2/g, function (_, attribute, quote, value) {
+                var safeValue;
+                var normalized = normalizedKey(attribute);
+                if (SENSITIVE_KEY.test(normalized)) safeValue = redact();
+                else if (URL_KEY.test(normalized) || /^(?:https?:)?\/\//i.test(value)) safeValue = sanitizeUrl(value);
+                else if (SESSION_KEY.test(normalized)) safeValue = mapSession(value);
+                else if (ID_KEY.test(normalized) && looksOpaque(value)) safeValue = mapToken(value);
+                else safeValue = sanitizeInlineString(value, attribute);
+                return ' ' + attribute + '=' + quote + safeValue + quote;
+            });
+        }
+
+        function sanitizeXmlText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            input = input.replace(/<!--[\s\S]*?-->/g, '<!-- REDACTED -->');
+            input = input.replace(/<(?:[\w.-]+:)?(?:pssh|pro|ContentProtection)\b[^>]*(?:\/>|>[\s\S]*?<\/(?:[\w.-]+:)?(?:pssh|pro|ContentProtection)\s*>)/gi, function () {
+                if (data) data.sanitization.redactions++;
+                addWarning('sanitizer:drm-xml-removed');
+                return '<!-- DRM_REMOVED -->';
+            });
+            input = input.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, function () {
+                captionSequence++;
+                if (data) data.sanitization.redactions++;
+                return '<![CDATA[CAPTION_' + captionSequence + ']]>';
+            });
+            return input.split(/(<[^>]+>)/g).map(function (part) {
+                if (!part) return '';
+                if (/^<[^>]+>$/.test(part)) return sanitizeXmlTag(part);
+                if (!part.trim()) return part;
+                captionSequence++;
+                if (data) data.sanitization.redactions++;
+                var leading = (part.match(/^\s*/) || [''])[0];
+                var trailing = (part.match(/\s*$/) || [''])[0];
+                return leading + 'CAPTION_' + captionSequence + trailing;
+            }).join('');
+        }
+
+        function sanitizeArtifactText(kind, text, format) {
+            var normalized = String(format || '').toLowerCase();
+            if (normalized === 'json' || /json/.test(normalized)) return sanitizeJsonText(text);
+            if (/^(?:vtt|webvtt)$/.test(normalized)) return sanitizeWebVttText(text);
+            if (/^(?:xml|ttml|dfxp|mpd)$/.test(normalized)) return sanitizeXmlText(text);
+            if (/^(?:m3u8|hls|manifest)$/.test(normalized) || /manifest|playlist/i.test(String(kind || ''))) {
+                return sanitizeManifestText(text);
+            }
+            addWarning('sanitizer:unsupported-artifact-format');
+            if (data) data.sanitization.redactions++;
+            return '[REDACTED_ARTIFACT]';
+        }
+
+        function reserve(value) {
+            var encoded = safeJson(value);
+            if (!encoded) return false;
+            var size = byteLength(encoded);
+            if (capturedBytes + size > limits.maxCaptureBytes) {
+                markTruncated('maxCaptureBytes');
+                return false;
+            }
+            capturedBytes += size;
+            return true;
+        }
+
+        function captureEvent(type, eventData, context, internal) {
+            if (state !== 'recording') return false;
+            if (data.events.length >= limits.maxEvents) {
+                markTruncated('maxEvents');
+                return false;
+            }
+            var safeType = sanitizeEventType(type);
+            var safeContext = context && typeof context === 'object' ? context : {};
+            var record = {
+                seq: ++eventSequence,
+                t: Math.max(0, Math.round(safeNow() - startedAtMs)),
+                type: safeType,
+                data: {}
+            };
+            if (safeContext.session != null && safeContext.session !== '') record.session = mapSession(safeContext.session);
+            if (eventData !== undefined) {
+                var sanitizedEventData = sanitizeValue(eventData, '', 0, []);
+                record.data = sanitizedEventData && typeof sanitizedEventData === 'object' && !Array.isArray(sanitizedEventData) ?
+                    sanitizedEventData : { value: sanitizedEventData };
+            }
+            if (!reserve(record)) return false;
+            data.events.push(record);
+            return true;
+        }
+
+        function captureSnapshot(kind, snapshotData, context) {
+            try {
+                if (state !== 'recording') return false;
+                if (data.snapshots.length >= limits.maxSnapshots) {
+                    markTruncated('maxSnapshots');
+                    return false;
+                }
+                var safeContext = context && typeof context === 'object' ? context : {};
+                var record = {
+                    seq: ++eventSequence,
+                    t: Math.max(0, Math.round(safeNow() - startedAtMs)),
+                    kind: sanitizeKind(kind, 'snapshot'),
+                    data: {}
+                };
+                var sanitizedSnapshotData = sanitizeValue(snapshotData, '', 0, []);
+                record.data = sanitizedSnapshotData && typeof sanitizedSnapshotData === 'object' && !Array.isArray(sanitizedSnapshotData) ?
+                    sanitizedSnapshotData : { value: sanitizedSnapshotData };
+                if (safeContext.session != null && safeContext.session !== '') record.session = mapSession(safeContext.session);
+                if (!reserve(record)) return false;
+                data.snapshots.push(record);
+                return true;
+            } catch (error) {
+                lastError = 'snapshot-failed';
+                return false;
+            }
+        }
+
+        function captureArtifact(kind, text, metadata) {
+            try {
+                if (state !== 'recording') return null;
+                var requestedKind = String(kind == null ? '' : kind);
+                var requestedFormat = metadata && typeof metadata === 'object' ? String(metadata.format || '') : '';
+                if (DRM_ARTIFACT.test(requestedKind) || DRM_ARTIFACT.test(requestedFormat)) {
+                    flagCriticalSecret('drm-artifact');
+                    return null;
+                }
+                if (PROHIBITED_ARTIFACT.test(requestedKind) || PROHIBITED_ARTIFACT.test(requestedFormat)) {
+                    addWarning('sanitizer:prohibited-artifact-ignored');
+                    return null;
+                }
+                if (data && data.artifacts && Object.keys(data.artifacts).length >= limits.maxArtifacts) {
+                    markTruncated('maxArtifacts');
+                    return null;
+                }
+                var source = String(text == null ? '' : text);
+                if (byteLength(source) > limits.maxArtifactBytes) markTruncated('maxArtifactBytes');
+                var safeMetadata = metadata && typeof metadata === 'object' ? metadata : {};
+                var format = sanitizeFormat(safeMetadata.format || '');
+                var sanitizedText = sanitizeArtifactText(kind, source, format);
+                if (byteLength(sanitizedText) > limits.maxArtifactBytes) {
+                    sanitizedText = truncateUtf8(sanitizedText, limits.maxArtifactBytes);
+                    markTruncated('maxArtifactBytes');
+                }
+                var identifier = 'ARTIFACT_' + (++artifactSequence);
+                var record = {
+                    kind: sanitizeKind(kind, 'artifact'),
+                    format: format,
+                    text: sanitizedText,
+                    byteLength: byteLength(sanitizedText)
+                };
+                if (safeMetadata.url) {
+                    var safeArtifactUrl = sanitizeUrl(safeMetadata.url);
+                    if (/^https?:\/\//i.test(safeArtifactUrl)) record.url = safeArtifactUrl;
+                }
+                var metadataCopy = {};
+                Object.keys(safeMetadata).forEach(function (key) {
+                    if (key !== 'url' && key !== 'format') metadataCopy[key] = safeMetadata[key];
+                });
+                if (Object.keys(metadataCopy).length) record.metadata = sanitizeValue(metadataCopy, '', 0, []);
+                if (!reserve(record)) return null;
+                data.artifacts[identifier] = record;
+                return identifier;
+            } catch (error) {
+                lastError = 'artifact-failed';
+                return null;
+            }
+        }
+
+        function sanitizePage() {
+            var supplied = options.page && typeof options.page === 'object' ? options.page : {};
+            var host = String(supplied.host || '');
+            var path = String(supplied.path || '');
+            if ((!host || !path) && options.pageUrl) {
+                try {
+                    var parsed = new URL(String(options.pageUrl));
+                    host = host || parsed.host;
+                    path = path || parsed.pathname;
+                } catch (error) {
+                    addWarning('sanitizer:invalid-page-url');
+                }
+            }
+            var safePath = sanitizeUrl(path || '/');
+            return {
+                host: truncateUtf8(host.replace(/[^A-Za-z0-9.:-]/g, ''), 255),
+                path: safePath.split('?')[0] || '/'
+            };
+        }
+
+        function start(context) {
+            try {
+                if (state === 'recording') return false;
+                state = 'idle';
+                data = null;
+                capturedBytes = 0;
+                artifactSequence = 0;
+                eventSequence = 0;
+                warningKeys = Object.create(null);
+                securityBlocked = false;
+                lastError = '';
+                resetMappings();
+                startedAtMs = safeNow();
+                data = {
+                    schemaVersion: 1,
+                    captureToolVersion: CAPTURE_TOOL_VERSION,
+                    service: sanitizeIdentifier(options.service, 'unknown'),
+                    scriptVersion: sanitizeIdentifier(options.scriptVersion, 'unknown'),
+                    page: {},
+                    capture: {
+                        startedAt: safeIsoTime(startedAtMs),
+                        durationMs: 0,
+                        truncated: false,
+                        limits: cloneJson(limits)
+                    },
+                    events: [],
+                    artifacts: {},
+                    snapshots: [],
+                    observed: {},
+                    sanitization: {
+                        version: SANITIZATION_VERSION,
+                        redactions: 0,
+                        warnings: []
+                    }
+                };
+                data.page = sanitizePage();
+                capturedBytes = byteLength(safeJson(data));
+                if (capturedBytes > limits.maxCaptureBytes) {
+                    data = null;
+                    lastError = 'capture-limit-too-small';
+                    return false;
+                }
+                state = 'recording';
+                captureEvent('capture.start', context || {}, null, true);
+                return true;
+            } catch (error) {
+                state = 'idle';
+                data = null;
+                lastError = 'start-failed';
+                return false;
+            }
+        }
+
+        function stop(observed) {
+            try {
+                if (state !== 'recording') return false;
+                if (observed !== undefined) {
+                    var safeObserved = sanitizeValue(observed, '', 0, []);
+                    data.observed = safeObserved && typeof safeObserved === 'object' && !Array.isArray(safeObserved) ?
+                        safeObserved : { value: safeObserved };
+                }
+                captureEvent('capture.stop', {}, null, true);
+                data.capture.durationMs = Math.max(0, Math.round(safeNow() - startedAtMs));
+                state = 'stopped';
+                return true;
+            } catch (error) {
+                state = data ? 'stopped' : 'idle';
+                lastError = 'stop-failed';
+                return false;
+            }
+        }
+
+        function setObserved(observed) {
+            try {
+                if (state !== 'recording' || !data) return false;
+                var safeObserved = sanitizeValue(observed, '', 0, []);
+                safeObserved = safeObserved && typeof safeObserved === 'object' && !Array.isArray(safeObserved) ?
+                    safeObserved : { value: safeObserved };
+                if (!reserve(safeObserved)) return false;
+                data.observed = safeObserved;
+                return true;
+            } catch (error) {
+                lastError = 'observed-failed';
+                return false;
+            }
+        }
+
+        function clear() {
+            try {
+                data = null;
+                state = 'idle';
+                startedAtMs = 0;
+                capturedBytes = 0;
+                artifactSequence = 0;
+                eventSequence = 0;
+                warningKeys = Object.create(null);
+                securityBlocked = false;
+                lastError = '';
+                resetMappings();
+                return true;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function scanExport(serialized) {
+            return /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(serialized) ||
+                /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(serialized) ||
+                /\bAKIA[0-9A-Z]{16}\b/.test(serialized) ||
+                /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(serialized) ||
+                /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(serialized) ||
+                /"(?:authorization|cookie|set-cookie)"\s*:\s*"(?!REDACTED(?:_SECRET)?")[^"]+"/i.test(serialized) ||
+                /[?&](?:token|sig|signature|policy|key|auth|credential)=(?!REDACTED(?:%20|\b))[^&#"\s]+/i.test(serialized) ||
+                /(?:^|[\/~;,])(?:dvt\d*|exp(?:ires)?|signature|sig|policy|tokens?|auth(?:orization)?|credentials?|psid|playback_?session_?id)=(?!REDACTED(?:%20|\b)|TOKEN_[1-9]\d*(?:[\/~;,]|$))[^\s"'<>]*/im.test(serialized);
+        }
+
+        function compactExport(result) {
+            var serialized = safeJson(result);
+            if (!serialized) return null;
+            if (byteLength(serialized) <= limits.maxCaptureBytes) return result;
+            result.capture.truncated = true;
+            if (result.sanitization.warnings.indexOf('limit:export-size') < 0) result.sanitization.warnings.push('limit:export-size');
+            var artifactIds = Object.keys(result.artifacts).reverse();
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && artifactIds.length) {
+                delete result.artifacts[artifactIds.shift()];
+            }
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && result.snapshots.length) result.snapshots.pop();
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && result.events.length > 1) result.events.pop();
+            return byteLength(safeJson(result)) <= limits.maxCaptureBytes ? result : null;
+        }
+
+        function exportObject() {
+            try {
+                if (!data || state === 'idle') return null;
+                var result = cloneJson(data);
+                if (!result) {
+                    lastError = 'export-serialization-failed';
+                    return null;
+                }
+                if (state === 'recording') result.capture.durationMs = Math.max(0, Math.round(safeNow() - startedAtMs));
+                result = compactExport(result);
+                if (!result) {
+                    lastError = 'export-size-limit';
+                    return null;
+                }
+                var serialized = safeJson(result);
+                if (securityBlocked || scanExport(serialized)) {
+                    securityBlocked = true;
+                    lastError = 'export-blocked-sensitive-data';
+                    return null;
+                }
+                return result;
+            } catch (error) {
+                lastError = 'export-failed';
+                return null;
+            }
+        }
+
+        function exportBlob(pretty) {
+            try {
+                var result = exportObject();
+                if (!result) return null;
+                var BlobConstructor = options.Blob;
+                if (!BlobConstructor && typeof Blob !== 'undefined') BlobConstructor = Blob;
+                if (typeof BlobConstructor !== 'function') {
+                    lastError = 'blob-unavailable';
+                    return null;
+                }
+                return new BlobConstructor([JSON.stringify(result, null, pretty === false ? 0 : 2)], {
+                    type: 'application/json;charset=utf-8'
+                });
+            } catch (error) {
+                lastError = 'blob-export-failed';
+                return null;
+            }
+        }
+
+        function status() {
+            try {
+                return {
+                    state: state,
+                    recording: state === 'recording',
+                    eventCount: data ? data.events.length : 0,
+                    artifactCount: data ? Object.keys(data.artifacts).length : 0,
+                    snapshotCount: data ? data.snapshots.length : 0,
+                    truncated: !!(data && data.capture.truncated),
+                    exportBlocked: securityBlocked,
+                    lastError: lastError
+                };
+            } catch (error) {
+                return {
+                    state: state,
+                    recording: false,
+                    eventCount: 0,
+                    artifactCount: 0,
+                    snapshotCount: 0,
+                    truncated: false,
+                    exportBlocked: true,
+                    lastError: 'status-failed'
+                };
+            }
+        }
+
+        return {
+            start: start,
+            stop: stop,
+            clear: clear,
+            event: function (type, eventData, context) {
+                try {
+                    return captureEvent(type, eventData, context, false);
+                } catch (error) {
+                    lastError = 'event-failed';
+                    return false;
+                }
+            },
+            artifact: captureArtifact,
+            snapshot: captureSnapshot,
+            setObserved: setObserved,
+            exportObject: exportObject,
+            exportBlob: exportBlob,
+            status: status
+        };
+    }
+    // END SHARED FIXTURE CAPTURE CORE
+
+    var fixtureCaptureEnabled = consumeFixtureCaptureArm();
+    var fixtureCapture = fixtureCaptureEnabled ? createFixtureCapture({
+        service: 'disney',
+        scriptVersion: currentUserscriptVersion(),
+        page: {
+            host: location.host,
+            path: location.pathname || '/'
+        },
+        Blob: typeof Blob === 'function' ? Blob : null
+    }) : null;
+    var fixtureCaptureRecording = false;
+    var fixtureSnapshotValues = fixtureCaptureEnabled ? Object.create(null) : null;
+    var fixtureMetadataArtifactCache = fixtureCaptureEnabled ? [] : null;
+
     init();
+
+    function currentUserscriptVersion() {
+        try {
+            if (typeof GM_info === 'object' && GM_info && GM_info.script &&
+                typeof GM_info.script.version === 'string' && GM_info.script.version) {
+                return GM_info.script.version;
+            }
+        } catch (err) {}
+        return 'unknown';
+    }
 
     function init() {
         if (state.initialized) return;
         state.initialized = true;
 
+        installFixtureCaptureCommands();
         installStyles();
         installNavigationHooks();
         tick();
@@ -90,10 +1026,325 @@
         debuglog('Script loaded');
     }
 
+    function consumeFixtureCaptureArm() {
+        try {
+            if (window.top !== window) return false;
+            var storage = window.sessionStorage;
+            var rawExpiry = storage.getItem(FIXTURE_CAPTURE_ARM_KEY);
+            if (!rawExpiry) return false;
+            storage.removeItem(FIXTURE_CAPTURE_ARM_KEY);
+            var expiresAt = Number(rawExpiry);
+            var remainingMs = expiresAt - Date.now();
+            return isFinite(expiresAt) && remainingMs >= 0 && remainingMs <= FIXTURE_CAPTURE_ARM_TTL_MS;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function armFixtureCaptureAndReload() {
+        try {
+            if (window.top !== window) return false;
+            window.sessionStorage.setItem(FIXTURE_CAPTURE_ARM_KEY, String(Date.now() + FIXTURE_CAPTURE_ARM_TTL_MS));
+            location.reload();
+            return true;
+        } catch (err) {
+            debuglog('Could not arm fixture capture for this tab.');
+            return false;
+        }
+    }
+
+    function installFixtureCaptureCommands() {
+        try {
+            if (window.top !== window) return;
+        } catch (err) {
+            return;
+        }
+        if (fixtureCapture) startFixtureCapture('menu-armed-reload');
+        if (typeof GM_registerMenuCommand !== 'function') return;
+
+        try {
+            if (!fixtureCapture) {
+                GM_registerMenuCommand('[Fixture] Start capture and reload this tab', armFixtureCaptureAndReload);
+                return;
+            }
+            GM_registerMenuCommand('[Fixture] Start/restart capture', function () {
+                startFixtureCapture('menu-restart');
+                printFixtureCaptureStatus();
+            });
+            GM_registerMenuCommand('[Fixture] Stop and export', function () {
+                exportFixtureCapture(true);
+            });
+            GM_registerMenuCommand('[Fixture] Export snapshot', function () {
+                exportFixtureCapture(false);
+            });
+            GM_registerMenuCommand('[Fixture] Clear capture', function () {
+                fixtureCapture.clear();
+                fixtureCaptureRecording = false;
+                fixtureSnapshotValues = Object.create(null);
+                fixtureMetadataArtifactCache = [];
+                printFixtureCaptureStatus();
+            });
+            GM_registerMenuCommand('[Fixture] Print status', printFixtureCaptureStatus);
+        } catch (err) {
+            debuglog('Could not register fixture capture commands.');
+        }
+    }
+
+    function startFixtureCapture(reason) {
+        if (!fixtureCapture) return false;
+        try {
+            fixtureCapture.clear();
+            fixtureSnapshotValues = Object.create(null);
+            fixtureMetadataArtifactCache = [];
+            fixtureCaptureRecording = fixtureCapture.start({ reason: reason || 'manual' });
+            return fixtureCaptureRecording;
+        } catch (err) {
+            fixtureCaptureRecording = false;
+            return false;
+        }
+    }
+
+    function fixtureObservedState() {
+        return {
+            metadata: {
+                title: state.mediaTitle || '',
+                seasonNumber: state.seasonNumber,
+                episodeNumber: state.episodeNumber,
+                episodeTag: state.episodeTag || '',
+                metadataTitle: state.episodeMetadataTitle || '',
+                mediaKind: state.mediaKind || 'unknown',
+                ready: isPlaybackMetadataReady(),
+                source: state.metadataSource || '',
+                pendingEpisodeTagPresent: !!state.pendingEpisodeTag,
+                playbackResponseSeen: !!state.playbackMetadataResponseSeen
+            },
+            outputFilename: state.outputFilename || '',
+            status: state.status || '',
+            lastErrorCode: fixtureErrorCode(state.lastError),
+            tracks: state.langs.map(fixtureTrackSummary)
+        };
+    }
+
+    function exportFixtureCapture(stopFirst) {
+        if (!fixtureCapture) return;
+        try {
+            if (fixtureCaptureRecording) {
+                if (stopFirst) {
+                    fixtureCapture.stop(fixtureObservedState());
+                    fixtureCaptureRecording = false;
+                } else {
+                    fixtureCapture.setObserved(fixtureObservedState());
+                }
+            }
+            var blob = fixtureCapture.exportBlob(true);
+            if (!blob) {
+                printFixtureCaptureStatus();
+                return;
+            }
+            var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            saveAs(blob, 'disney-' + timestamp + '.fixture.local.json');
+            printFixtureCaptureStatus();
+        } catch (err) {
+            debuglog('Fixture export failed.');
+        }
+    }
+
+    function printFixtureCaptureStatus() {
+        if (!fixtureCapture) return;
+        try { console.info(LOG_PREFIX + ' Fixture capture status', fixtureCapture.status()); } catch (err) {}
+    }
+
+    function captureDisney(type, sessionId, payloadFactory) {
+        if (!fixtureCaptureRecording || !fixtureCapture) return false;
+        try {
+            var payload = typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {});
+            return fixtureCapture.event(type, payload, { session: sessionId || '' });
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function captureDisneyArtifact(kind, text, metadataFactory) {
+        if (!fixtureCaptureRecording || !fixtureCapture) return null;
+        try {
+            if (kind === 'metadata-structure' && fixtureMetadataArtifactCache) {
+                for (var index = 0; index < fixtureMetadataArtifactCache.length; index++) {
+                    if (fixtureMetadataArtifactCache[index].text === text) return fixtureMetadataArtifactCache[index].artifact;
+                }
+            }
+            var metadata = typeof metadataFactory === 'function' ? metadataFactory() : (metadataFactory || {});
+            var artifactId = fixtureCapture.artifact(kind, text, metadata);
+            if (artifactId && kind === 'metadata-structure' && fixtureMetadataArtifactCache) {
+                fixtureMetadataArtifactCache.push({ text: text, artifact: artifactId });
+            }
+            return artifactId;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    function captureDisneySnapshot(kind, sessionId, payloadFactory) {
+        if (!fixtureCaptureRecording || !fixtureCapture) return false;
+        try {
+            var payload = typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {});
+            var dedupeKey = String(sessionId || '') + '\n' + JSON.stringify(payload);
+            if (fixtureSnapshotValues[kind] === dedupeKey) return false;
+            fixtureSnapshotValues[kind] = dedupeKey;
+            return fixtureCapture.snapshot(kind, payload, { session: sessionId || '' });
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function fixtureTrackSummary(track) {
+        track = track || {};
+        return {
+            name: track.NAME || '',
+            language: track.LANGUAGE || '',
+            forced: /^(?:YES|true|1)$/i.test(String(track.FORCED || '')),
+            cc: /sdh|caption|transcribes-spoken-dialog/i.test(String(track.CHARACTERISTICS || '') + ' ' + String(track.NAME || '')),
+            source: track.source || '',
+            uri: track.URI || '',
+            segmentCount: track.segments && track.segments.length ? track.segments.length : 0
+        };
+    }
+
+    function fixtureMetadataState() {
+        return {
+            title: state.mediaTitle || '',
+            seasonNumber: state.seasonNumber,
+            episodeNumber: state.episodeNumber,
+            episodeTag: state.episodeTag || '',
+            metadataTitle: state.episodeMetadataTitle || '',
+            mediaKind: state.mediaKind || 'unknown',
+            ready: isPlaybackMetadataReady(),
+            source: state.metadataSource || '',
+            pendingEpisodeTagPresent: !!state.pendingEpisodeTag,
+            playbackResponseSeen: !!state.playbackMetadataResponseSeen
+        };
+    }
+
+    function fixtureMetadataProjection(text) {
+        if (!fixtureCaptureRecording || typeof text !== 'string' || !text || text.length > 500000) return '';
+        var source;
+        try { source = JSON.parse(text); } catch (err) { return ''; }
+        var keySequence = 0;
+        var stringSequence = 0;
+
+        function normalizedKey(value) {
+            return String(value || '')
+                .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+                .replace(/[^a-z0-9]+/gi, '_')
+                .toLowerCase();
+        }
+
+        function isSiteConfigOnlyResponse(value) {
+            if (!value || typeof value !== 'object' || Array.isArray(value) ||
+                !value.data || typeof value.data !== 'object' || Array.isArray(value.data)) return false;
+            var operationKeys = Object.keys(value.data).filter(function (key) {
+                return value.data[key] !== undefined && value.data[key] !== null;
+            });
+            return operationKeys.length === 1 && /^(?:get_)?site_config$/.test(normalizedKey(operationKeys[0]));
+        }
+
+        if (isSiteConfigOnlyResponse(source)) return '';
+
+        function projectedKey(value) {
+            var key = String(value || '');
+            if (/^[A-Za-z_$][A-Za-z0-9_$.-]{0,79}$/.test(key) &&
+                !/@/.test(key) && !/^[A-Fa-f0-9]{16,}$/.test(key) && !/^[A-Za-z0-9_-]{32,}$/.test(key)) return key;
+            keySequence++;
+            return 'FIELD_' + keySequence;
+        }
+
+        function placeholderString(value, key, path) {
+            var normalized = normalizedKey(key);
+            var normalizedPath = normalizedKey(path || key);
+            if (/(?:^|_)(?:authorization|cookies?|password|passwd|secrets?|tokens?|signatures?|credentials?|api_keys?|private_keys?)(?:$|_)/.test(normalizedPath)) {
+                return 'REDACTED';
+            }
+            if (/(?:^|_)(?:accounts?|profiles?|subscribers?|customers?|users?|viewers?|persons?|members?)(?:$|_)/.test(normalizedPath) &&
+                /(?:^|_)(?:id|name|email|phone|address|birth|gender)(?:$|_)/.test(normalizedPath)) {
+                return 'REDACTED';
+            }
+            if (/(?:^|_)(?:url|uri|href|src|manifest|playlist)(?:$|_)/.test(normalized)) return 'URL_001';
+            if (/(?:^|_)(?:id|(?:movie|content|playable|episode|asset|account|profile|subscriber|customer|user|viewer|device)_?id)(?:$|_)/.test(normalized)) return 'TOKEN_001';
+            var episodeTag = value ? seasonEpisodeTag(value) : '';
+            if (episodeTag) return episodeTag;
+            if (/(?:^|_)(?:content|media|program|entity)_?type(?:$|_)/.test(normalized) &&
+                /^(?:movie|film|feature|episode)$/i.test(value)) return String(value).toLowerCase();
+            if (/(?:season|episode)/.test(normalizedPath) && /^\d{1,3}$/.test(value)) return value;
+            if (/(?:^|_)(?:language|locale)(?:$|_)/.test(normalized) && /^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2})?$/.test(value)) return value;
+            if (/(?:series|show|program|collection|franchise)/.test(normalizedPath) && /(?:title|name)/.test(normalized)) return 'SHOW_001';
+            stringSequence++;
+            return 'STRING_' + stringSequence;
+        }
+
+        function project(value, key, path, depth) {
+            if (value == null || typeof value === 'boolean') return value;
+            if (typeof value === 'string') return placeholderString(value, key, path);
+            var normalizedPath = normalizedKey(path || key);
+            if (typeof value === 'number') {
+                return /(?:season|episode)/.test(normalizedPath) && /(?:number|sequence|seq|index|position)/.test(normalizedKey(key)) &&
+                    isFinite(value) && value > 0 && value < 1000 ? value : 0;
+            }
+            if (typeof value !== 'object') return null;
+            if (depth >= 10) return '[MAX_DEPTH]';
+            if (Array.isArray(value)) {
+                return value.slice(0, 50).map(function (item) {
+                    return project(item, key, path, depth + 1);
+                });
+            }
+            var result = Object.create(null);
+            Object.keys(value).slice(0, 100).forEach(function (property) {
+                if (/^(?:get_)?site_config$/.test(normalizedKey(property))) return;
+                var safeProperty = projectedKey(property);
+                while (Object.prototype.hasOwnProperty.call(result, safeProperty)) safeProperty += '_';
+                result[safeProperty] = project(value[property], property, path ? path + '_' + property : property, depth + 1);
+            });
+            return result;
+        }
+
+        function hasProjectedContent(value) {
+            if (value == null) return false;
+            if (Array.isArray(value)) return value.some(hasProjectedContent);
+            if (typeof value === 'object') return Object.keys(value).some(function (key) {
+                return hasProjectedContent(value[key]);
+            });
+            return true;
+        }
+
+        try {
+            var projection = project(source, '', '', 0);
+            return hasProjectedContent(projection) ? JSON.stringify(projection, null, 2) : '';
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function fixtureErrorCode(error) {
+        var value = String(error && error.message ? error.message : (error || ''));
+        if (!value) return '';
+        if (/stale|playback changed/i.test(value)) return 'stale-session';
+        if (/timeout/i.test(value)) return 'timeout';
+        if (/network/i.test(value)) return 'network';
+        if (/HTTP\s+\d+/i.test(value)) return 'http';
+        if (/retry after/i.test(value)) return 'retry-after';
+        if (/No subtitle|No VTT|empty/i.test(value)) return 'empty-output';
+        return 'unknown';
+    }
+
     function tick() {
         var playbackPage = isPlaybackPage();
         var playbackKey = playbackPage ? location.href.split('#')[0] : '';
         if (state.oldlocation !== playbackKey) {
+            captureDisney('navigation.changed', state.playbackSessionId, function () {
+                return {
+                    hadPreviousPlayback: !!state.oldlocation,
+                    playback: playbackPage,
+                    path: location.pathname || '/'
+                };
+            });
             state.oldlocation = playbackKey;
             if (playbackPage) {
                 beginPlaybackSession();
@@ -101,6 +1352,7 @@
                 resetSubtitleTracks();
                 resetShadowMetadataObservers();
                 resetMediaMetadata();
+                beginPlaybackMetadataSettling();
                 refreshMediaMetadataFromDom();
                 scanPerformanceEntries(true);
                 state.lastPerformanceScanAt = Date.now();
@@ -162,7 +1414,9 @@
     }
 
     function beginPlaybackSession(lookbackMs) {
+        var previousSessionId = state.playbackSessionId;
         invalidateDownloadOperation();
+        cancelPlaybackMetadataSettling();
         var requestedLookbackMs = Number(lookbackMs);
         var initialLookbackMs = isFinite(requestedLookbackMs) && requestedLookbackMs >= 0
             ? Math.min(requestedLookbackMs, 5000)
@@ -170,17 +1424,74 @@
         state.playbackSessionSequence++;
         state.playbackSessionId = 'disney:' + state.playbackSessionSequence + ':' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2);
         state.playbackSessionStartedAt = Math.max(0, performanceNow() - initialLookbackMs);
+        captureDisney('session.start', state.playbackSessionId, function () {
+            return {
+                previous_session: previousSessionId || '',
+                lookbackMs: initialLookbackMs,
+                sequence: state.playbackSessionSequence
+            };
+        });
     }
 
     function invalidatePlaybackSession() {
         invalidateDownloadOperation();
+        cancelPlaybackMetadataSettling();
         if (!state.playbackSessionId) return;
+        captureDisney('session.invalidate', state.playbackSessionId, function () {
+            return { reason: 'left-playback' };
+        });
         state.playbackSessionId = '';
         state.playbackSessionStartedAt = performanceNow();
     }
 
     function isPlaybackSessionCurrent(sessionId) {
         return !!sessionId && sessionId === state.playbackSessionId;
+    }
+
+    function isPlaybackMetadataSettling() {
+        return !!state.playbackMetadataSettlingUntil && Date.now() < state.playbackMetadataSettlingUntil;
+    }
+
+    function isPlaybackMetadataReady() {
+        if (!state.metadataReady || !state.mediaTitle) return false;
+        if (state.mediaKind === 'movie') return !state.episodeTag;
+        if (state.mediaKind === 'episode') return !!state.episodeTag;
+        return false;
+    }
+
+    function playbackMetadataWaitStatus() {
+        if (state.mediaKind === 'episode' || state.pendingEpisodeTag) return 'Waiting for current episode title...';
+        if (state.playbackMetadataResponseSeen) return 'Waiting for current playback title...';
+        return 'Waiting for current playback metadata...';
+    }
+
+    function cancelPlaybackMetadataSettling() {
+        if (state.playbackMetadataSettlingTimer) clearTimeout(state.playbackMetadataSettlingTimer);
+        state.playbackMetadataSettlingTimer = null;
+        state.playbackMetadataSettlingUntil = 0;
+    }
+
+    function beginPlaybackMetadataSettling() {
+        cancelPlaybackMetadataSettling();
+        var sessionId = state.playbackSessionId;
+        state.playbackMetadataSettlingUntil = Date.now() + PLAYBACK_METADATA_SETTLE_MS;
+        state.playbackMetadataSettlingTimer = setTimeout(function () {
+            state.playbackMetadataSettlingTimer = null;
+            state.playbackMetadataSettlingUntil = 0;
+            if (!isPlaybackPage() || !isPlaybackSessionCurrent(sessionId)) return;
+            refreshMediaMetadataFromDom();
+            if (!isPlaybackMetadataReady() && !state.playbackMetadataUnresolvedLogged) {
+                state.playbackMetadataUnresolvedLogged = true;
+                captureDisney('metadata.unresolved', sessionId, function () {
+                    return {
+                        mediaKind: state.mediaKind || 'unknown',
+                        pendingEpisodeTagPresent: !!state.pendingEpisodeTag,
+                        playbackResponseSeen: !!state.playbackMetadataResponseSeen
+                    };
+                });
+            }
+            updateUi();
+        }, PLAYBACK_METADATA_SETTLE_MS);
     }
 
     function scheduleUi() {
@@ -352,14 +1663,16 @@
 
         count.textContent = state.langs.length + (state.langs.length === 1 ? ' track' : ' tracks');
         selectedName.textContent = findTrackByKey(select.value) ? findTrackByKey(select.value).NAME : 'none';
-        filename.textContent = state.wait && state.outputFilename ? state.outputFilename : previewSelectedFilename(select.value);
+        var previewFilename = state.wait && state.outputFilename ? state.outputFilename : previewSelectedFilename(select.value);
+        var metadataReady = isPlaybackMetadataReady();
+        filename.textContent = previewFilename || playbackMetadataWaitStatus();
         updateProgressElement(progress, progressText);
-        status.textContent = state.lastError || state.status;
-        setMenuItemDisabled(download, state.wait || state.langs.length === 0);
-        setMenuItemDisabled(downloadAll, state.wait || state.langs.length === 0);
-        setMenuItemDisabled(downloadEn, state.wait || !preferredEn);
-        setMenuItemDisabled(downloadKo, state.wait || !preferredKo);
-        setMenuItemDisabled(downloadEnKo, state.wait || !preferredEn || !preferredKo);
+        status.textContent = state.lastError || (metadataReady ? state.status : playbackMetadataWaitStatus());
+        setMenuItemDisabled(download, state.wait || !metadataReady || state.langs.length === 0);
+        setMenuItemDisabled(downloadAll, state.wait || !metadataReady || state.langs.length === 0);
+        setMenuItemDisabled(downloadEn, state.wait || !metadataReady || !preferredEn);
+        setMenuItemDisabled(downloadKo, state.wait || !metadataReady || !preferredKo);
+        setMenuItemDisabled(downloadEnKo, state.wait || !metadataReady || !preferredEn || !preferredKo);
         downloadEn.title = preferredEn ? preferredEn.NAME : 'No English subtitle detected yet';
         downloadKo.title = preferredKo ? preferredKo.NAME : 'No Korean subtitle detected yet';
         downloadEnKo.title = preferredEn && preferredKo ? preferredEn.NAME + ' + ' + preferredKo.NAME : 'English and Korean subtitles are both required';
@@ -575,6 +1888,9 @@
         state.seenResourceUrls[url] = true;
 
         if (/\.m3u8(?:[?#]|$)/i.test(url)) {
+            captureDisney('resource.observed', sessionId, function () {
+                return { source: source || 'unknown', kind: 'hls-manifest', url: url };
+            });
             queueManifest(url, source, sessionId);
         }
     }
@@ -595,16 +1911,119 @@
         if (text.length > 2000000) return;
 
         var metadata = extractMetadataFromText(text);
+        var metadataProjection = fixtureCaptureRecording ? fixtureMetadataProjection(text) : '';
+        var metadataArtifactId = metadataProjection ? captureDisneyArtifact('metadata-structure', metadataProjection, function () {
+            return { format: 'json', url: url };
+        }) : null;
+        captureDisney('metadata.observed', sessionId, function () {
+            return { source: 'network-response', url: url, artifact: metadataArtifactId || '', candidate: metadata };
+        });
         var hasEpisodeMetadata = metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber);
+        if (isTrustedDisneyPlaybackMetadataUrl(url)) {
+            if (!metadata.structuredResponse) {
+                captureDisney('metadata.rejected', sessionId, function () {
+                    return { source: 'playback-response', reason: 'invalid-structured-response' };
+                });
+                return;
+            }
+            rememberPlaybackResponseMetadata(metadata, sessionId, url);
+            updateUi();
+            return;
+        }
         if (hasEpisodeMetadata && !metadata.title) {
-            delete metadata.episodeTag;
-            delete metadata.seasonNumber;
-            delete metadata.episodeNumber;
+            captureDisney('metadata.rejected', sessionId, function () {
+                return { source: 'network-response', reason: 'unscoped-episode-metadata', candidate: metadata };
+            });
             debuglog('Ignored episode metadata without a matching series title from ' + shortUrl(url));
+            return;
         }
-        if (metadata.title || metadata.episodeTag || (metadata.seasonNumber && metadata.episodeNumber)) {
-            updateMediaMetadata(metadata);
+        if (metadata.title && hasEpisodeMetadata && !isPlaybackMetadataSettling()) {
+            var activeTitle = activePlaybackTitle(activePlaybackContainer());
+            if (activeTitle && mediaTitlesMatch(activeTitle, metadata.title)) {
+                acceptPlaybackMetadata({
+                    title: activeTitle,
+                    episodeTag: episodeTagFromMetadata(metadata)
+                }, 'episode', 'matched-network-response', sessionId);
+                updateUi();
+            }
         }
+    }
+
+    function isTrustedDisneyPlaybackMetadataUrl(rawUrl) {
+        var value = normalizeUrl(rawUrl);
+        if (!value) return false;
+        try {
+            var parsed = new URL(value);
+            var trustedHost = /(?:^|\.)(?:bamgrid\.com|dssedge\.com|dssott\.com)$/i.test(parsed.hostname || '');
+            return trustedHost && /^\/v\d+\/playback\/ctr-regular(?:\/|$)/i.test(parsed.pathname || '');
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function episodeTagFromMetadata(metadata) {
+        if (!metadata) return '';
+        if (metadata.episodeTag) return metadata.episodeTag;
+        if (metadata.seasonNumber && metadata.episodeNumber) {
+            return formatSeasonEpisode(metadata.seasonNumber, metadata.episodeNumber);
+        }
+        return '';
+    }
+
+    function rememberPlaybackResponseMetadata(metadata, sessionId, url) {
+        if (!isPlaybackSessionCurrent(sessionId) || !isTrustedDisneyPlaybackMetadataUrl(url)) return false;
+        var episodeTag = episodeTagFromMetadata(metadata);
+        var responseKind = (episodeTag || (metadata && metadata.mediaKind === 'episode')) ? 'episode' : 'movie';
+        if (episodeTag && isPlaybackMetadataReady() && state.mediaKind === 'episode' && state.episodeTag && state.episodeTag !== episodeTag) {
+            captureDisney('metadata.changed', sessionId, function () {
+                return {
+                    source: 'playback-response',
+                    before: fixtureMetadataState(),
+                    candidate: { episodeTag: episodeTag, mediaKind: 'episode' }
+                };
+            });
+            sessionId = restartPlaybackSessionForMetadataChange();
+        }
+        state.playbackMetadataResponseSeen = true;
+        if (responseKind === 'episode') {
+            var changed = state.pendingEpisodeTag !== episodeTag || state.mediaKind !== 'episode';
+            state.mediaKind = 'episode';
+            if (episodeTag) state.pendingEpisodeTag = episodeTag;
+            if (changed) {
+                captureDisney('metadata.pending', sessionId, function () {
+                    return {
+                        source: 'playback-response',
+                        mediaKind: 'episode',
+                        episodeTag: episodeTag || '',
+                        episodeTagPresent: !!episodeTag
+                    };
+                });
+            }
+        } else if (state.mediaKind === 'unknown') {
+            state.mediaKind = 'movie';
+            captureDisney('metadata.classified', sessionId, function () {
+                return { source: 'playback-response', mediaKind: 'movie' };
+            });
+        }
+        return resolvePendingPlaybackMetadata('playback-response+active-player', sessionId);
+    }
+
+    function resolvePendingPlaybackMetadata(source, sessionId) {
+        sessionId = sessionId || state.playbackSessionId;
+        if (!isPlaybackSessionCurrent(sessionId) || isPlaybackMetadataSettling()) return false;
+        var container = activePlaybackContainer();
+        var title = activePlaybackTitle(container);
+        if (!container || !title) return false;
+        if (state.mediaKind === 'episode' && state.pendingEpisodeTag) {
+            return acceptPlaybackMetadata({
+                title: title,
+                episodeTag: state.pendingEpisodeTag
+            }, 'episode', source || 'active-player+playback-response', sessionId);
+        }
+        if (state.mediaKind === 'movie' && state.playbackMetadataResponseSeen) {
+            return acceptPlaybackMetadata({ title: title }, 'movie', source || 'active-player+playback-response', sessionId);
+        }
+        return false;
     }
 
     function shouldInspectMetadataUrl(url) {
@@ -621,7 +2040,9 @@
         if (tag) metadata.episodeTag = tag;
 
         try {
-            collectMetadataFromJson(JSON.parse(text), metadata, '', 0);
+            var parsed = JSON.parse(text);
+            metadata.structuredResponse = true;
+            collectMetadataFromJson(parsed, metadata, '', 0);
         } catch (err) {}
 
         return metadata;
@@ -666,6 +2087,11 @@
                 var tag = seasonEpisodeTag(child);
                 if (tag && !metadata.episodeTag) metadata.episodeTag = tag;
 
+                if (!metadata.mediaKind && /^(?:contenttype|programtype|entitytype|mediatype)$/.test(lower)) {
+                    if (/episode|episodic/i.test(child)) metadata.mediaKind = 'episode';
+                    if (/movie|film|feature/i.test(child)) metadata.mediaKind = 'movie';
+                }
+
                 if (!metadata.title && /(series|show|program|collection|franchise).*(title|name)|(?:title|name).*(series|show|program|collection|franchise)/.test(nextPath)) {
                     metadata.title = child;
                 }
@@ -673,6 +2099,54 @@
 
             collectMetadataFromJson(child, metadata, nextPath, depth + 1);
         });
+    }
+
+    function acceptPlaybackMetadata(metadata, mediaKind, source, sessionId) {
+        sessionId = sessionId || state.playbackSessionId;
+        if (!isPlaybackSessionCurrent(sessionId) || !metadata) return false;
+        var title = metadata.title ? cleanDisplayTitle(metadata.title) : '';
+        var episodeTag = episodeTagFromMetadata(metadata);
+        mediaKind = mediaKind === 'episode' || episodeTag ? 'episode' : (mediaKind === 'movie' ? 'movie' : 'unknown');
+        if (!title || mediaKind === 'unknown' || (mediaKind === 'episode' && !episodeTag)) return false;
+
+        var alreadyReady = isPlaybackMetadataReady() && state.mediaKind === mediaKind &&
+            mediaTitlesMatch(state.mediaTitle, title) && (mediaKind !== 'episode' || state.episodeTag === episodeTag);
+        if (alreadyReady) return true;
+
+        var previousMetadata = fixtureCaptureRecording ? fixtureMetadataState() : null;
+        if (mediaKind === 'movie') {
+            state.seasonNumber = null;
+            state.episodeNumber = null;
+            state.episodeTag = '';
+            state.episodeMetadataTitle = '';
+            state.pendingEpisodeTag = '';
+        }
+        updateMediaMetadata({ title: title, episodeTag: episodeTag });
+        state.mediaKind = mediaKind;
+        state.metadataReady = mediaKind === 'movie' ? !!state.mediaTitle : !!(state.mediaTitle && state.episodeTag);
+        state.metadataSource = source || 'unknown';
+        if (!state.metadataReady) return false;
+        if (state.lastError === 'Current playback metadata is not ready yet.') state.lastError = '';
+        cancelPlaybackMetadataSettling();
+        captureDisney('metadata.accepted', sessionId, function () {
+            return {
+                source: state.metadataSource,
+                candidate: { title: title, episodeTag: episodeTag || '', mediaKind: mediaKind },
+                before: previousMetadata || {},
+                after: fixtureMetadataState()
+            };
+        });
+        if (/playback-response/.test(state.metadataSource)) {
+            captureDisney('metadata.resolved', sessionId, function () {
+                return {
+                    source: state.metadataSource,
+                    mediaKind: mediaKind,
+                    title: state.mediaTitle || '',
+                    episodeTag: state.episodeTag || ''
+                };
+            });
+        }
+        return true;
     }
 
     function updateMediaMetadata(metadata) {
@@ -703,6 +2177,12 @@
         state.episodeNumber = null;
         state.episodeTag = '';
         state.episodeMetadataTitle = '';
+        state.mediaKind = 'unknown';
+        state.metadataReady = false;
+        state.metadataSource = '';
+        state.pendingEpisodeTag = '';
+        state.playbackMetadataResponseSeen = false;
+        state.playbackMetadataUnresolvedLogged = false;
     }
 
     function resetSubtitleTracks() {
@@ -912,26 +2392,74 @@
         state.status = 'Scanning new playback...';
         resetSubtitleTracks();
         resetMediaMetadata();
+        beginPlaybackMetadataSettling();
         setTimeout(function () {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             scanPerformanceEntries(true);
             state.lastPerformanceScanAt = Date.now();
             updateUi();
         }, 0);
+        return sessionId;
     }
 
     function refreshMediaMetadataFromDom() {
         var shadowMetadata = observeShadowPlaybackMetadata();
         var container = activePlaybackContainer();
-        var playbackTitle = (shadowMetadata && shadowMetadata.title) || activePlaybackTitle(container) || displayTitle();
+        var activeTitle = activePlaybackTitle(container);
+        var playbackTitle = (shadowMetadata && shadowMetadata.title) || activeTitle || displayTitle();
         var scopedPlaybackText = activePlaybackInfoText(container);
-        var playbackEpisodeTag = (shadowMetadata && shadowMetadata.episodeTag) ||
+        var visibleEpisodeTag = (shadowMetadata && shadowMetadata.episodeTag) ||
             seasonEpisodeTag(scopedPlaybackText || (!container ? playbackInfoText() : ''));
-        if (playbackMetadataChanged(playbackTitle, playbackEpisodeTag)) restartPlaybackSessionForMetadataChange();
-        updateMediaMetadata({
-            title: playbackTitle,
-            episodeTag: playbackEpisodeTag
+        captureDisneySnapshot('shadow.semantic', state.playbackSessionId, function () {
+            return {
+                source: shadowMetadata ? 'disney-shadow-dom' : 'active-player',
+                controlsRootPresent: !!state.shadowControlsRoot,
+                titleRootPresent: !!state.shadowTitleRoot,
+                activePlaybackContainerPresent: !!container,
+                metadata: {
+                    title: playbackTitle || '',
+                    activeTitle: activeTitle || '',
+                    episodeTag: visibleEpisodeTag || ''
+                },
+                pendingEpisodeTagPresent: !!state.pendingEpisodeTag,
+                playbackResponseSeen: !!state.playbackMetadataResponseSeen
+            };
         });
+
+        resolvePendingPlaybackMetadata('active-player+playback-response', state.playbackSessionId);
+        if (isPlaybackMetadataSettling()) return;
+
+        var candidateTitle = (shadowMetadata && shadowMetadata.title) || activeTitle;
+        var candidateEpisodeTag = state.pendingEpisodeTag || visibleEpisodeTag;
+        if (!candidateTitle) return;
+        if (playbackMetadataChanged(candidateTitle, candidateEpisodeTag)) {
+            var hadPendingEpisodeTag = !!state.pendingEpisodeTag;
+            captureDisney('metadata.changed', state.playbackSessionId, function () {
+                return {
+                    before: fixtureMetadataState(),
+                    candidate: { title: candidateTitle || '', episodeTag: candidateEpisodeTag || '' }
+                };
+            });
+            var restartedSessionId = restartPlaybackSessionForMetadataChange();
+            if (candidateEpisodeTag) {
+                state.mediaKind = 'episode';
+                state.pendingEpisodeTag = candidateEpisodeTag;
+                state.playbackMetadataResponseSeen = hadPendingEpisodeTag;
+            }
+            acceptPlaybackMetadata({
+                title: candidateTitle,
+                episodeTag: candidateEpisodeTag
+            }, candidateEpisodeTag ? 'episode' : 'movie', shadowMetadata ? 'disney-shadow-dom' : 'active-player', restartedSessionId);
+            return;
+        }
+
+        if (candidateEpisodeTag) {
+            acceptPlaybackMetadata({ title: candidateTitle, episodeTag: candidateEpisodeTag }, 'episode',
+                state.pendingEpisodeTag ? 'active-player+playback-response' : (shadowMetadata ? 'disney-shadow-dom' : 'active-player'),
+                state.playbackSessionId);
+        } else if (state.mediaKind === 'movie' && state.playbackMetadataResponseSeen) {
+            acceptPlaybackMetadata({ title: candidateTitle }, 'movie', 'active-player+playback-response', state.playbackSessionId);
+        }
     }
 
     function scheduleManifestRetry(url, source, sessionId, delayMs) {
@@ -952,12 +2480,29 @@
         if (state.seenManifestUrls[url]) return;
         state.seenManifestUrls[url] = 'pending';
         state.status = 'Found manifest via ' + source + '. Reading tracks...';
+        captureDisney('artifact.requested', sessionId, function () {
+            return { kind: 'hls-manifest', source: source || 'unknown', url: url };
+        });
         updateUi();
 
         getText(url).then(function (text) {
             if (!isPlaybackSessionCurrent(sessionId)) return;
             state.seenManifestUrls[url] = 'loaded';
             if (/^Could not read manifest:/.test(state.lastError || '')) state.lastError = '';
+            var directWebVtt = /^\s*WEBVTT/i.test(text || '');
+            var hlsManifest = (text || '').indexOf('#EXTM3U') >= 0;
+            var artifactKind = directWebVtt ? 'direct-webvtt' : (hlsManifest ? 'hls-manifest' : 'unrecognized-response');
+            var artifactId = directWebVtt || hlsManifest ? captureDisneyArtifact(artifactKind, text || '', function () {
+                return { format: directWebVtt ? 'vtt' : 'm3u8', url: url, source: source || 'unknown' };
+            }) : null;
+            captureDisney('artifact.loaded', sessionId, function () {
+                return {
+                    kind: artifactKind,
+                    artifact: artifactId || '',
+                    source: source || 'unknown',
+                    url: url
+                };
+            });
             parseManifest(url, text || '', sessionId);
             updateUi();
         }).catch(function (err) {
@@ -972,6 +2517,15 @@
                     delete state.seenResourceUrls[url];
                 }
             }
+            captureDisney('artifact.failed', sessionId, function () {
+                return {
+                    kind: 'hls-manifest',
+                    source: source || 'unknown',
+                    url: url,
+                    code: fixtureErrorCode(err),
+                    retryScheduled: state.seenManifestUrls[url] === 'cooldown'
+                };
+            });
             state.lastError = 'Could not read manifest: ' + err.message;
             updateUi();
         });
@@ -979,9 +2533,20 @@
 
     function parseManifest(url, text, sessionId) {
         if (!isPlaybackSessionCurrent(sessionId)) return;
-        if (!text) return;
-        if (text.indexOf('#EXTM3U') < 0 && text.indexOf('WEBVTT') < 0) return;
+        if (!text) {
+            captureDisney('manifest.rejected', sessionId, function () {
+                return { url: url, reason: 'empty' };
+            });
+            return;
+        }
+        if (text.indexOf('#EXTM3U') < 0 && text.indexOf('WEBVTT') < 0) {
+            captureDisney('manifest.rejected', sessionId, function () {
+                return { url: url, reason: 'not-hls-or-webvtt' };
+            });
+            return;
+        }
 
+        var trackCountBefore = state.langs.length;
         var lines = text.split(/\r\n|\r|\n/);
         var subtitleMediaLines = lines.filter(function (line) {
             return /^#EXT-X-MEDIA:/i.test(line) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(line);
@@ -1015,6 +2580,16 @@
         if (state.langs.length > 0) {
             state.status = 'Ready. Select a subtitle track.';
         }
+        captureDisney('manifest.parsed', sessionId, function () {
+            return {
+                url: url,
+                lineCount: lines.length,
+                subtitleMediaLineCount: subtitleMediaLines.length,
+                directSubtitlePlaylist: looksLikeSubtitlePlaylist(url, text),
+                trackCountBefore: trackCountBefore,
+                trackCountAfter: state.langs.length
+            };
+        });
     }
 
     function parseAttrList(value) {
@@ -1053,11 +2628,25 @@
     }
 
     function addTrack(track) {
-        if (!track.URI) return;
+        if (!track.URI) {
+            captureDisney('track.rejected', state.playbackSessionId, function () {
+                return { reason: 'missing-uri', track: fixtureTrackSummary(track) };
+            });
+            return;
+        }
         var key = trackIdentity(track);
         var existing = state.langKeys[key];
         if (existing) {
+            var beforeTrack = fixtureCaptureRecording ? fixtureTrackSummary(existing) : null;
+            var incomingTrack = fixtureCaptureRecording ? fixtureTrackSummary(track) : null;
             mergeTrack(existing, track);
+            captureDisney('track.merged', state.playbackSessionId, function () {
+                return {
+                    before: beforeTrack || {},
+                    incoming: incomingTrack || {},
+                    after: fixtureTrackSummary(existing)
+                };
+            });
             return;
         }
         track.key = key;
@@ -1068,6 +2657,9 @@
             return a.NAME.localeCompare(b.NAME);
         });
         debuglog('Track added: ' + track.NAME);
+        captureDisney('track.added', state.playbackSessionId, function () {
+            return { track: fixtureTrackSummary(track) };
+        });
     }
 
     function mergeTrack(existing, incoming) {
@@ -1389,6 +2981,14 @@
         state.progressCompleted = 0;
         state.progressTotal = 0;
         state.progressLabel = 'Preparing...';
+        captureDisney('download.start', operation.sessionId, function () {
+            return {
+                operationId: operation.id,
+                baseFilename: operation.baseFilename,
+                outputFilename: operation.outputFilename,
+                detectedTrackCount: state.langs.length
+            };
+        });
         return operation;
     }
 
@@ -1401,6 +3001,11 @@
     }
 
     function invalidateDownloadOperation() {
+        if (state.activeDownloadOperationId) {
+            captureDisney('download.invalidated', state.playbackSessionId, function () {
+                return { operationId: state.activeDownloadOperationId };
+            });
+        }
         state.activeDownloadOperationId = 0;
         state.wait = false;
         state.downloadall = false;
@@ -1420,6 +3025,11 @@
         if (state.wait || state.langs.length === 0) return;
         var tracks = state.langs.slice();
         var baseFilename = safeBaseFilename();
+        if (!baseFilename) {
+            state.lastError = 'Current playback metadata is not ready yet.';
+            updateUi();
+            return;
+        }
         var operation = beginDownloadOperation(baseFilename + '.subtitles.zip');
         operation.baseFilename = baseFilename;
         var zip = new JSZip();
@@ -1447,7 +3057,13 @@
             saveAs(blob, operation.baseFilename + '.subtitles.zip');
             state.status = 'Downloaded all subtitles.';
             state.progressLabel = 'Complete';
+            captureDisney('download.complete', operation.sessionId, function () {
+                return { operationId: operation.id, outputFilename: operation.baseFilename + '.subtitles.zip' };
+            });
         }).catch(function (err) {
+            captureDisney(isDownloadOperationCurrent(operation) ? 'download.failed' : 'download.aborted', operation.sessionId, function () {
+                return { operationId: operation.id, code: fixtureErrorCode(err) };
+            });
             if (isDownloadOperationCurrent(operation)) {
                 state.lastError = 'Download failed: ' + err.message;
                 state.progressLabel = 'Failed';
@@ -1461,6 +3077,11 @@
         if (state.wait) return;
         var tracks = tracksWithForcedCompanion(track);
         var baseFilename = safeBaseFilename();
+        if (!baseFilename) {
+            state.lastError = 'Current playback metadata is not ready yet.';
+            updateUi();
+            return;
+        }
         var outputFilename = trackDownloadFilename(track, tracks, baseFilename);
         var operation = beginDownloadOperation(outputFilename);
         operation.baseFilename = baseFilename;
@@ -1474,7 +3095,13 @@
             assertDownloadOperationCurrent(operation);
             state.status = 'Downloaded ' + downloadTrackNames(tracks) + '.';
             state.progressLabel = 'Complete';
+            captureDisney('download.complete', operation.sessionId, function () {
+                return { operationId: operation.id, outputFilename: outputFilename };
+            });
         }).catch(function (err) {
+            captureDisney(isDownloadOperationCurrent(operation) ? 'download.failed' : 'download.aborted', operation.sessionId, function () {
+                return { operationId: operation.id, code: fixtureErrorCode(err) };
+            });
             if (isDownloadOperationCurrent(operation)) {
                 state.lastError = 'Download failed: ' + err.message;
                 state.progressLabel = 'Failed';
@@ -1509,6 +3136,11 @@
 
         var tracks = uniqueTracks(tracksWithForcedCompanion(english).concat(tracksWithForcedCompanion(korean)));
         var baseFilename = safeBaseFilename();
+        if (!baseFilename) {
+            state.lastError = 'Current playback metadata is not ready yet.';
+            updateUi();
+            return;
+        }
         var outputFilename = baseFilename + '.en-ko.subtitles.zip';
         var operation = beginDownloadOperation(outputFilename);
         operation.baseFilename = baseFilename;
@@ -1534,7 +3166,13 @@
             saveAs(blob, operation.baseFilename + '.en-ko.subtitles.zip');
             state.status = 'Downloaded English + Korean subtitles' + forcedSummary(tracks) + '.';
             state.progressLabel = 'Complete';
+            captureDisney('download.complete', operation.sessionId, function () {
+                return { operationId: operation.id, outputFilename: operation.baseFilename + '.en-ko.subtitles.zip' };
+            });
         }).catch(function (err) {
+            captureDisney(isDownloadOperationCurrent(operation) ? 'download.failed' : 'download.aborted', operation.sessionId, function () {
+                return { operationId: operation.id, code: fixtureErrorCode(err) };
+            });
             if (isDownloadOperationCurrent(operation)) {
                 state.lastError = 'Download failed: ' + err.message;
                 state.progressLabel = 'Failed';
@@ -1633,10 +3271,21 @@
             assertDownloadOperationCurrent(operation);
             var output = normalizeVttForDownload(vtt);
             if (!output.trim()) throw new Error('No subtitle cues found.');
-            return {
+            var file = {
                 name: operation.baseFilename + '.' + safeTrackName(track) + '.vtt',
                 content: output
             };
+            var artifactId = captureDisneyArtifact('subtitle-output', output, function () {
+                return { format: 'vtt', track: fixtureTrackSummary(track), filename: file.name };
+            });
+            captureDisney('download.file-built', operation.sessionId, function () {
+                return {
+                    operationId: operation.id,
+                    filename: file.name,
+                    artifact: artifactId || ''
+                };
+            });
+            return file;
         });
     }
 
@@ -1646,7 +3295,20 @@
         updateUi();
         return getText(track.URI).then(function (playlist) {
             assertDownloadOperationCurrent(operation);
-            if (/^\s*WEBVTT/i.test(playlist)) {
+            var directWebVtt = /^\s*WEBVTT/i.test(playlist || '');
+            var hlsPlaylist = (playlist || '').indexOf('#EXTM3U') >= 0;
+            var playlistArtifactKind = directWebVtt ? 'direct-webvtt' : (hlsPlaylist ? 'hls-media-playlist' : 'unrecognized-response');
+            var playlistArtifactId = directWebVtt || hlsPlaylist ? captureDisneyArtifact(playlistArtifactKind, playlist || '', function () {
+                return { format: directWebVtt ? 'vtt' : 'm3u8', url: track.URI, track: fixtureTrackSummary(track) };
+            }) : null;
+            captureDisney('artifact.loaded', operation.sessionId, function () {
+                return {
+                    kind: playlistArtifactKind,
+                    artifact: playlistArtifactId || '',
+                    url: track.URI
+                };
+            });
+            if (directWebVtt) {
                 addDownloadProgressTotal(operation, 1, 'Downloading ' + track.NAME + '...');
                 advanceDownloadProgress(operation, 'Downloading ' + track.NAME + '...');
                 return playlist;
@@ -1683,6 +3345,13 @@
                 }).catch(function (err) {
                     failedSegments.push(segment.url);
                     debuglog('Segment failed: ' + err.message);
+                    captureDisney('artifact.failed', operation.sessionId, function () {
+                        return {
+                            kind: 'hls-vtt-segment',
+                            url: segment.url,
+                            code: fixtureErrorCode(err)
+                        };
+                    });
                 }).then(function () {
                     advanceDownloadProgress(operation, 'Downloading ' + track.NAME + ' segments...');
                 });
@@ -2093,15 +3762,32 @@
 
     function safeBaseFilename() {
         refreshMediaMetadataFromDom();
-        var title = state.mediaTitle || displayTitle();
-        var episodeTag = state.episodeTag || seasonEpisodeTag(playbackInfoText());
+        if (!isPlaybackMetadataReady()) return '';
+        var title = state.mediaTitle;
+        var episodeTag = state.mediaKind === 'episode' ? state.episodeTag : '';
         if (episodeTag && state.episodeMetadataTitle && !mediaTitlesMatch(title, state.episodeMetadataTitle)) {
             debuglog('Ignored episode metadata for a different title: ' + state.episodeMetadataTitle);
-            episodeTag = '';
+            captureDisney('metadata.rejected', state.playbackSessionId, function () {
+                return {
+                    reason: 'title-mismatch-at-filename',
+                    title: title,
+                    metadataTitle: state.episodeMetadataTitle,
+                    episodeTag: episodeTag
+                };
+            });
+            return '';
         }
-        if (episodeTag && title.toUpperCase().indexOf(episodeTag) < 0) {
-            title += '.' + episodeTag;
-        }
+        var filename = formatMediaBaseFilename(title, episodeTag);
+        captureDisneySnapshot('filename.resolved', state.playbackSessionId, function () {
+            return { filename: filename, episodeTag: episodeTag || '' };
+        });
+        return filename;
+    }
+
+    function formatMediaBaseFilename(title, episodeTag) {
+        title = String(title || 'DisneyPlus');
+        episodeTag = String(episodeTag || '');
+        if (episodeTag && title.toUpperCase().indexOf(episodeTag.toUpperCase()) < 0) title += '.' + episodeTag;
         return sanitizeFilename(title);
     }
 

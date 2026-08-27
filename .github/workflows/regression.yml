@@ -20,12 +20,27 @@ jobs:
           node tools/sync-hls-segment-parser.js --check
           node tools/sync-hls-segment-parser.js --write
           git diff --exit-code -- scripts/apple-tv-plus-subtitles-downloader.user.js scripts/disney-plus-subtitles-downloader.user.js scripts/coupang-play-subtitles-downloader.user.js
-      - name: Check userscript syntax
+      - name: Check shared fixture capture synchronization
         run: |
-          for file in scripts/*.user.js; do
+          node tools/sync-fixture-capture.js --check
+          node tools/sync-fixture-capture.js --write
+          git diff --exit-code -- scripts/disney-plus-subtitles-downloader.user.js
+      - name: Check JavaScript syntax
+        run: |
+          for file in scripts/*.user.js shared/*.js tools/*.js tools/fixture-lib/*.js tests/*.js; do
             node --check "$file"
           done
       - name: Check whitespace
         run: git diff --check HEAD^ HEAD
       - name: Run regression suite
         run: node tests/regression.js
+      - name: Test fixture capture core
+        run: node tests/fixture-capture-core.js
+      - name: Test Disney+ fixture capture adapter
+        run: node tests/fixture-capture-disney.js
+      - name: Test fixture repository tooling
+        run: node tests/fixture-tooling.js
+      - name: Verify repository fixtures
+        run: node tools/fixture.js verify-all
+      - name: Replay repository fixtures
+        run: node tests/fixture-replay.js

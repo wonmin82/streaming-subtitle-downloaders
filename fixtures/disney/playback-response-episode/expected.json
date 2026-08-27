@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "metadata": {
+      "title": "SHOW_001",
+      "episodeTag": "S01E03",
+      "mediaKind": "episode",
+      "ready": true
+    },
+    "filename": "SHOW_001.S01E03"
+  }
+}

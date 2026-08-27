@@ -82,16 +82,29 @@ streaming-subtitle-downloaders/
 ├── .github/
 │   └── workflows/
 │       └── regression.yml
+├── docs/
+│   └── fixture-capture.md
+├── fixtures/
+│   └── disney/
+│       └── synthetic-metadata/
 ├── scripts/
 │   ├── apple-tv-plus-subtitles-downloader.user.js
 │   ├── coupang-play-subtitles-downloader.user.js
 │   ├── disney-plus-subtitles-downloader.user.js
 │   └── netflix-subtitles-downloader.user.js
 ├── shared/
+│   ├── fixture-capture.template.js
 │   └── hls-segment-parser.template.js
 ├── tests/
+│   ├── fixture-capture-core.js
+│   ├── fixture-capture-disney.js
+│   ├── fixture-replay.js
+│   ├── fixture-tooling.js
 │   └── regression.js
 ├── tools/
+│   ├── fixture-lib/
+│   ├── fixture.js
+│   ├── sync-fixture-capture.js
 │   └── sync-hls-segment-parser.js
 ├── .gitattributes
 ├── .gitignore
@@ -115,12 +128,18 @@ Node.js is required for the repository tools and tests. Before submitting a chan
 
 ```bash
 node tools/sync-hls-segment-parser.js --check
+node tools/sync-fixture-capture.js --check
 for file in scripts/*.user.js; do node --check "$file"; done
 node tests/regression.js
+node tests/fixture-capture-core.js
+node tests/fixture-capture-disney.js
+node tests/fixture-tooling.js
+node tools/fixture.js verify-all
+node tests/fixture-replay.js
 git diff --check
 ```
 
-The synchronization check compares generated parser blocks byte-for-byte. On Windows, run it from an LF-preserving checkout; a CRLF-converted shared template can otherwise produce a line-1 mismatch even when the parser code is unchanged.
+The synchronization tools normalize line endings before comparing generated blocks, so the checks are consistent across LF and CRLF checkouts.
 
 When changing the shared HLS parser, edit [`shared/hls-segment-parser.template.js`](shared/hls-segment-parser.template.js), regenerate the three userscript copies, and verify them:
 
@@ -129,9 +148,17 @@ node tools/sync-hls-segment-parser.js --write
 node tools/sync-hls-segment-parser.js --check
 ```
 
-The `Regression tests` GitHub Actions workflow performs the shared-parser synchronization check, userscript syntax checks, whitespace validation, and the regression suite for pull requests and pushes to `main`.
+When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its initial generated target is the Disney+ userscript.
+
+The `Regression tests` GitHub Actions workflow performs both shared-block synchronization checks, userscript syntax checks, whitespace validation, the regression suites, repository-fixture safety verification, and offline fixture replay for pull requests and pushes to `main`.
 
 When a userscript changes, increment its `@version` so installed copies can receive the update.
+
+## Fixture capture development
+
+The repository includes a developer-only workflow for recording a sanitized playback timeline and turning it into a reviewed, offline regression fixture. It is disabled during normal use and currently has a Disney+ adapter pilot. Raw captures are ignored by Git; only minimized fixtures that pass the repository safety checks and contain human-reviewed expectations may be committed.
+
+See [`docs/fixture-capture.md`](docs/fixture-capture.md) for activation, sanitization boundaries, import commands, fixture layout, and replay requirements. [`fixtures/README.md`](fixtures/README.md) contains the shorter repository-fixture policy.
 
 ## License and attribution
 

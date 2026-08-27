@@ -1,3 +1,8 @@
 * text=auto
 *.md text eol=lf
 /scripts/*.user.js text eol=lf
+/shared/*.js text eol=lf
+/tools/*.js text eol=lf
+/tools/**/*.js text eol=lf
+/tests/*.js text eol=lf
+/fixtures/** text eol=lf

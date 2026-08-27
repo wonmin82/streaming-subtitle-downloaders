@@ -1,0 +1,82 @@
+# Fixture Capture Tool
+
+Fixture Capture is a developer-only path for turning an observed playback problem into a small, sanitized, offline regression case. The first adapter is Disney+; the capture schema and repository tooling already recognize all four supported services so that later adapters can use the same workflow.
+
+Once armed, the recording path is a read-only side channel. It records values that the userscript has already received or calculated, does not issue additional requests, and is never awaited by the download path. Capture failures are contained inside the adapter and must not change playback, subtitle discovery, filenames, or saved files.
+
+## Developer activation
+
+Capture recording is inactive during normal use. To enable it for Disney+ without changing the playback URL:
+
+1. Open the Tampermonkey menu in the Disney+ tab.
+2. Choose **[Fixture] Start capture and reload this tab**. The command arms only that tab and reloads it automatically.
+3. Reproduce the problem. Capture starts before the normal network hooks are installed so that early metadata and manifest observations are included.
+4. Open the Tampermonkey menu again and choose **[Fixture] Stop and export**.
+
+Before activation, Tampermonkey shows only the start-and-reload command. The command stores a two-minute, one-shot arm in the current tab's `sessionStorage`; the reloaded userscript consumes and deletes it immediately. No capture content is written to browser storage. Once active, the developer commands can restart the in-memory capture, export a non-stopping snapshot, clear it, or print a value-free status summary to the console. No page overlay, badge, notification, persistent setting, URL marker, or end-user downloader-menu item is added.
+
+The export is named `disney-<timestamp>.fixture.local.json`. This suffix and the local `captures/` directory are ignored by Git.
+
+## What a capture contains
+
+Schema version 1 separates four kinds of evidence:
+
+- `events`: ordered decisions such as session changes, metadata acceptance, manifest parsing, track discovery, and download outcomes.
+- `snapshots`: deduplicated semantic states such as the active Shadow DOM title and resolved filename.
+- `artifacts`: bounded HLS/WebVTT structures already handled by the userscript and structure-only projections of metadata JSON. Raw metadata responses are not exported.
+- `observed`: the final metadata, filename, status code, and track summaries produced during the reproduction.
+
+Known non-playback configuration operations such as Disney+'s `getSiteConfig` response are omitted from metadata artifacts. Repeated metadata projections reuse the first artifact while each observation remains represented in the event timeline.
+
+Session values and opaque identifiers are replaced with stable capture-local aliases. URL credentials, query signing parameters, and path-embedded CDN signing segments are removed. Metadata scalar strings are projected to placeholders except for narrowly allowed parser signals, account/profile fields are removed, and subtitle dialogue is replaced while timing and parser-relevant structure remain. Capture sizes and entry counts are bounded; an export that hits a limit is marked as truncated and cannot be imported as a repository fixture.
+
+Export is blocked if a final safety scan still sees high-risk credentials, signed URLs, DRM/license material, or other sensitive data. This browser-side protection is followed by a separate repository-side verifier; neither replaces human review.
+
+## Importing a repository fixture
+
+Keep the downloaded capture outside the repository or under ignored `captures/`, then inspect it without printing captured values:
+
+```text
+node tools/fixture.js inspect captures/problem.fixture.local.json
+node tools/fixture.js verify-capture captures/problem.fixture.local.json
+node tools/fixture.js import captures/problem.fixture.local.json --name descriptive-case-name
+```
+
+Import refuses unsafe names, overwrites, truncated captures, and captures that fail schema or safety checks. It creates:
+
+```text
+fixtures/<service>/<name>/
+├── scenario.json
+├── input/
+├── observed.json
+└── expected.json
+```
+
+`observed.json` records the faulty or successful behavior that occurred; it is evidence, not the expected result. Import therefore creates `expected.json` with `reviewed: false` and no assertions. A maintainer must minimize and pseudonymize the input, diagnose the behavior, write the intended assertions, and set `reviewed` to `true` before the fixture can be committed.
+
+Do not commit raw captures, cookies, authorization headers, account or device identifiers, DRM data, media files, HAR files, DOM dumps, synopsis text, or real subtitle dialogue. Prefer synthetic values such as `SHOW_001`, `TOKEN_1`, and `CAPTION_001` whenever the original value is not needed to reproduce the parser decision.
+
+## Verification and replay
+
+Validate one reviewed fixture or the complete corpus offline:
+
+```text
+node tools/fixture.js verify fixtures/disney/synthetic-metadata
+node tools/fixture.js verify-all
+node tests/fixture-replay.js
+```
+
+Repository verification checks the schema, reviewed flag, paths, symlinks, referenced inputs, size limits, secrets, signed URLs, DRM material, opaque binary data, and unsanitized long-form or subtitle text. Replay tests then feed fixture inputs into the applicable userscript parser and compare the fresh result with the human-reviewed assertions. No streaming-service request is allowed during replay.
+
+The committed `fixtures/disney/synthetic-metadata` case is synthetic and demonstrates this full path. Future observed cases should be reduced to the smallest input that preserves the failing decision.
+
+## Maintaining the shared core
+
+Edit the source template rather than the generated userscript block:
+
+```text
+node tools/sync-fixture-capture.js --write
+node tools/sync-fixture-capture.js --check
+```
+
+The initial target list contains only Disney+. A service should be added only after its adapter has lazy, synchronous, no-throw wrappers and parity tests proving that capture-disabled execution does not create payloads, requests, timers, observers, or UI.
