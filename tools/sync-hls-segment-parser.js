@@ -36,7 +36,11 @@ if (check === write || args.size !== 1) {
   process.exit(2);
 }
 
-const template = fs.readFileSync(TEMPLATE_PATH, 'utf8');
+function normalizeLf(text) {
+  return String(text).replace(/\r\n?|\u2028|\u2029/g, '\n');
+}
+
+const template = normalizeLf(fs.readFileSync(TEMPLATE_PATH, 'utf8'));
 const placeholderCount = template.split(PLACEHOLDER).length - 1;
 if (placeholderCount !== 1) {
   throw new Error(`Expected exactly one ${PLACEHOLDER} placeholder, found ${placeholderCount}`);
@@ -87,7 +91,7 @@ function firstDifferenceLine(actual, expected) {
 let changed = 0;
 for (const target of TARGETS) {
   const filePath = path.join(ROOT, target.file);
-  const source = fs.readFileSync(filePath, 'utf8');
+  const source = normalizeLf(fs.readFileSync(filePath, 'utf8'));
   const bounds = blockBounds(source, target.file);
   const actual = source.slice(bounds.start, bounds.end);
   const expected = template.replace(PLACEHOLDER, target.subtitleExtensions);

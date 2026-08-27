@@ -1,0 +1,15 @@
+{
+  "data": {
+    "program": {
+      "series": {
+        "title": "SHOW_001"
+      },
+      "season": {
+        "sequenceNumber": 3
+      },
+      "episode": {
+        "sequenceNumber": 2
+      }
+    }
+  }
+}

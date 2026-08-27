@@ -2,3 +2,7 @@
 *.tmp
 .DS_Store
 Thumbs.db
+captures/
+*.fixture.local.json
+*.fixture.raw.json
+*.har
