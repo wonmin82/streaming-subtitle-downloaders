@@ -42,7 +42,12 @@ function functionDeclarations(source, names) {
 }
 
 function evaluateFunctions(code, extras = {}) {
-  const context = { console, ...extras };
+  const context = {
+    console,
+    captureAppleSnapshot: () => false,
+    fixtureMetadataState: () => ({}),
+    ...extras
+  };
   vm.createContext(context);
   vm.runInContext(code, context);
   return context;
@@ -277,6 +282,34 @@ test('apple: active playback title overrides stale homepage metadata', () => {
   assert.strictEqual(ctx.safeBaseFilename(), "'테드 래소' - Ted Lasso.S01E01");
   assert.strictEqual(ctx.state.mediaTitle, "'테드 래소' - Ted Lasso", 'player metadata title must outrank the episode aria-label');
   assert.strictEqual(ctx.state.episodeTag, 'S01E01', 'localized player metadata should supply season and episode numbers');
+});
+
+test('apple: related-content metadata cannot replace the active episode', () => {
+  const source = sources.apple;
+  const urlContext = evaluateFunctions(functionDeclaration(source, 'shouldInspectMetadataUrl'), {
+    normalizeUrl: value => value
+  });
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/shelves/player-tabs/PlayerTabUpNext'), false);
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/canvases/channels/example'), false);
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/shows/show-id'), false, 'show aggregate metadata must stay excluded');
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/shows/show-id/episodes?limit=20'), false, 'episode-list metadata must stay excluded');
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/episodes/episode-id?caller=web'), true, 'the active episode endpoint must remain eligible');
+  assert.strictEqual(urlContext.shouldInspectMetadataUrl('https://tv.apple.com/api/uts/v3/contents/play-metadata/vod'), true);
+
+  const conflictContext = evaluateFunctions(functionDeclaration(source, 'metadataConflictsWithActivePlayback'), {
+    activePlaybackInfoText: () => 'Season 1 Episode 1',
+    activePlaybackTitle: () => 'Show Title',
+    seasonEpisodeTag: () => 'S01E01',
+    formatSeasonEpisode: (season, episode) => `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`,
+    mediaTitlesMatch: (left, right) => left === right
+  });
+  assert.strictEqual(conflictContext.metadataConflictsWithActivePlayback({
+    title: 'Show Title', seasonNumber: 1, episodeNumber: 2
+  }), true, 'Up Next metadata must not replace the active episode');
+  assert.strictEqual(conflictContext.metadataConflictsWithActivePlayback({
+    title: 'Show Title', seasonNumber: 1, episodeNumber: 1
+  }), false, 'metadata for the active episode should remain eligible');
+  requireText(functionDeclaration(source, 'inspectMetadataResponse'), 'metadataConflictsWithActivePlayback(metadata)', 'active playback metadata guard');
 });
 
 for (const service of ['apple', 'disney']) {

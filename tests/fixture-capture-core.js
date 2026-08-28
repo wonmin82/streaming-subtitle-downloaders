@@ -414,10 +414,11 @@ test('core source has no browser network, storage, or DOM side effects', () => {
   assert(!/\bdocument\s*\.|\bwindow\s*\./.test(source));
 });
 
-test('sync tool documents an explicit marker-only insertion contract for Disney', () => {
+test('sync tool documents an explicit marker-only insertion contract for each adapter', () => {
   const syncSource = fs.readFileSync(SYNC_PATH, 'utf8');
   assert(syncSource.includes("const START_MARKER = '    // BEGIN SHARED FIXTURE CAPTURE CORE';"));
   assert(syncSource.includes("const END_MARKER = '    // END SHARED FIXTURE CAPTURE CORE';"));
+  assert(syncSource.includes("'scripts/apple-tv-plus-subtitles-downloader.user.js'"));
   assert(syncSource.includes("'scripts/disney-plus-subtitles-downloader.user.js'"));
   assert(syncSource.includes('expected exactly one fixture capture marker pair'));
 });

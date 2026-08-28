@@ -1,0 +1,19 @@
+{
+  "data": {
+    "playback": {
+      "program": {
+        "contentType": "episode",
+        "series": {
+          "title": "SHOW_001"
+        },
+        "season": {
+          "sequenceNumber": 2
+        },
+        "episode": {
+          "sequenceNumber": 5,
+          "label": "Season 2 Episode 5"
+        }
+      }
+    }
+  }
+}

@@ -148,7 +148,7 @@ node tools/sync-hls-segment-parser.js --write
 node tools/sync-hls-segment-parser.js --check
 ```
 
-When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its initial generated target is the Disney+ userscript.
+When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its generated targets are the Apple TV+ and Disney+ userscripts.
 
 The `Regression tests` GitHub Actions workflow performs both shared-block synchronization checks, userscript syntax checks, whitespace validation, the regression suites, repository-fixture safety verification, and offline fixture replay for pull requests and pushes to `main`.
 
