@@ -7,13 +7,34 @@ const vm = require('vm');
 const { verifyAll } = require('../tools/fixture-lib/verifier');
 
 const ROOT = path.resolve(__dirname, '..');
+const APPLE_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'apple-tv-plus-subtitles-downloader.user.js'), 'utf8');
 const DISNEY_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'disney-plus-subtitles-downloader.user.js'), 'utf8');
 
 function functionDeclaration(source, name) {
   const start = source.indexOf(`function ${name}(`);
-  assert(start >= 0, `${name} not found in the Disney+ userscript`);
+  assert(start >= 0, `${name} not found in the selected userscript`);
   const next = source.indexOf('\n    function ', start + 1);
   return source.slice(start, next >= 0 ? next : source.length);
+}
+
+function appleMetadataRuntime() {
+  const names = [
+    'extractMetadataFromText',
+    'collectMetadataFromJson',
+    'isGenericMediaTitle',
+    'shouldReplaceMediaTitle',
+    'updateMediaMetadata',
+    'cleanDisplayTitle',
+    'seasonEpisodeTag',
+    'formatSeasonEpisode',
+    'padNumber',
+    'sanitizeFilename',
+    'safeBaseFilename'
+  ];
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(names.map(name => functionDeclaration(APPLE_SOURCE, name)).join('\n'), context);
+  return context;
 }
 
 function disneyMetadataRuntime() {
@@ -44,6 +65,33 @@ function disneyMetadataRuntime() {
 }
 
 const replayDrivers = {
+  'apple-metadata-v1': (inputText) => {
+    const runtime = appleMetadataRuntime();
+    runtime.state = {
+      playbackSessionId: 'SESSION_1',
+      mediaTitle: '', mediaTitlePriority: 0,
+      seasonNumber: null, episodeNumber: null, episodeTag: ''
+    };
+    runtime.captureAppleSnapshot = () => false;
+    runtime.fixtureMetadataState = () => ({});
+    runtime.activePlaybackTitle = () => '';
+    runtime.activePlaybackInfoText = () => '';
+    runtime.playbackInfoText = () => '';
+    runtime.refreshMediaMetadataFromDom = () => {};
+    runtime.displayTitle = () => runtime.state.mediaTitle || 'AppleTVPlus';
+
+    const extracted = runtime.extractMetadataFromText(inputText);
+    runtime.updateMediaMetadata(extracted, 3);
+    return {
+      metadata: {
+        title: runtime.state.mediaTitle,
+        season: runtime.state.seasonNumber,
+        episode: runtime.state.episodeNumber,
+        episodeTag: runtime.state.episodeTag
+      },
+      filename: runtime.safeBaseFilename()
+    };
+  },
   'disney-metadata-v1': (inputText) => {
     const runtime = disneyMetadataRuntime();
     const extracted = runtime.extractMetadataFromText(inputText);

@@ -192,6 +192,8 @@ function scanTtml(text, path, issues) {
 function scanSubtitleArtifact(artifact, path, issues) {
   const format = String(artifact.format || '').toLowerCase();
   const kind = String(artifact.kind || '').toLowerCase();
+  const isManifest = /^(?:m3u8|hls|manifest)$/.test(format);
+  if (isManifest) return;
   const isSubtitle = /subtitle|caption|timedtext/.test(kind) || /^(?:vtt|webvtt|srt|ttml|dfxp|imsc)$/.test(format);
   if (!isSubtitle || typeof artifact.text !== 'string') return;
   if (/^(?:vtt|webvtt|srt)$/.test(format)) {

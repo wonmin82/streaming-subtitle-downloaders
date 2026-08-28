@@ -8,6 +8,7 @@ const TEMPLATE_PATH = path.join(ROOT, 'shared', 'fixture-capture.template.js');
 const START_MARKER = '    // BEGIN SHARED FIXTURE CAPTURE CORE';
 const END_MARKER = '    // END SHARED FIXTURE CAPTURE CORE';
 const TARGETS = [
+  'scripts/apple-tv-plus-subtitles-downloader.user.js',
   'scripts/disney-plus-subtitles-downloader.user.js'
 ];
 

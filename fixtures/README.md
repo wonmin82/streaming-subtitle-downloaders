@@ -25,12 +25,13 @@ Verify one fixture or the complete committed corpus with:
 
 ```text
 node tools/fixture.js verify fixtures/disney/synthetic-metadata
+node tools/fixture.js verify fixtures/apple/synthetic-metadata
 node tools/fixture.js verify-all
 node tests/fixture-replay.js
 ```
 
 The verifier is dependency-free and offline. It rejects malformed schema versions, path traversal, symbolic links, unreferenced inputs, unreviewed expectations, truncated captures, credentials, query- or path-signed URLs, DRM/license material, opaque binary blobs, and subtitle dialogue that has not been replaced with placeholders such as `CAPTION_001`.
 
-To make a fixture an executable test case, add a supported `scenario.json.replay` driver and input artifact reference. The replay suite feeds that sanitized input into the corresponding userscript parser and compares the fresh result with `expected.json.assertions`; it does not compare against `observed.json`. The synthetic Disney+ metadata fixture is the first example.
+To make a fixture an executable test case, add a supported `scenario.json.replay` driver and input artifact reference. The replay suite feeds that sanitized input into the corresponding userscript parser and compares the fresh result with `expected.json.assertions`; it does not compare against `observed.json`. The synthetic Apple TV+ and Disney+ metadata fixtures are the smallest examples.
 
 Fixtures should be minimal. Preserve only the structure needed for the regression: timing, manifest structure, semantic metadata fields, state transitions, and expected decisions. Do not include cookies, authorization headers, account identifiers, DRM payloads, media files, full DOM snapshots, synopsis text, or real subtitle dialogue.

@@ -193,6 +193,14 @@ test('subtitle guard accepts placeholders and rejects captured dialogue', () => 
   );
   assert.doesNotThrow(() => verifyCaptureObject(sanitized));
 
+  const subtitlePlaylist = capture();
+  subtitlePlaylist.artifacts.ARTIFACT_1 = artifact(
+    'subtitle-playlist',
+    'm3u8',
+    '#EXTM3U\n#EXTINF:2.0,\nhttps://cdn.example.test/subtitle-001.vtt\n'
+  );
+  assert.doesNotThrow(() => verifyCaptureObject(subtitlePlaylist), 'HLS subtitle playlists contain resource structure, not subtitle dialogue');
+
   const dialogue = clone(sanitized);
   dialogue.artifacts.ARTIFACT_1.text = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nThis is real dialogue.\n';
   dialogue.artifacts.ARTIFACT_1.byteLength = Buffer.byteLength(dialogue.artifacts.ARTIFACT_1.text);
@@ -209,6 +217,24 @@ test('subtitle guard accepts placeholders and rejects captured dialogue', () => 
   const body = capture();
   body.observed.body = 'A response body must be reduced before commit.';
   assert.throws(() => verifyCaptureObject(body), error => error instanceof FixtureSecurityError && error.issues.some(issue => issue.code === 'copyright-text-field'));
+});
+
+test('WebVTT subtitle playlists cannot bypass dialogue verification', () => {
+  const sanitized = capture();
+  sanitized.artifacts.ARTIFACT_1 = artifact(
+    'subtitle-playlist',
+    'webvtt',
+    'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nCAPTION_001\n'
+  );
+  assert.doesNotThrow(() => verifyCaptureObject(sanitized));
+
+  const dialogue = clone(sanitized);
+  dialogue.artifacts.ARTIFACT_1.text = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nThis is real dialogue.\n';
+  dialogue.artifacts.ARTIFACT_1.byteLength = Buffer.byteLength(dialogue.artifacts.ARTIFACT_1.text);
+  assert.throws(
+    () => verifyCaptureObject(dialogue),
+    error => error instanceof FixtureSecurityError && error.issues.some(issue => issue.code === 'subtitle-text')
+  );
 });
 
 test('guard rejects account and profile data', () => {
