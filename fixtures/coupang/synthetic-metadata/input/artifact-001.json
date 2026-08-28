@@ -1,0 +1,10 @@
+{
+  "series": {
+    "title": "SHOW_001"
+  },
+  "episode": {
+    "title": "EPISODE_001",
+    "season": 1,
+    "episode": 3
+  }
+}

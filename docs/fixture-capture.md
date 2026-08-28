@@ -1,12 +1,12 @@
 # Fixture Capture Tool
 
-Fixture Capture is a developer-only path for turning an observed playback problem into a small, sanitized, offline regression case. Apple TV+ and Disney+ currently have capture adapters; the capture schema and repository tooling recognize all four supported services so that later adapters can use the same workflow.
+Fixture Capture is a developer-only path for turning an observed playback problem into a small, sanitized, offline regression case. Apple TV+, Coupang Play, and Disney+ currently have capture adapters; the capture schema and repository tooling recognize all four supported services so that later adapters can use the same workflow.
 
 Once armed, the recording path is a read-only side channel. It records values that the userscript has already received or calculated, does not issue additional requests, and is never awaited by the download path. Capture failures are contained inside the adapter and must not change playback, subtitle discovery, filenames, or saved files.
 
 ## Developer activation
 
-Capture recording is inactive during normal use. To enable it for Apple TV+ or Disney+ without changing the playback URL:
+Capture recording is inactive during normal use. To enable it for Apple TV+, Coupang Play, or Disney+ without changing the playback URL:
 
 1. Open the Tampermonkey menu in the service tab.
 2. Choose **[Fixture] Start capture and reload this tab**. The command arms only that tab and reloads it automatically.
@@ -15,7 +15,7 @@ Capture recording is inactive during normal use. To enable it for Apple TV+ or D
 
 Before activation, Tampermonkey shows only the start-and-reload command. The command stores a two-minute, one-shot arm in the current tab's `sessionStorage`; the reloaded userscript consumes and deletes it immediately. No capture content is written to browser storage. Once active, the developer commands can restart the in-memory capture, export a non-stopping snapshot, clear it, or print a value-free status summary to the console. Stopping or clearing a capture immediately restores the start-and-reload command without requiring another page reload. No page overlay, badge, notification, persistent setting, URL marker, or end-user downloader-menu item is added.
 
-The export is named `apple-<timestamp>.fixture.local.json` or `disney-<timestamp>.fixture.local.json`. This suffix and the local `captures/` directory are ignored by Git.
+The export is named `apple-<timestamp>.fixture.local.json`, `coupang-<timestamp>.fixture.local.json`, or `disney-<timestamp>.fixture.local.json`. This suffix and the local `captures/` directory are ignored by Git.
 
 ## What a capture contains
 
@@ -26,7 +26,7 @@ Schema version 1 separates four kinds of evidence:
 - `artifacts`: bounded HLS/WebVTT structures already handled by the userscript and structure-only projections of metadata JSON. Raw metadata responses are not exported.
 - `observed`: the final metadata, filename, status code, and track summaries produced during the reproduction.
 
-Known non-playback configuration operations such as Disney+'s `getSiteConfig` response are omitted from metadata artifacts. Apple TV+ HLS responses are reduced to subtitle-relevant master entries or a bounded head-and-tail media-playlist projection before entering the shared capture limits. Repeated metadata projections reuse the first artifact while each observation remains represented in the event timeline.
+Known non-playback configuration operations such as Disney+'s `getSiteConfig` response are omitted from metadata artifacts. Apple TV+ HLS responses are reduced to subtitle-relevant master entries or a bounded head-and-tail media-playlist projection before entering the shared capture limits. Coupang Play records projected discovery metadata plus bounded HLS, DASH, WebVTT, and TTML structures that the downloader already receives. Repeated metadata projections reuse the first artifact while each observation remains represented in the event timeline.
 
 Session values and opaque identifiers are replaced with stable capture-local aliases. URL credentials, query signing parameters, and path-embedded CDN signing segments are removed. Metadata scalar strings are projected to placeholders except for narrowly allowed parser signals, account/profile fields are removed, and subtitle dialogue is replaced while timing and parser-relevant structure remain. Capture sizes and entry counts are bounded; an export that hits a limit is marked as truncated and cannot be imported as a repository fixture.
 
@@ -63,13 +63,14 @@ Validate one reviewed fixture or the complete corpus offline:
 ```text
 node tools/fixture.js verify fixtures/disney/synthetic-metadata
 node tools/fixture.js verify fixtures/apple/synthetic-metadata
+node tools/fixture.js verify fixtures/coupang/synthetic-metadata
 node tools/fixture.js verify-all
 node tests/fixture-replay.js
 ```
 
 Repository verification checks the schema, reviewed flag, paths, symlinks, referenced inputs, size limits, secrets, signed URLs, DRM material, opaque binary data, and unsanitized long-form or subtitle text. Replay tests then feed fixture inputs into the applicable userscript parser and compare the fresh result with the human-reviewed assertions. No streaming-service request is allowed during replay.
 
-The committed Apple TV+ and Disney+ synthetic metadata cases demonstrate this full path. Future observed cases should be reduced to the smallest input that preserves the failing decision.
+The committed Apple TV+, Coupang Play, and Disney+ synthetic metadata cases demonstrate this full path. Future observed cases should be reduced to the smallest input that preserves the failing decision.
 
 ## Maintaining the shared core
 
@@ -80,4 +81,4 @@ node tools/sync-fixture-capture.js --write
 node tools/sync-fixture-capture.js --check
 ```
 
-The generated target list contains Apple TV+ and Disney+. A service should be added only after its adapter has lazy, synchronous, no-throw wrappers and parity tests proving that capture-disabled execution does not create payloads, requests, timers, observers, or UI.
+The generated target list contains Apple TV+, Coupang Play, and Disney+. A service should be added only after its adapter has lazy, synchronous, no-throw wrappers and parity tests proving that capture-disabled execution does not create payloads, requests, timers, observers, or UI.

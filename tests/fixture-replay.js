@@ -8,6 +8,7 @@ const { verifyAll } = require('../tools/fixture-lib/verifier');
 
 const ROOT = path.resolve(__dirname, '..');
 const APPLE_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'apple-tv-plus-subtitles-downloader.user.js'), 'utf8');
+const COUPANG_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'coupang-play-subtitles-downloader.user.js'), 'utf8');
 const DISNEY_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'disney-plus-subtitles-downloader.user.js'), 'utf8');
 
 function functionDeclaration(source, name) {
@@ -64,6 +65,26 @@ function disneyMetadataRuntime() {
   return context;
 }
 
+function coupangMetadataRuntime() {
+  const names = [
+    'mergeEpisodeObjectMetadata',
+    'episodeMetadataFromTitle',
+    'isUsableMetadataLine',
+    'isPlaybackTimeText',
+    'cleanDisplayTitle',
+    'seasonEpisodeNumbers',
+    'formatSeasonEpisodeTag',
+    'parseOptionalNumber',
+    'uniqueFilenameParts',
+    'sanitizeFilename',
+    'pad2'
+  ];
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(names.map(name => functionDeclaration(COUPANG_SOURCE, name)).join('\n'), context);
+  return context;
+}
+
 const replayDrivers = {
   'apple-metadata-v1': (inputText) => {
     const runtime = appleMetadataRuntime();
@@ -90,6 +111,32 @@ const replayDrivers = {
         episodeTag: runtime.state.episodeTag
       },
       filename: runtime.safeBaseFilename()
+    };
+  },
+  'coupang-metadata-v1': (inputText) => {
+    const runtime = coupangMetadataRuntime();
+    const input = JSON.parse(inputText);
+    const metadata = {
+      title: input.series && input.series.title || '',
+      seasonNumber: null,
+      episodeNumber: null,
+      episodeTitle: '',
+      episodeConfirmed: false
+    };
+    runtime.mergeEpisodeObjectMetadata(input.episode, metadata);
+    const episodeTag = runtime.formatSeasonEpisodeTag(metadata.seasonNumber, metadata.episodeNumber);
+    return {
+      metadata: {
+        title: metadata.title,
+        season: metadata.seasonNumber,
+        episode: metadata.episodeNumber,
+        episodeTag
+      },
+      filename: runtime.sanitizeFilename(runtime.uniqueFilenameParts([
+        metadata.title,
+        episodeTag,
+        metadata.episodeTitle
+      ]).join('.'))
     };
   },
   'disney-metadata-v1': (inputText) => {

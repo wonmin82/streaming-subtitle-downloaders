@@ -24,7 +24,7 @@ jobs:
         run: |
           node tools/sync-fixture-capture.js --check
           node tools/sync-fixture-capture.js --write
-          git diff --exit-code -- scripts/apple-tv-plus-subtitles-downloader.user.js scripts/disney-plus-subtitles-downloader.user.js
+          git diff --exit-code -- scripts/apple-tv-plus-subtitles-downloader.user.js scripts/coupang-play-subtitles-downloader.user.js scripts/disney-plus-subtitles-downloader.user.js
       - name: Check JavaScript syntax
         run: |
           for file in scripts/*.user.js shared/*.js tools/*.js tools/fixture-lib/*.js tests/*.js; do
@@ -40,6 +40,8 @@ jobs:
         run: node tests/fixture-capture-disney.js
       - name: Test Apple TV+ fixture capture adapter
         run: node tests/fixture-capture-apple.js
+      - name: Test Coupang Play fixture capture adapter
+        run: node tests/fixture-capture-coupang.js
       - name: Test fixture repository tooling
         run: node tests/fixture-tooling.js
       - name: Verify repository fixtures
