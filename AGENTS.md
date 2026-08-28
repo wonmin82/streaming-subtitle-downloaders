@@ -8,11 +8,12 @@
 - Keep unrelated changes in separate branches and pull requests.
 - Preserve unrelated working-tree changes.
 - Review the complete diff before committing or opening a pull request.
-- Run relevant automated and manual checks before opening a pull request.
+- Run relevant automated checks before opening a pull request.
+- Manual validation is optional unless explicitly requested.
 - Create a pull request only when requested or when the agreed workflow explicitly requires one.
 - Review the pull request, validation results, and unresolved comments before merging.
 - Do not merge a pull request without explicit user approval.
-- Prefer squash merging unless another merge strategy is explicitly requested.
+- Use a merge commit unless another merge strategy is explicitly requested.
 - Delete the source branch after merging only when requested.
 
 ## Commits
@@ -21,7 +22,7 @@
 - Keep each commit focused on one logical change.
 - Use a concise, imperative subject that describes the result.
 - Include the motivation, significant implementation details, and validation results in the body when useful.
-- Amend or squash temporary and work-in-progress commits before merging.
+- Preserve the pull request's commit history; do not squash or rewrite its commits unless explicitly requested.
 - Do not include credentials, personal paths, sensitive data, or identifying sample data.
 
 ## Pull Requests
