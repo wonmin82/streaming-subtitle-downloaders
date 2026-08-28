@@ -2,7 +2,7 @@
 // @name       Disney+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Disney+
-// @version    1.0.16
+// @version    1.0.17
 // @author     stegner; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -12,6 +12,7 @@
 // @grant      GM_info
 // @grant      GM_xmlhttpRequest
 // @grant      GM_registerMenuCommand
+// @grant      GM_unregisterMenuCommand
 // @grant      unsafeWindow
 // @connect    *.dssott.com
 // @connect    *.dssedge.com
@@ -998,6 +999,7 @@
     var fixtureCaptureRecording = false;
     var fixtureSnapshotValues = fixtureCaptureEnabled ? Object.create(null) : null;
     var fixtureMetadataArtifactCache = fixtureCaptureEnabled ? [] : null;
+    var fixtureCaptureMenuCommandIds = [];
 
     init();
 
@@ -1053,38 +1055,52 @@
         }
     }
 
-    function installFixtureCaptureCommands() {
+    function installFixtureCaptureCommands(skipAutoStart) {
         try {
             if (window.top !== window) return;
         } catch (err) {
             return;
         }
-        if (fixtureCapture) startFixtureCapture('menu-armed-reload');
+        if (!skipAutoStart && fixtureCapture) startFixtureCapture('menu-armed-reload');
         if (typeof GM_registerMenuCommand !== 'function') return;
 
         try {
-            if (!fixtureCapture) {
-                GM_registerMenuCommand('[Fixture] Start capture and reload this tab', armFixtureCaptureAndReload);
+            if (typeof GM_unregisterMenuCommand === 'function') {
+                fixtureCaptureMenuCommandIds.forEach(function (commandId) {
+                    try { GM_unregisterMenuCommand(commandId); } catch (err) {}
+                });
+            }
+            fixtureCaptureMenuCommandIds = [];
+
+            function registerCommand(label, handler) {
+                var commandId = GM_registerMenuCommand(label, handler);
+                if (commandId !== undefined && commandId !== null) fixtureCaptureMenuCommandIds.push(commandId);
+            }
+
+            if (!fixtureCaptureRecording) {
+                registerCommand('[Fixture] Start capture and reload this tab', armFixtureCaptureAndReload);
                 return;
             }
-            GM_registerMenuCommand('[Fixture] Start/restart capture', function () {
+            registerCommand('[Fixture] Start/restart capture', function () {
                 startFixtureCapture('menu-restart');
+                installFixtureCaptureCommands(true);
                 printFixtureCaptureStatus();
             });
-            GM_registerMenuCommand('[Fixture] Stop and export', function () {
+            registerCommand('[Fixture] Stop and export', function () {
                 exportFixtureCapture(true);
             });
-            GM_registerMenuCommand('[Fixture] Export snapshot', function () {
+            registerCommand('[Fixture] Export snapshot', function () {
                 exportFixtureCapture(false);
             });
-            GM_registerMenuCommand('[Fixture] Clear capture', function () {
+            registerCommand('[Fixture] Clear capture', function () {
                 fixtureCapture.clear();
                 fixtureCaptureRecording = false;
                 fixtureSnapshotValues = Object.create(null);
                 fixtureMetadataArtifactCache = [];
+                installFixtureCaptureCommands(true);
                 printFixtureCaptureStatus();
             });
-            GM_registerMenuCommand('[Fixture] Print status', printFixtureCaptureStatus);
+            registerCommand('[Fixture] Print status', printFixtureCaptureStatus);
         } catch (err) {
             debuglog('Could not register fixture capture commands.');
         }
@@ -1132,6 +1148,7 @@
                 if (stopFirst) {
                     fixtureCapture.stop(fixtureObservedState());
                     fixtureCaptureRecording = false;
+                    installFixtureCaptureCommands(true);
                 } else {
                     fixtureCapture.setObserved(fixtureObservedState());
                 }

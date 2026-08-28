@@ -104,6 +104,7 @@ test('fixture exports derive their version from userscript metadata', () => {
   context = evaluate(code);
   assert.strictEqual(context.currentUserscriptVersion(), 'unknown');
   assert(source.includes('// @grant      GM_info'));
+  assert(source.includes('// @grant      GM_unregisterMenuCommand'));
   assert(source.includes('scriptVersion: currentUserscriptVersion()'));
   assert(!/scriptVersion:\s*['"]\d/.test(source), 'fixture capture must not duplicate the userscript version');
 });
@@ -111,14 +112,21 @@ test('fixture exports derive their version from userscript metadata', () => {
 test('developer commands stay in Tampermonkey and out of the page menu', () => {
   const topWindow = {};
   topWindow.top = topWindow;
-  const inactiveLabels = [];
-  let inactiveHandler = null;
+  const commands = new Map();
+  let commandSequence = 0;
   let arms = 0;
   let starts = 0;
   let context = evaluate(functionDeclaration('installFixtureCaptureCommands'), {
     window: topWindow,
     fixtureCapture: null,
-    GM_registerMenuCommand: (label, handler) => { inactiveLabels.push(label); inactiveHandler = handler; },
+    fixtureCaptureRecording: false,
+    fixtureCaptureMenuCommandIds: [],
+    GM_registerMenuCommand: (label, handler) => {
+      const id = ++commandSequence;
+      commands.set(id, { label, handler });
+      return id;
+    },
+    GM_unregisterMenuCommand: id => commands.delete(id),
     armFixtureCaptureAndReload: () => { arms++; },
     startFixtureCapture: () => { starts++; },
     debuglog: () => {}
@@ -126,23 +134,36 @@ test('developer commands stay in Tampermonkey and out of the page menu', () => {
   context.installFixtureCaptureCommands();
   assert.strictEqual(starts, 0);
   assert.strictEqual(arms, 0);
-  assert.deepStrictEqual(inactiveLabels, ['[Fixture] Start capture and reload this tab']);
-  inactiveHandler();
+  assert.deepStrictEqual([...commands.values()].map(command => command.label), ['[Fixture] Start capture and reload this tab']);
+  [...commands.values()][0].handler();
   assert.strictEqual(arms, 1);
 
-  const labels = [];
+  commands.clear();
+  commandSequence = 0;
   starts = 0;
   context = evaluate(functionDeclaration('installFixtureCaptureCommands'), {
     window: topWindow,
     fixtureCapture: {},
-    GM_registerMenuCommand: label => labels.push(label),
-    startFixtureCapture: () => { starts++; },
+    fixtureCaptureRecording: false,
+    fixtureCaptureMenuCommandIds: [],
+    GM_registerMenuCommand: (label, handler) => {
+      const id = ++commandSequence;
+      commands.set(id, { label, handler });
+      return id;
+    },
+    GM_unregisterMenuCommand: id => commands.delete(id),
+    startFixtureCapture: () => true,
     printFixtureCaptureStatus: () => {},
     exportFixtureCapture: () => {}
   });
+  context.startFixtureCapture = () => {
+    starts++;
+    context.fixtureCaptureRecording = true;
+    return true;
+  };
   context.installFixtureCaptureCommands();
   assert.strictEqual(starts, 1, 'capture should start before normal playback hooks');
-  assert.deepStrictEqual(labels, [
+  assert.deepStrictEqual([...commands.values()].map(command => command.label), [
     '[Fixture] Start/restart capture',
     '[Fixture] Stop and export',
     '[Fixture] Export snapshot',
@@ -156,12 +177,58 @@ test('developer commands stay in Tampermonkey and out of the page menu', () => {
   context = evaluate(functionDeclaration('installFixtureCaptureCommands'), {
     window: { top: {} },
     fixtureCapture: null,
+    fixtureCaptureRecording: false,
+    fixtureCaptureMenuCommandIds: [],
     GM_registerMenuCommand: label => childLabels.push(label),
+    GM_unregisterMenuCommand: () => {},
     startFixtureCapture: () => { throw new Error('child frame must stay inactive'); },
     debuglog: () => {}
   });
   context.installFixtureCaptureCommands();
   assert.deepStrictEqual(childLabels, []);
+});
+
+test('stop and export replaces active commands with the start-and-reload command', () => {
+  const topWindow = {};
+  topWindow.top = topWindow;
+  const commands = new Map();
+  let commandSequence = 0;
+  const code = [
+    functionDeclaration('installFixtureCaptureCommands'),
+    functionDeclaration('exportFixtureCapture')
+  ].join('\n');
+  const context = evaluate(code, {
+    window: topWindow,
+    fixtureCaptureRecording: true,
+    fixtureCaptureMenuCommandIds: [],
+    fixtureSnapshotValues: {},
+    fixtureMetadataArtifactCache: [],
+    fixtureCapture: {
+      stop: () => {},
+      setObserved: () => {},
+      exportBlob: () => null,
+      clear: () => {}
+    },
+    GM_registerMenuCommand: (label, handler) => {
+      const id = ++commandSequence;
+      commands.set(id, { label, handler });
+      return id;
+    },
+    GM_unregisterMenuCommand: id => commands.delete(id),
+    startFixtureCapture: () => true,
+    armFixtureCaptureAndReload: () => true,
+    fixtureObservedState: () => ({}),
+    printFixtureCaptureStatus: () => {},
+    debuglog: () => {}
+  });
+  context.installFixtureCaptureCommands(true);
+  const stopCommand = [...commands.values()].find(command => command.label === '[Fixture] Stop and export');
+  assert(stopCommand, 'active stop command must be registered');
+  stopCommand.handler();
+  assert.strictEqual(context.fixtureCaptureRecording, false);
+  assert.deepStrictEqual([...commands.values()].map(command => command.label), [
+    '[Fixture] Start capture and reload this tab'
+  ]);
 });
 
 test('disabled adapter wrappers do not evaluate lazy payloads', () => {
