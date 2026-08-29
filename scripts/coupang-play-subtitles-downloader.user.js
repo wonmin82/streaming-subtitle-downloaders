@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.26
+// @version    1.0.27
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1145,7 +1145,7 @@
 
     function printFixtureCaptureStatus() {
         if (!fixtureCapture) return;
-        try { console.info(LOG_PREFIX + ' Fixture capture status', fixtureCapture.status()); } catch (err) {}
+        try { console.info(LOG_PREFIX + ' Fixture capture status ' + JSON.stringify(fixtureCapture.status())); } catch (err) {}
     }
 
     function captureCoupang(type, sessionId, payloadFactory) {
@@ -1156,6 +1156,15 @@
         } catch (err) {
             return false;
         }
+    }
+
+    function captureCoupangResource(url, source, sessionId) {
+        if (!fixtureCaptureRecording || !fixtureCapture) return false;
+        var kind = fixtureResourceKind(url);
+        if (!/^(?:hls-manifest|dash-manifest|subtitle|metadata)$/.test(kind)) return false;
+        return captureCoupang('resource.observed', sessionId, function () {
+            return { url: url, source: source || '', kind: kind };
+        });
     }
 
     function captureCoupangArtifact(kind, text, metadataFactory) {
@@ -1218,6 +1227,7 @@
     }
 
     function fixtureResourceKind(url) {
+        if (/\/(?:drm|license|licenses|widevine|fairplay|playready|certificate|cert)(?:\/|[?#]|$)/i.test(url || '')) return 'ignored';
         if (isManifestUrl(url)) return /\.mpd(?:[?#]|$)/i.test(url || '') ? 'dash-manifest' : 'hls-manifest';
         if (isSubtitleUrl(url)) return 'subtitle';
         if (/api-(?:discover|playback)|\/discover\//i.test(url || '')) return 'metadata';
@@ -2412,9 +2422,7 @@
         var url = normalizeUrl(rawUrl);
         if (!url || state.seenResourceUrls[url]) return;
         state.seenResourceUrls[url] = true;
-        captureCoupang('resource.observed', sessionId, function () {
-            return { url: url, source: source || '', kind: fixtureResourceKind(url) };
-        });
+        captureCoupangResource(url, source, sessionId);
 
         if (isManifestUrl(url)) {
             queueManifest(url, source, sessionId);

@@ -243,7 +243,7 @@ test('identical metadata projections reuse one artifact', () => {
 test('capture helpers add no page, request, persistent storage, observer, or timer path', () => {
   const helperNames = [
     'startFixtureCapture', 'fixtureObservedState', 'exportFixtureCapture', 'printFixtureCaptureStatus',
-    'captureCoupang', 'captureCoupangArtifact', 'captureCoupangSnapshot', 'fixtureTrackSummary',
+    'captureCoupang', 'captureCoupangResource', 'captureCoupangArtifact', 'captureCoupangSnapshot', 'fixtureTrackSummary',
     'fixtureMetadataState', 'fixtureResourceKind', 'fixtureMetadataProjection',
     'fixtureManifestText', 'fixtureErrorCode'
   ];
@@ -330,6 +330,73 @@ test('resource classification distinguishes manifests, subtitles, metadata, and 
   assert.strictEqual(context.fixtureResourceKind('https://cdn.test/ko.vtt'), 'subtitle');
   assert.strictEqual(context.fixtureResourceKind('https://www.coupangplay.com/api-discover/v1/title'), 'metadata');
   assert.strictEqual(context.fixtureResourceKind('https://cdn.test/chunk.m4s'), 'media');
+  assert.strictEqual(context.fixtureResourceKind('https://www.coupangplay.com/api-playback/v1/license'), 'ignored');
+});
+
+test('resource capture excludes DRM, media, and unrelated requests before sanitization', () => {
+  const events = [];
+  const code = [
+    functionDeclaration('captureCoupangResource'),
+    functionDeclaration('fixtureResourceKind')
+  ].join('\n');
+  const context = evaluate(code, {
+    fixtureCaptureRecording: true,
+    fixtureCapture: {},
+    isManifestUrl: value => /\.(?:m3u8|mpd)(?:\?|$)/.test(value),
+    isSubtitleUrl: value => /\.vtt(?:\?|$)/.test(value),
+    captureCoupang: (type, session, payloadFactory) => {
+      events.push({ type, session, data: payloadFactory() });
+      return true;
+    }
+  });
+  assert.strictEqual(context.captureCoupangResource('https://cdn.test/master.m3u8', 'fetch', 'SESSION_1'), true);
+  assert.strictEqual(context.captureCoupangResource('https://www.coupangplay.com/api-playback/v1/license', 'fetch', 'SESSION_1'), false);
+  assert.strictEqual(context.captureCoupangResource('https://cdn.test/chunk.m4s', 'performance', 'SESSION_1'), false);
+  assert.strictEqual(context.captureCoupangResource('https://telemetry.test/events', 'fetch', 'SESSION_1'), false);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(events)), [{
+    type: 'resource.observed',
+    session: 'SESSION_1',
+    data: { url: 'https://cdn.test/master.m3u8', source: 'fetch', kind: 'hls-manifest' }
+  }]);
+});
+
+test('fixture status logging exposes safe export failure codes as text', () => {
+  const messages = [];
+  const context = evaluate(functionDeclaration('printFixtureCaptureStatus'), {
+    fixtureCapture: {
+      status: () => ({
+        state: 'stopped', recording: false, eventCount: 4,
+        artifactCount: 1, snapshotCount: 1, truncated: false,
+        exportBlocked: true, lastError: 'export-blocked-sensitive-data'
+      })
+    },
+    console: { info: message => messages.push(message) },
+    LOG_PREFIX: '[Fixture test]'
+  });
+  context.printFixtureCaptureStatus();
+  assert.strictEqual(messages.length, 1);
+  assert(messages[0].includes('"exportBlocked":true'));
+  assert(messages[0].includes('"lastError":"export-blocked-sensitive-data"'));
+});
+
+test('successful fixture export passes the JSON blob to the existing file saver', () => {
+  const saved = [];
+  const blob = { type: 'application/json;charset=utf-8' };
+  const context = evaluate(functionDeclaration('exportFixtureCapture'), {
+    fixtureCaptureRecording: false,
+    fixtureCapture: { exportBlob: pretty => pretty === true ? blob : null },
+    saveAs: (value, filename) => saved.push({ value, filename }),
+    printFixtureCaptureStatus: () => {},
+    debuglog: () => {},
+    Date: class extends Date {
+      constructor() { super('2026-08-29T00:00:00.000Z'); }
+    }
+  });
+  context.exportFixtureCapture(false);
+  assert.deepStrictEqual(saved, [{
+    value: blob,
+    filename: 'coupang-2026-08-29T00-00-00-000Z.fixture.local.json'
+  }]);
 });
 
 test('metadata changes produce accepted events and deduplicated snapshots', () => {
@@ -406,7 +473,7 @@ test('pilot records session, resource, metadata, manifest, track, filename, and 
     assert(source.includes(`'${event}'`), `${event} capture point missing`);
   }
   assert(source.includes('// @grant      GM_registerMenuCommand'));
-  assert(/^\/\/ @version\s+1\.0\.26$/m.test(source));
+  assert(/^\/\/ @version\s+1\.0\.27$/m.test(source));
 });
 
 console.log(`Coupang Play fixture capture adapter tests passed: ${passed}`);
