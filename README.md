@@ -88,7 +88,8 @@ streaming-subtitle-downloaders/
 │   ├── apple/
 │   ├── coupang/
 │   ├── disney/
-│   └── netflix/
+│   ├── netflix/
+│   └── README.md
 ├── scripts/
 │   ├── apple-tv-plus-subtitles-downloader.user.js
 │   ├── coupang-play-subtitles-downloader.user.js
@@ -108,6 +109,10 @@ streaming-subtitle-downloaders/
 │   └── regression.js
 ├── tools/
 │   ├── fixture-lib/
+│   │   ├── guards.js
+│   │   ├── importer.js
+│   │   ├── schema.js
+│   │   └── verifier.js
 │   ├── fixture.js
 │   ├── sync-fixture-capture.js
 │   └── sync-hls-segment-parser.js
