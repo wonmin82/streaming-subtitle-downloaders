@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.27
+// @version    1.0.28
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1312,6 +1312,68 @@
     function fixtureManifestText(text) {
         if (!fixtureCaptureRecording || typeof text !== 'string' || !text || text.length > 500000) return '';
         return text;
+    }
+
+    function fixtureManifestProjection(url, text) {
+        var empty = { text: '', relevant: false, projected: false, originalLineCount: 0, projectedLineCount: 0 };
+        if (!fixtureCaptureRecording || typeof text !== 'string' || !text || text.length > 500000) return empty;
+
+        if (/^\s*#EXTM3U/i.test(text)) {
+            var lines = text.split(/\r\n|\r|\n/);
+            var subtitleMediaLines = lines.filter(function (line) {
+                return /^#EXT-X-MEDIA:/i.test(line.trim()) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(line);
+            });
+            var subtitlePlaylist = looksLikeSubtitlePlaylist(url, text);
+            if (!subtitleMediaLines.length && !subtitlePlaylist) {
+                empty.originalLineCount = lines.length;
+                return empty;
+            }
+
+            var projectedLines = subtitleMediaLines.length ? lines.filter(function (line) {
+                var trimmed = line.trim();
+                return /^#EXTM3U$/i.test(trimmed) ||
+                    /^#EXT-X-(?:VERSION|INDEPENDENT-SEGMENTS|DEFINE):/i.test(trimmed) ||
+                    (/^#EXT-X-MEDIA:/i.test(trimmed) && /TYPE=(SUBTITLES|CLOSED-CAPTIONS)/i.test(trimmed));
+            }) : lines.filter(function (line) {
+                return !/^#EXT-X-(?:SESSION-)?KEY\s*:/i.test(line.trim()) &&
+                    !/(?:^|[/:._-])(?:drm|license|widevine|fairplay|playready)(?:[/:._?#-]|$)/i.test(line);
+            });
+            if (projectedLines.length > 500) {
+                projectedLines = projectedLines.slice(0, 350).concat([
+                    '# SSD_FIXTURE_PROJECTION_OMITTED=' + (projectedLines.length - 500)
+                ], projectedLines.slice(-150));
+            }
+            var projectedHls = projectedLines.join('\n');
+            return {
+                text: projectedHls,
+                relevant: true,
+                projected: projectedHls !== text,
+                originalLineCount: lines.length,
+                projectedLineCount: projectedLines.length
+            };
+        }
+
+        if (/^\s*<MPD[\s>]/i.test(text)) {
+            if (!/(?:contentType\s*=\s*["']text|mimeType\s*=\s*["'](?:text\/|application\/ttml)|subtitle|caption|ttml|wvtt|stpp)/i.test(text)) return empty;
+            var projectedDash = text
+                .replace(/<(?:[\w.-]+:)?ContentProtection\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?ContentProtection\s*>/gi, '<!-- DRM_REMOVED -->')
+                .replace(/<(?:[\w.-]+:)?ContentProtection\b[^>]*\/>/gi, '<!-- DRM_REMOVED -->')
+                .replace(/<(?:[\w.-]+:)?(?:pssh|pro|laurl|license)\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?(?:pssh|pro|laurl|license)\s*>/gi, '<!-- DRM_REMOVED -->')
+                .replace(/<(?:[\w.-]+:)?(?:pssh|pro|laurl|license)\b[^>]*\/>/gi, '<!-- DRM_REMOVED -->')
+                .replace(/\s+[\w:.-]*(?:drm|license|widevine|fairplay|playready)[\w:.-]*\s*=\s*(["'])[\s\S]*?\1/gi, '');
+            projectedDash = projectedDash.replace(/<BaseURL\b[^>]*>[\s\S]*?<\/BaseURL\s*>/gi, function (block) {
+                return /(?:^|[/:._-])(?:drm|license|widevine|fairplay|playready)(?:[/:._?#-]|$)/i.test(block) ? '<!-- DRM_URL_REMOVED -->' : block;
+            });
+            return {
+                text: projectedDash,
+                relevant: true,
+                projected: projectedDash !== text,
+                originalLineCount: text.split(/\r\n|\r|\n/).length,
+                projectedLineCount: projectedDash.split(/\r\n|\r|\n/).length
+            };
+        }
+
+        return empty;
     }
 
     function fixtureErrorCode(error) {
@@ -2676,9 +2738,15 @@
         if (!text) return;
         activePlayback = activePlayback == null ? isActivePlaybackObservation() : !!activePlayback;
         var format = /^\s*#EXTM3U/i.test(text) ? 'm3u8' : (/^\s*<MPD[\s>]/i.test(text) ? 'mpd' : '');
-        var projectedManifest = fixtureManifestText(text);
-        var manifestArtifact = projectedManifest ? captureCoupangArtifact('manifest', projectedManifest, function () {
-            return { format: format, url: url };
+        var manifestProjection = fixtureManifestProjection(url, text);
+        var manifestArtifact = manifestProjection.text ? captureCoupangArtifact('manifest', manifestProjection.text, function () {
+            return {
+                format: format,
+                url: url,
+                projected: manifestProjection.projected,
+                originalLineCount: manifestProjection.originalLineCount,
+                projectedLineCount: manifestProjection.projectedLineCount
+            };
         }) : null;
         var trackCountBefore = state.tracks.length;
         if (/^\s*#EXTM3U/i.test(text)) {

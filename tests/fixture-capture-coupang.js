@@ -27,6 +27,13 @@ function functionDeclaration(name) {
   return source.slice(start, next >= 0 ? next : source.length);
 }
 
+function sharedCaptureCoreDeclaration() {
+  const start = source.indexOf('    function createFixtureCapture(');
+  const end = source.indexOf('\n    // END SHARED FIXTURE CAPTURE CORE', start);
+  assert(start >= 0 && end > start, 'shared fixture capture core not found');
+  return source.slice(start, end);
+}
+
 function evaluate(code, extras = {}) {
   const context = { ...extras };
   vm.createContext(context);
@@ -245,7 +252,7 @@ test('capture helpers add no page, request, persistent storage, observer, or tim
     'startFixtureCapture', 'fixtureObservedState', 'exportFixtureCapture', 'printFixtureCaptureStatus',
     'captureCoupang', 'captureCoupangResource', 'captureCoupangArtifact', 'captureCoupangSnapshot', 'fixtureTrackSummary',
     'fixtureMetadataState', 'fixtureResourceKind', 'fixtureMetadataProjection',
-    'fixtureManifestText', 'fixtureErrorCode'
+    'fixtureManifestText', 'fixtureManifestProjection', 'fixtureErrorCode'
   ];
   const helpers = helperNames.map(functionDeclaration).join('\n');
   assert(!/document\.|createElement|GM_xmlhttpRequest|XMLHttpRequest|\bfetch\s*\(|GM_(?:get|set|delete)Value|MutationObserver|setTimeout|setInterval/.test(helpers));
@@ -399,6 +406,83 @@ test('successful fixture export passes the JSON blob to the existing file saver'
   }]);
 });
 
+test('HLS fixture projection removes DRM data and unrelated video variants', () => {
+  const context = evaluate(functionDeclaration('fixtureManifestProjection'), {
+    fixtureCaptureRecording: true,
+    looksLikeSubtitlePlaylist: () => false
+  });
+  const manifest = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:7',
+    '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="https://license.test/license/TOKEN_RAW"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="ko",URI="https://cdn.test/ko.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=800000,SUBTITLES="subs"',
+    'https://cdn.test/video.m3u8'
+  ].join('\n');
+  const projection = context.fixtureManifestProjection('https://cdn.test/master.m3u8', manifest);
+  assert.strictEqual(projection.relevant, true);
+  assert.strictEqual(projection.projected, true);
+  assert(projection.text.includes('TYPE=SUBTITLES'));
+  assert(!/SESSION-KEY|license\.test|video\.m3u8/.test(projection.text));
+});
+
+test('DASH fixture projection removes content protection and license endpoints', () => {
+  const context = evaluate(functionDeclaration('fixtureManifestProjection'), {
+    fixtureCaptureRecording: true,
+    looksLikeSubtitlePlaylist: () => false
+  });
+  const manifest = [
+    '<MPD>',
+    '  <Period>',
+    '    <AdaptationSet contentType="text" mimeType="application/ttml+xml">',
+    '      <ContentProtection schemeIdUri="urn:uuid:TOKEN_RAW"><cenc:pssh>PRIVATE_DRM</cenc:pssh></ContentProtection>',
+    '      <dashif:Laurl>https://license.test/license/TOKEN_RAW</dashif:Laurl>',
+    '      <Representation id="subtitle"><BaseURL>https://cdn.test/subtitle.m4s</BaseURL></Representation>',
+    '    </AdaptationSet>',
+    '  </Period>',
+    '</MPD>'
+  ].join('\n');
+  const projection = context.fixtureManifestProjection('https://cdn.test/manifest.mpd', manifest);
+  assert.strictEqual(projection.relevant, true);
+  assert(projection.text.includes('contentType="text"'));
+  assert(projection.text.includes('subtitle.m4s'));
+  assert(!/PRIVATE_DRM|license\.test|ContentProtection|pssh|Laurl/.test(projection.text));
+});
+
+test('projected subtitle manifests remain exportable through the shared safety core', () => {
+  const code = [
+    sharedCaptureCoreDeclaration(),
+    functionDeclaration('fixtureManifestProjection')
+  ].join('\n');
+  const context = evaluate(code, {
+    URL,
+    Blob,
+    fixtureCaptureRecording: true,
+    looksLikeSubtitlePlaylist: () => false
+  });
+  const capture = context.createFixtureCapture({
+    service: 'coupang',
+    scriptVersion: 'test',
+    page: { host: 'www.coupangplay.com', path: '/play/TOKEN_1/episode' },
+    Blob
+  });
+  assert.strictEqual(capture.start({ reason: 'test' }), true);
+  const manifest = [
+    '#EXTM3U',
+    '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="https://license.test/license/TOKEN_RAW"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="ko",URI="https://cdn.test/ko.m3u8"'
+  ].join('\n');
+  const projection = context.fixtureManifestProjection('https://cdn.test/master.m3u8', manifest);
+  assert(capture.artifact('manifest', projection.text, {
+    format: 'm3u8',
+    url: 'https://cdn.test/master.m3u8'
+  }));
+  capture.stop({ status: 'complete' });
+  const exported = capture.exportObject();
+  assert(exported);
+  assert.strictEqual(capture.status().exportBlocked, false);
+});
+
 test('metadata changes produce accepted events and deduplicated snapshots', () => {
   const events = [];
   const snapshots = [];
@@ -473,7 +557,7 @@ test('pilot records session, resource, metadata, manifest, track, filename, and 
     assert(source.includes(`'${event}'`), `${event} capture point missing`);
   }
   assert(source.includes('// @grant      GM_registerMenuCommand'));
-  assert(/^\/\/ @version\s+1\.0\.27$/m.test(source));
+  assert(/^\/\/ @version\s+1\.0\.28$/m.test(source));
 });
 
 console.log(`Coupang Play fixture capture adapter tests passed: ${passed}`);
