@@ -10,7 +10,8 @@ const END_MARKER = '    // END SHARED FIXTURE CAPTURE CORE';
 const TARGETS = [
   'scripts/apple-tv-plus-subtitles-downloader.user.js',
   'scripts/coupang-play-subtitles-downloader.user.js',
-  'scripts/disney-plus-subtitles-downloader.user.js'
+  'scripts/disney-plus-subtitles-downloader.user.js',
+  'scripts/netflix-subtitles-downloader.user.js'
 ];
 
 const args = new Set(process.argv.slice(2));

@@ -1,0 +1,38 @@
+{
+  "video": {
+    "type": "show",
+    "title": "SHOW_001",
+    "id": "TOKEN_SHOW",
+    "currentEpisode": "TOKEN_EP_2",
+    "seasons": [
+      {
+        "seq": 1,
+        "episodes": [
+          {
+            "seq": 1,
+            "id": "TOKEN_EP_1",
+            "title": "TEXT_001",
+            "hiddenEpisodeNumbers": false
+          },
+          {
+            "seq": 2,
+            "id": "TOKEN_EP_2",
+            "title": "TEXT_002",
+            "hiddenEpisodeNumbers": true
+          }
+        ]
+      },
+      {
+        "seq": 2,
+        "episodes": [
+          {
+            "seq": 1,
+            "id": "TOKEN_EP_3",
+            "title": "TEXT_003",
+            "hiddenEpisodeNumbers": false
+          }
+        ]
+      }
+    ]
+  }
+}

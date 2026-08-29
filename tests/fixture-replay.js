@@ -10,12 +10,31 @@ const ROOT = path.resolve(__dirname, '..');
 const APPLE_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'apple-tv-plus-subtitles-downloader.user.js'), 'utf8');
 const COUPANG_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'coupang-play-subtitles-downloader.user.js'), 'utf8');
 const DISNEY_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'disney-plus-subtitles-downloader.user.js'), 'utf8');
+const NETFLIX_SOURCE = fs.readFileSync(path.join(ROOT, 'scripts', 'netflix-subtitles-downloader.user.js'), 'utf8');
 
 function functionDeclaration(source, name) {
   const start = source.indexOf(`function ${name}(`);
   assert(start >= 0, `${name} not found in the selected userscript`);
   const next = source.indexOf('\n    function ', start + 1);
   return source.slice(start, next >= 0 ? next : source.length);
+}
+
+function constDeclaration(source, name) {
+  const start = source.indexOf(`const ${name} =`);
+  assert(start >= 0, `${name} not found in the selected userscript`);
+  const next = source.indexOf('\nconst ', start + 1);
+  return source.slice(start, next >= 0 ? next : source.length);
+}
+
+function netflixRuntime(names, extras) {
+  const context = {...extras};
+  vm.createContext(context);
+  vm.runInContext(
+    names.map(name => constDeclaration(NETFLIX_SOURCE, name)).join('\n') +
+      `\nthis.__netflixRuntime = {${names.join(',')}};`,
+    context
+  );
+  return {context, runtime: context.__netflixRuntime};
 }
 
 function appleMetadataRuntime() {
@@ -187,6 +206,100 @@ const replayDrivers = {
       },
       filename: runtime.formatMediaBaseFilename(runtime.state.mediaTitle, runtime.state.episodeTag)
     };
+  },
+  'netflix-metadata-v1': (inputText) => {
+    const input = JSON.parse(inputText);
+    const menu = {
+      classList: {
+        add() {},
+        remove() {}
+      }
+    };
+    const {context, runtime} = netflixRuntime([
+      'processMetadata',
+      'normalizeDomTitle',
+      'positiveInteger',
+      'cleanEpisodeSubtitle',
+      'pad',
+      'safeTitle',
+      'getTitleFromCache'
+    ], {
+      titleCache: {},
+      domDerivedTitleIds: {},
+      batchAll: null,
+      batchSeason: null,
+      batchToEnd: null,
+      epTitleInFilename: false,
+      fixtureCaptureRecording: false,
+      ensureMenu: () => menu,
+      syncPlaybackMetadataState: () => null,
+      checkSubsCache: () => {},
+      episodeNumberFromLabel: () => null,
+      console: {debug() {}}
+    });
+    runtime.processMetadata(input);
+    const current = input.video.type === 'show' ?
+      context.titleCache[input.video.currentEpisode] : context.titleCache[input.video.id];
+    const [filename] = runtime.getTitleFromCache(current);
+    return {
+      metadata: {
+        title: current.title,
+        season: current.season,
+        episode: current.episode,
+        subtitle: current.subtitle,
+        hiddenNumber: current.hiddenNumber
+      },
+      filename,
+      batch: {
+        allCount: Array.isArray(context.batchAll) ? context.batchAll.length : 0,
+        seasonCount: Array.isArray(context.batchSeason) ? context.batchSeason.length : 0,
+        toEndCount: Array.isArray(context.batchToEnd) ? context.batchToEnd.length : 0
+      }
+    };
+  },
+  'netflix-subtitle-catalog-v1': (inputText) => {
+    const input = JSON.parse(inputText);
+    const WEBVTT = 'webvtt-lssdh-ios8';
+    const DFXP = 'dfxp-ls-sdh';
+    const SIMPLE = 'simplesdh';
+    const IMSC1_1 = 'imsc1.1';
+    const {context, runtime} = netflixRuntime([
+      'processSubInfo',
+      'isUsableFormatCandidate',
+      'pickFormat'
+    ], {
+      SUB_TYPES: {subtitles: '', closedcaptions: '[cc]'},
+      ALL_FORMATS: [IMSC1_1, DFXP, WEBVTT, SIMPLE],
+      ALL_FORMATS_prefer_vtt: [WEBVTT, IMSC1_1, DFXP, SIMPLE],
+      EXTENSIONS: {
+        [WEBVTT]: 'vtt',
+        [DFXP]: 'dfxp',
+        [SIMPLE]: 'xml',
+        [IMSC1_1]: 'xml'
+      },
+      WEBVTT,
+      DFXP,
+      subFormat: WEBVTT,
+      subCache: {},
+      fixtureCaptureRecording: false,
+      handleSubsReady: () => false,
+      ensureMenu: () => null,
+      console: {log() {}},
+      alert() { throw new Error('synthetic subtitle catalog must contain usable URLs'); }
+    });
+    runtime.processSubInfo(input);
+    const subs = context.subCache[input.movieId];
+    const tracks = Object.keys(subs).map(language => {
+      const selected = runtime.pickFormat(subs[language]);
+      const format = Object.keys(subs[language]).find(candidate => subs[language][candidate] === selected);
+      return {
+        language,
+        format,
+        extension: selected[1],
+        mirrorCount: selected[0].length
+      };
+    }).sort((left, right) => left.language < right.language ? -1 : (left.language > right.language ? 1 : 0));
+    return {tracks};
   }
 };
 

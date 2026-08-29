@@ -2,13 +2,16 @@
 // @name       Netflix Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Netflix
-// @version    1.0.12
+// @version    1.0.13
 // @author     Tithen-Firion; modifications by Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
 // @downloadURL https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/netflix-subtitles-downloader.user.js
 // @updateURL  https://raw.githubusercontent.com/wonmin82/streaming-subtitle-downloaders/main/scripts/netflix-subtitles-downloader.user.js
 // @match      https://www.netflix.com/*
+// @grant      GM_info
+// @grant      GM_registerMenuCommand
+// @grant      GM_unregisterMenuCommand
 // @grant      unsafeWindow
 // @require    https://cdn.jsdelivr.net/npm/jszip@3.7.1/dist/jszip.min.js
 // @require    https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js
@@ -88,9 +91,9 @@ const DOWNLOAD_MENU = `
 <ol>
 <li class="header">Netflix subtitle downloader</li>
 <li class="download">Download subs for this <span class="series">episode</span><span class="not-series">movie</span></li>
-<li class="download-to-end series">Download subs from this ep till last available</li>
-<li class="download-season series">Download subs for this season</li>
-<li class="download-all series">Download subs for all seasons</li>
+<li class="download-to-end series batch-action">Download subs from this ep till last available</li>
+<li class="download-season series batch-action">Download subs for this season</li>
+<li class="download-all series batch-action">Download subs for all seasons</li>
 <li class="ep-title-in-filename">Add episode title to filename: <span></span></li>
 <li class="force-all-lang">Force Netflix to show all languages: <span></span></li>
 <li class="pref-locale">Preferred locale: <span></span></li>
@@ -137,6 +140,8 @@ body:hover #subtitle-downloader-menu { display: block; }
 
 #subtitle-downloader-menu:not(.series) .series{ display: none; }
 #subtitle-downloader-menu.series .not-series{ display: none; }
+#subtitle-downloader-menu.series:not(.batch-ready) .batch-action { opacity: .55; }
+#subtitle-downloader-menu.series:not(.batch-ready) .batch-action:hover { cursor: wait; }
 `;
 
 const SUB_TYPES = {
@@ -144,12 +149,912 @@ const SUB_TYPES = {
   'closedcaptions': '[cc]'
 };
 
+    // BEGIN SHARED FIXTURE CAPTURE CORE
+    function createFixtureCapture(options) {
+        'use strict';
+
+        options = options && typeof options === 'object' ? options : {};
+
+        var CAPTURE_TOOL_VERSION = '1.0.0';
+        var SANITIZATION_VERSION = 1;
+        var HARD_LIMITS = {
+            maxEvents: 3000,
+            maxSnapshots: 500,
+            maxArtifacts: 200,
+            maxArtifactBytes: 1024 * 1024,
+            maxCaptureBytes: 20 * 1024 * 1024,
+            maxStringBytes: 4096,
+            maxArrayItems: 200,
+            maxObjectKeys: 200,
+            maxDepth: 12
+        };
+        var MIN_LIMITS = {
+            maxEvents: 1,
+            maxSnapshots: 1,
+            maxArtifacts: 1,
+            maxArtifactBytes: 128,
+            maxCaptureBytes: 2048,
+            maxStringBytes: 64,
+            maxArrayItems: 1,
+            maxObjectKeys: 1,
+            maxDepth: 1
+        };
+        var SAFE_QUERY_VALUES = /^(?:lang(?:uage)?|locale|format|_HLS_msn|_HLS_part)$/i;
+        var SENSITIVE_KEY = /(?:^|_)(?:authorization|cookies?|set_cookie|password|passwd|secrets?|access_tokens?|refresh_tokens?|id_tokens?|tokens?|signatures?|polic(?:y|ies)|credentials?|api_keys?|private_keys?)(?:$|_)/i;
+        var SESSION_KEY = /(?:^|_)(?:playback_)?session(?:_?id)?(?:$|_)/i;
+        var URL_KEY = /(?:^|_)(?:url|uri|href|src|manifest|playlist)(?:$|_)/i;
+        var CONTENT_TEXT_KEY = /(?:^|_)(?:caption|subtitle|transcript|dialogue|body|description|synopsis|overview|summary|plot)(?:$|_)/i;
+        var ID_KEY = /(?:^|_)(?:id|(?:movie|content|playable|episode|asset|account|profile|subscriber|customer|user|viewer|device)_?id)(?:$|_)/i;
+        var PII_KEY = /(?:^|_)(?:(?:first|middle|last|full|given|family|display|profile|user|account|subscriber|customer|viewer)_?name|e_?mail|phone(?:_number)?|address|birth(?:date)?|date_of_birth|gender)(?:$|_)/i;
+        var PII_CONTAINER_KEY = /^(?:accounts?|profiles?|subscribers?|customers?|users?|viewers?|persons?|members?)$/i;
+        var DRM_KEY = /(?:^|_)(?:pssh|drm_data|license_data|license_challenge|license_response|certificate_data|widevine_data|fairplay_data|playready_data)(?:$|_)/i;
+        var DRM_ARTIFACT = /^(?:drm|license|certificate|cert|pssh|widevine|fairplay|playready|cenc)$/i;
+        var PROHIBITED_ARTIFACT = /^(?:dom|html|har|media|video|audio|image|binary|blob)$/i;
+        var DRM_PATH = /\/(?:drm|license|licenses|widevine|fairplay|playready|certificate|cert)(?:\/|$)/i;
+        var SIGNED_PATH_SEGMENT = /(?:^|[~;,])(?:dvt\d*|exp(?:ires)?|signature|sig|policy|tokens?|auth(?:orization)?|credentials?|psid|playback_?session_?id)=/i;
+        var limits = resolveLimits(options.limits);
+        var state = 'idle';
+        var data = null;
+        var startedAtMs = 0;
+        var capturedBytes = 0;
+        var artifactSequence = 0;
+        var eventSequence = 0;
+        var captionSequence = 0;
+        var textSequence = 0;
+        var sessionValues = [];
+        var tokenValues = [];
+        var warningKeys = Object.create(null);
+        var securityBlocked = false;
+        var lastError = '';
+
+        function resolveLimits(requested) {
+            var source = requested && typeof requested === 'object' ? requested : {};
+            var result = {};
+            Object.keys(HARD_LIMITS).forEach(function (key) {
+                var value = Number(source[key]);
+                if (!isFinite(value)) value = HARD_LIMITS[key];
+                value = Math.floor(value);
+                result[key] = Math.max(MIN_LIMITS[key], Math.min(HARD_LIMITS[key], value));
+            });
+            return result;
+        }
+
+        function safeNow() {
+            try {
+                var value = typeof options.now === 'function' ? Number(options.now()) : Date.now();
+                return isFinite(value) ? value : Date.now();
+            } catch (error) {
+                return Date.now();
+            }
+        }
+
+        function safeIsoTime(value) {
+            try {
+                return new Date(value).toISOString();
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function byteLength(value) {
+            var string = String(value == null ? '' : value);
+            var bytes = 0;
+            for (var index = 0; index < string.length; index++) {
+                var code = string.charCodeAt(index);
+                if (code < 0x80) {
+                    bytes += 1;
+                } else if (code < 0x800) {
+                    bytes += 2;
+                } else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < string.length &&
+                    string.charCodeAt(index + 1) >= 0xDC00 && string.charCodeAt(index + 1) <= 0xDFFF) {
+                    bytes += 4;
+                    index++;
+                } else {
+                    bytes += 3;
+                }
+            }
+            return bytes;
+        }
+
+        function truncateUtf8(value, maximum) {
+            var string = String(value == null ? '' : value);
+            if (byteLength(string) <= maximum) return string;
+            var bytes = 0;
+            var output = '';
+            for (var index = 0; index < string.length; index++) {
+                var code = string.charCodeAt(index);
+                var width = code < 0x80 ? 1 : (code < 0x800 ? 2 : 3);
+                var chunk = string.charAt(index);
+                if (code >= 0xD800 && code <= 0xDBFF && index + 1 < string.length &&
+                    string.charCodeAt(index + 1) >= 0xDC00 && string.charCodeAt(index + 1) <= 0xDFFF) {
+                    width = 4;
+                    chunk += string.charAt(++index);
+                }
+                if (bytes + width > maximum) break;
+                output += chunk;
+                bytes += width;
+            }
+            return output;
+        }
+
+        function safeJson(value) {
+            try {
+                return JSON.stringify(value);
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function cloneJson(value) {
+            try {
+                return JSON.parse(JSON.stringify(value));
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function sanitizeIdentifier(value, fallback) {
+            var result = String(value == null ? '' : value).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+            return truncateUtf8(result || fallback || 'unknown', 80);
+        }
+
+        function sanitizeEventType(value) {
+            var parts = String(value == null ? '' : value).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(function (part) {
+                return /^[a-z]/.test(part) ? part : 'x' + part;
+            });
+            if (!parts.length) parts = ['custom', 'event'];
+            if (parts.length === 1) parts.unshift('custom');
+            return truncateUtf8(parts.join('.'), 80).replace(/\.+$/, '') || 'custom.event';
+        }
+
+        function sanitizeKind(value, fallback) {
+            var result = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
+            if (!result) result = fallback || 'item';
+            if (!/^[a-z]/.test(result)) result = 'item-' + result;
+            return truncateUtf8(result, 80).replace(/[.-]+$/, '') || 'item';
+        }
+
+        function sanitizeFormat(value) {
+            var result = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9.+-]+/g, '-').replace(/^[.+-]+|[.+-]+$/g, '');
+            return truncateUtf8(result || 'text', 32).replace(/[.+-]+$/, '') || 'text';
+        }
+
+        function resetMappings() {
+            sessionValues = [];
+            tokenValues = [];
+            captionSequence = 0;
+            textSequence = 0;
+        }
+
+        function mappedValue(collection, prefix, value) {
+            var string = String(value == null ? '' : value);
+            var index = collection.indexOf(string);
+            if (index < 0) {
+                collection.push(string);
+                index = collection.length - 1;
+            }
+            return prefix + '_' + (index + 1);
+        }
+
+        function mapSession(value) {
+            if (value == null || value === '') return '';
+            return mappedValue(sessionValues, 'SESSION', value);
+        }
+
+        function mapToken(value) {
+            if (value == null || value === '') return '';
+            return mappedValue(tokenValues, 'TOKEN', value);
+        }
+
+        function looksOpaque(value) {
+            var string = String(value == null ? '' : value);
+            return /^[0-9]{10,}$/.test(string) ||
+                /^[0-9a-f]{16,}$/i.test(string) ||
+                /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(string) ||
+                (/^[A-Za-z0-9_-]{20,}$/.test(string) && /[0-9]/.test(string));
+        }
+
+        function normalizedKey(value) {
+            return String(value == null ? '' : value)
+                .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+                .replace(/[-:\s]+/g, '_')
+                .toLowerCase();
+        }
+
+        function addWarning(code) {
+            if (!data || warningKeys[code]) return;
+            warningKeys[code] = true;
+            if (data.sanitization.warnings.length < 50) data.sanitization.warnings.push(truncateUtf8(code, 120));
+        }
+
+        function markTruncated(code) {
+            if (data) data.capture.truncated = true;
+            addWarning('limit:' + code);
+        }
+
+        function redact() {
+            if (data) data.sanitization.redactions++;
+            return 'REDACTED';
+        }
+
+        function flagCriticalSecret(code) {
+            securityBlocked = true;
+            addWarning('security:' + code);
+            if (data) data.sanitization.redactions++;
+        }
+
+        function containsCriticalSecret(value, key) {
+            var string = String(value == null ? '' : value);
+            if ((/(?:authorization|cookie|set-cookie)/i.test(String(key || '')) && string && string !== 'REDACTED') ||
+                /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(string) ||
+                /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(string) ||
+                /\b(?:Cookie|Set-Cookie|Authorization)\s*:\s*\S+/i.test(string) ||
+                /\bAKIA[0-9A-Z]{16}\b/.test(string) ||
+                /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(string) ||
+                (!/\s/.test(string) && /^(?:[A-Za-z0-9+/]{256,}={0,2})$/.test(string)) ||
+                /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(string)) {
+                return true;
+            }
+            return false;
+        }
+
+        function sanitizeUrl(value) {
+            try {
+                var input = truncateUtf8(value, limits.maxStringBytes * 4);
+                if (!input) return '';
+                if (/^(?:data|blob|javascript):/i.test(input)) return redact() + '_URL';
+                var absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(input) || /^\/\//.test(input);
+                var url = new URL(input, 'https://fixture.invalid/');
+                if (!/^https?:$/.test(url.protocol)) return redact() + '_URL';
+                if (DRM_PATH.test(url.pathname)) {
+                    flagCriticalSecret('drm-url');
+                    return 'REDACTED_URL';
+                }
+                url.username = '';
+                url.password = '';
+                var pathParts = url.pathname.split('/').map(function (part) {
+                    if (!part) return part;
+                    var decodedPart = part;
+                    try { decodedPart = decodeURIComponent(part); } catch (error) {}
+                    if (SIGNED_PATH_SEGMENT.test(decodedPart)) return mapToken(part);
+                    var extensionMatch = part.match(/^(.*?)(\.[A-Za-z0-9]{1,8})$/);
+                    var stem = extensionMatch ? extensionMatch[1] : part;
+                    var extension = extensionMatch ? extensionMatch[2] : '';
+                    return looksOpaque(stem) ? mapToken(stem) + extension : truncateUtf8(part, 160);
+                });
+                url.pathname = pathParts.join('/');
+                var query = [];
+                url.searchParams.forEach(function (queryValue, queryKey) {
+                    var safeKey = truncateUtf8(queryKey.replace(/[^A-Za-z0-9_.-]/g, '_'), 80);
+                    var safeValue = SAFE_QUERY_VALUES.test(queryKey) && /^[A-Za-z0-9_.-]{1,40}$/.test(queryValue) ? queryValue : redact();
+                    query.push(encodeURIComponent(safeKey) + '=' + encodeURIComponent(safeValue));
+                });
+                url.search = query.length ? '?' + query.join('&') : '';
+                url.hash = '';
+                if (!absolute) return url.pathname + url.search;
+                if (/^\/\//.test(input)) return '//' + url.host + url.pathname + url.search;
+                return url.protocol + '//' + url.host + url.pathname + url.search;
+            } catch (error) {
+                if (data) data.sanitization.redactions++;
+                return 'REDACTED_URL';
+            }
+        }
+
+        function sanitizeInlineString(value, key) {
+            var string = String(value == null ? '' : value);
+            if (containsCriticalSecret(string, key)) {
+                flagCriticalSecret('high-risk-value');
+                return 'REDACTED_SECRET';
+            }
+            var normalized = normalizedKey(key);
+            if (DRM_KEY.test(normalized)) {
+                if (data) data.sanitization.redactions++;
+                addWarning('sanitizer:drm-field-removed');
+                return 'REDACTED';
+            }
+            if (PII_KEY.test(normalized) || PII_CONTAINER_KEY.test(normalized)) return redact();
+            if (SENSITIVE_KEY.test(normalized)) return redact();
+            if (SESSION_KEY.test(normalized)) return mapSession(string);
+            if (CONTENT_TEXT_KEY.test(normalized)) {
+                textSequence++;
+                if (data) data.sanitization.redactions++;
+                return 'TEXT_' + textSequence;
+            }
+            if (URL_KEY.test(normalized) || /^(?:https?:)?\/\//i.test(string)) return sanitizeUrl(string);
+            if (ID_KEY.test(normalized) && string) return mapToken(string);
+            if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(string)) {
+                if (data) data.sanitization.redactions++;
+                string = string.replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, 'REDACTED_EMAIL');
+            }
+            string = string.replace(/([?&](?:token|sig|signature|policy|key|auth|credential)=)[^&#\s]*/ig, '$1REDACTED');
+            if (byteLength(string) > limits.maxStringBytes) {
+                markTruncated('maxStringBytes');
+                string = truncateUtf8(string, limits.maxStringBytes);
+            }
+            return string;
+        }
+
+        function sanitizeValue(value, key, depth, seen) {
+            var normalized = normalizedKey(key);
+            if (value == null) return value;
+            if (typeof value === 'boolean') {
+                if (DRM_KEY.test(normalized) || SENSITIVE_KEY.test(normalized) || PII_KEY.test(normalized) ||
+                    PII_CONTAINER_KEY.test(normalized) || SESSION_KEY.test(normalized) || ID_KEY.test(normalized)) return redact();
+                return value;
+            }
+            if (typeof value !== 'string') {
+                if (DRM_KEY.test(normalized) || SENSITIVE_KEY.test(normalized) || PII_KEY.test(normalized) ||
+                    (PII_CONTAINER_KEY.test(normalized) && typeof value === 'object')) return redact();
+                if (SESSION_KEY.test(normalized) && (typeof value === 'number' || typeof value === 'bigint')) return mapSession(value);
+                if (ID_KEY.test(normalized) && (typeof value === 'number' || typeof value === 'bigint')) return mapToken(value);
+                if (CONTENT_TEXT_KEY.test(normalized) && typeof value === 'object') {
+                    textSequence++;
+                    if (data) data.sanitization.redactions++;
+                    return 'TEXT_' + textSequence;
+                }
+            }
+            if (typeof value === 'number') return isFinite(value) ? value : null;
+            if (typeof value === 'bigint') return sanitizeInlineString(String(value), key);
+            if (typeof value === 'string') return sanitizeInlineString(value, key);
+            if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') return null;
+            if (depth >= limits.maxDepth) {
+                markTruncated('maxDepth');
+                return '[MAX_DEPTH]';
+            }
+            if (seen.indexOf(value) >= 0) {
+                addWarning('sanitizer:cyclic-value');
+                return '[CIRCULAR]';
+            }
+            seen.push(value);
+            try {
+                if (Array.isArray(value)) {
+                    if (value.length > limits.maxArrayItems) markTruncated('maxArrayItems');
+                    return value.slice(0, limits.maxArrayItems).map(function (item) {
+                        return sanitizeValue(item, key, depth + 1, seen);
+                    });
+                }
+                var result = Object.create(null);
+                var keys;
+                try {
+                    keys = Object.keys(value);
+                } catch (error) {
+                    addWarning('sanitizer:unreadable-object');
+                    return '[UNREADABLE]';
+                }
+                if (keys.length > limits.maxObjectKeys) markTruncated('maxObjectKeys');
+                keys.slice(0, limits.maxObjectKeys).forEach(function (property) {
+                    var propertyValue;
+                    try {
+                        propertyValue = value[property];
+                    } catch (error) {
+                        addWarning('sanitizer:unreadable-property');
+                        result[property] = '[UNREADABLE]';
+                        return;
+                    }
+                    var safeProperty = truncateUtf8(String(property), 120);
+                    result[safeProperty] = sanitizeValue(propertyValue, property, depth + 1, seen);
+                });
+                return result;
+            } finally {
+                seen.pop();
+            }
+        }
+
+        function sanitizeJsonText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            try {
+                return JSON.stringify(sanitizeValue(JSON.parse(input), '', 0, []), null, 2);
+            } catch (error) {
+                addWarning('sanitizer:invalid-json');
+                return '[REDACTED_INVALID_JSON]';
+            }
+        }
+
+        function sanitizeManifestText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            var lines = input.split(/\r\n|\r|\n/);
+            return lines.map(function (line) {
+                var trimmed = line.trim();
+                if (!trimmed) return '';
+                if (/^#EXT-X-(?:SESSION-)?KEY\s*:/i.test(trimmed)) {
+                    if (data) data.sanitization.redactions++;
+                    addWarning('sanitizer:drm-hls-removed');
+                    return trimmed.replace(/:.*/, ':REDACTED');
+                }
+                if (/^(?:https?:)?\/\//i.test(trimmed) || (!/^#/.test(trimmed) && /[/?]/.test(trimmed))) {
+                    return sanitizeUrl(trimmed);
+                }
+                var output = line.replace(/(URI\s*=\s*)(["'])(.*?)(\2)/ig, function (_, prefix, quote, uri) {
+                    return prefix + quote + sanitizeUrl(uri) + quote;
+                });
+                output = output.replace(/(https?:\/\/[^\s,"']+)/ig, function (url) {
+                    return sanitizeUrl(url);
+                });
+                return sanitizeInlineString(output, 'structure_line');
+            }).join('\n');
+        }
+
+        function sanitizeCueMarkup(line) {
+            var parts = String(line).split(/(<[^>]*>)/g);
+            var wroteCaption = false;
+            return parts.map(function (part) {
+                if (!part) return '';
+                if (/^<[^>]*>$/.test(part)) {
+                    if (/^<v(?:\s|>)/i.test(part)) return part.replace(/^<v[^>]*>/i, '<v SPEAKER>');
+                    return truncateUtf8(part.replace(/\s(?:id|data-[\w-]+)=(['"])[\s\S]*?\1/ig, ''), 240);
+                }
+                if (!part.trim()) return part;
+                if (wroteCaption) return '';
+                captionSequence++;
+                wroteCaption = true;
+                if (data) data.sanitization.redactions++;
+                return 'CAPTION_' + captionSequence;
+            }).join('');
+        }
+
+        function sanitizeWebVttText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            var lines = input.split(/\r\n|\r|\n/);
+            var inCue = false;
+            var inNote = false;
+            var structuralBlock = '';
+            return lines.map(function (line) {
+                var trimmed = line.trim();
+                if (!trimmed) {
+                    inCue = false;
+                    inNote = false;
+                    structuralBlock = '';
+                    return '';
+                }
+                if (/^WEBVTT(?:\s|$)/i.test(trimmed)) return 'WEBVTT';
+                if (inNote) return '';
+                if (/^NOTE(?:\s|$)/i.test(trimmed)) {
+                    inNote = true;
+                    textSequence++;
+                    if (data) data.sanitization.redactions++;
+                    return 'NOTE TEXT_' + textSequence;
+                }
+                if (/^(?:STYLE|REGION)$/i.test(trimmed)) {
+                    structuralBlock = trimmed.toUpperCase();
+                    return structuralBlock;
+                }
+                if (/-->/.test(line)) {
+                    inCue = true;
+                    structuralBlock = '';
+                    return sanitizeInlineString(line, 'cue_timing');
+                }
+                if (inCue) return sanitizeCueMarkup(line);
+                if (structuralBlock) {
+                    return sanitizeInlineString(line.replace(/url\((['"]?)(.*?)\1\)/ig, function (_, quote, url) {
+                        return 'url(' + quote + sanitizeUrl(url) + quote + ')';
+                    }), 'vtt_structure');
+                }
+                if (/^(?:X-TIMESTAMP-MAP|Kind|Language)\s*[:=]/i.test(trimmed)) return sanitizeManifestText(line);
+                textSequence++;
+                if (data) data.sanitization.redactions++;
+                return 'CUE_' + textSequence;
+            }).join('\n');
+        }
+
+        function sanitizeXmlTag(tag) {
+            return tag.replace(/\s([:\w.-]+)\s*=\s*(["'])([\s\S]*?)\2/g, function (_, attribute, quote, value) {
+                var safeValue;
+                var normalized = normalizedKey(attribute);
+                if (SENSITIVE_KEY.test(normalized)) safeValue = redact();
+                else if (URL_KEY.test(normalized) || /^(?:https?:)?\/\//i.test(value)) safeValue = sanitizeUrl(value);
+                else if (SESSION_KEY.test(normalized)) safeValue = mapSession(value);
+                else if (ID_KEY.test(normalized) && looksOpaque(value)) safeValue = mapToken(value);
+                else safeValue = sanitizeInlineString(value, attribute);
+                return ' ' + attribute + '=' + quote + safeValue + quote;
+            });
+        }
+
+        function sanitizeXmlText(text) {
+            var input = truncateUtf8(text, limits.maxArtifactBytes);
+            input = input.replace(/<!--[\s\S]*?-->/g, '<!-- REDACTED -->');
+            input = input.replace(/<(?:[\w.-]+:)?(?:pssh|pro|ContentProtection)\b[^>]*(?:\/>|>[\s\S]*?<\/(?:[\w.-]+:)?(?:pssh|pro|ContentProtection)\s*>)/gi, function () {
+                if (data) data.sanitization.redactions++;
+                addWarning('sanitizer:drm-xml-removed');
+                return '<!-- DRM_REMOVED -->';
+            });
+            input = input.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, function () {
+                captionSequence++;
+                if (data) data.sanitization.redactions++;
+                return '<![CDATA[CAPTION_' + captionSequence + ']]>';
+            });
+            return input.split(/(<[^>]+>)/g).map(function (part) {
+                if (!part) return '';
+                if (/^<[^>]+>$/.test(part)) return sanitizeXmlTag(part);
+                if (!part.trim()) return part;
+                captionSequence++;
+                if (data) data.sanitization.redactions++;
+                var leading = (part.match(/^\s*/) || [''])[0];
+                var trailing = (part.match(/\s*$/) || [''])[0];
+                return leading + 'CAPTION_' + captionSequence + trailing;
+            }).join('');
+        }
+
+        function sanitizeArtifactText(kind, text, format) {
+            var normalized = String(format || '').toLowerCase();
+            if (normalized === 'json' || /json/.test(normalized)) return sanitizeJsonText(text);
+            if (/^(?:vtt|webvtt)$/.test(normalized)) return sanitizeWebVttText(text);
+            if (/^(?:xml|ttml|dfxp|mpd)$/.test(normalized)) return sanitizeXmlText(text);
+            if (/^(?:m3u8|hls|manifest)$/.test(normalized) || /manifest|playlist/i.test(String(kind || ''))) {
+                return sanitizeManifestText(text);
+            }
+            addWarning('sanitizer:unsupported-artifact-format');
+            if (data) data.sanitization.redactions++;
+            return '[REDACTED_ARTIFACT]';
+        }
+
+        function reserve(value) {
+            var encoded = safeJson(value);
+            if (!encoded) return false;
+            var size = byteLength(encoded);
+            if (capturedBytes + size > limits.maxCaptureBytes) {
+                markTruncated('maxCaptureBytes');
+                return false;
+            }
+            capturedBytes += size;
+            return true;
+        }
+
+        function captureEvent(type, eventData, context, internal) {
+            if (state !== 'recording') return false;
+            if (data.events.length >= limits.maxEvents) {
+                markTruncated('maxEvents');
+                return false;
+            }
+            var safeType = sanitizeEventType(type);
+            var safeContext = context && typeof context === 'object' ? context : {};
+            var record = {
+                seq: ++eventSequence,
+                t: Math.max(0, Math.round(safeNow() - startedAtMs)),
+                type: safeType,
+                data: {}
+            };
+            if (safeContext.session != null && safeContext.session !== '') record.session = mapSession(safeContext.session);
+            if (eventData !== undefined) {
+                var sanitizedEventData = sanitizeValue(eventData, '', 0, []);
+                record.data = sanitizedEventData && typeof sanitizedEventData === 'object' && !Array.isArray(sanitizedEventData) ?
+                    sanitizedEventData : { value: sanitizedEventData };
+            }
+            if (!reserve(record)) return false;
+            data.events.push(record);
+            return true;
+        }
+
+        function captureSnapshot(kind, snapshotData, context) {
+            try {
+                if (state !== 'recording') return false;
+                if (data.snapshots.length >= limits.maxSnapshots) {
+                    markTruncated('maxSnapshots');
+                    return false;
+                }
+                var safeContext = context && typeof context === 'object' ? context : {};
+                var record = {
+                    seq: ++eventSequence,
+                    t: Math.max(0, Math.round(safeNow() - startedAtMs)),
+                    kind: sanitizeKind(kind, 'snapshot'),
+                    data: {}
+                };
+                var sanitizedSnapshotData = sanitizeValue(snapshotData, '', 0, []);
+                record.data = sanitizedSnapshotData && typeof sanitizedSnapshotData === 'object' && !Array.isArray(sanitizedSnapshotData) ?
+                    sanitizedSnapshotData : { value: sanitizedSnapshotData };
+                if (safeContext.session != null && safeContext.session !== '') record.session = mapSession(safeContext.session);
+                if (!reserve(record)) return false;
+                data.snapshots.push(record);
+                return true;
+            } catch (error) {
+                lastError = 'snapshot-failed';
+                return false;
+            }
+        }
+
+        function captureArtifact(kind, text, metadata) {
+            try {
+                if (state !== 'recording') return null;
+                var requestedKind = String(kind == null ? '' : kind);
+                var requestedFormat = metadata && typeof metadata === 'object' ? String(metadata.format || '') : '';
+                if (DRM_ARTIFACT.test(requestedKind) || DRM_ARTIFACT.test(requestedFormat)) {
+                    flagCriticalSecret('drm-artifact');
+                    return null;
+                }
+                if (PROHIBITED_ARTIFACT.test(requestedKind) || PROHIBITED_ARTIFACT.test(requestedFormat)) {
+                    addWarning('sanitizer:prohibited-artifact-ignored');
+                    return null;
+                }
+                if (data && data.artifacts && Object.keys(data.artifacts).length >= limits.maxArtifacts) {
+                    markTruncated('maxArtifacts');
+                    return null;
+                }
+                var source = String(text == null ? '' : text);
+                if (byteLength(source) > limits.maxArtifactBytes) markTruncated('maxArtifactBytes');
+                var safeMetadata = metadata && typeof metadata === 'object' ? metadata : {};
+                var format = sanitizeFormat(safeMetadata.format || '');
+                var sanitizedText = sanitizeArtifactText(kind, source, format);
+                if (byteLength(sanitizedText) > limits.maxArtifactBytes) {
+                    sanitizedText = truncateUtf8(sanitizedText, limits.maxArtifactBytes);
+                    markTruncated('maxArtifactBytes');
+                }
+                var identifier = 'ARTIFACT_' + (++artifactSequence);
+                var record = {
+                    kind: sanitizeKind(kind, 'artifact'),
+                    format: format,
+                    text: sanitizedText,
+                    byteLength: byteLength(sanitizedText)
+                };
+                if (safeMetadata.url) {
+                    var safeArtifactUrl = sanitizeUrl(safeMetadata.url);
+                    if (/^https?:\/\//i.test(safeArtifactUrl)) record.url = safeArtifactUrl;
+                }
+                var metadataCopy = {};
+                Object.keys(safeMetadata).forEach(function (key) {
+                    if (key !== 'url' && key !== 'format') metadataCopy[key] = safeMetadata[key];
+                });
+                if (Object.keys(metadataCopy).length) record.metadata = sanitizeValue(metadataCopy, '', 0, []);
+                if (!reserve(record)) return null;
+                data.artifacts[identifier] = record;
+                return identifier;
+            } catch (error) {
+                lastError = 'artifact-failed';
+                return null;
+            }
+        }
+
+        function sanitizePage() {
+            var supplied = options.page && typeof options.page === 'object' ? options.page : {};
+            var host = String(supplied.host || '');
+            var path = String(supplied.path || '');
+            if ((!host || !path) && options.pageUrl) {
+                try {
+                    var parsed = new URL(String(options.pageUrl));
+                    host = host || parsed.host;
+                    path = path || parsed.pathname;
+                } catch (error) {
+                    addWarning('sanitizer:invalid-page-url');
+                }
+            }
+            var safePath = sanitizeUrl(path || '/');
+            return {
+                host: truncateUtf8(host.replace(/[^A-Za-z0-9.:-]/g, ''), 255),
+                path: safePath.split('?')[0] || '/'
+            };
+        }
+
+        function start(context) {
+            try {
+                if (state === 'recording') return false;
+                state = 'idle';
+                data = null;
+                capturedBytes = 0;
+                artifactSequence = 0;
+                eventSequence = 0;
+                warningKeys = Object.create(null);
+                securityBlocked = false;
+                lastError = '';
+                resetMappings();
+                startedAtMs = safeNow();
+                data = {
+                    schemaVersion: 1,
+                    captureToolVersion: CAPTURE_TOOL_VERSION,
+                    service: sanitizeIdentifier(options.service, 'unknown'),
+                    scriptVersion: sanitizeIdentifier(options.scriptVersion, 'unknown'),
+                    page: {},
+                    capture: {
+                        startedAt: safeIsoTime(startedAtMs),
+                        durationMs: 0,
+                        truncated: false,
+                        limits: cloneJson(limits)
+                    },
+                    events: [],
+                    artifacts: {},
+                    snapshots: [],
+                    observed: {},
+                    sanitization: {
+                        version: SANITIZATION_VERSION,
+                        redactions: 0,
+                        warnings: []
+                    }
+                };
+                data.page = sanitizePage();
+                capturedBytes = byteLength(safeJson(data));
+                if (capturedBytes > limits.maxCaptureBytes) {
+                    data = null;
+                    lastError = 'capture-limit-too-small';
+                    return false;
+                }
+                state = 'recording';
+                captureEvent('capture.start', context || {}, null, true);
+                return true;
+            } catch (error) {
+                state = 'idle';
+                data = null;
+                lastError = 'start-failed';
+                return false;
+            }
+        }
+
+        function stop(observed) {
+            try {
+                if (state !== 'recording') return false;
+                if (observed !== undefined) {
+                    var safeObserved = sanitizeValue(observed, '', 0, []);
+                    data.observed = safeObserved && typeof safeObserved === 'object' && !Array.isArray(safeObserved) ?
+                        safeObserved : { value: safeObserved };
+                }
+                captureEvent('capture.stop', {}, null, true);
+                data.capture.durationMs = Math.max(0, Math.round(safeNow() - startedAtMs));
+                state = 'stopped';
+                return true;
+            } catch (error) {
+                state = data ? 'stopped' : 'idle';
+                lastError = 'stop-failed';
+                return false;
+            }
+        }
+
+        function setObserved(observed) {
+            try {
+                if (state !== 'recording' || !data) return false;
+                var safeObserved = sanitizeValue(observed, '', 0, []);
+                safeObserved = safeObserved && typeof safeObserved === 'object' && !Array.isArray(safeObserved) ?
+                    safeObserved : { value: safeObserved };
+                if (!reserve(safeObserved)) return false;
+                data.observed = safeObserved;
+                return true;
+            } catch (error) {
+                lastError = 'observed-failed';
+                return false;
+            }
+        }
+
+        function clear() {
+            try {
+                data = null;
+                state = 'idle';
+                startedAtMs = 0;
+                capturedBytes = 0;
+                artifactSequence = 0;
+                eventSequence = 0;
+                warningKeys = Object.create(null);
+                securityBlocked = false;
+                lastError = '';
+                resetMappings();
+                return true;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function scanExport(serialized) {
+            return /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(serialized) ||
+                /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(serialized) ||
+                /\bAKIA[0-9A-Z]{16}\b/.test(serialized) ||
+                /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(serialized) ||
+                /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(serialized) ||
+                /"(?:authorization|cookie|set-cookie)"\s*:\s*"(?!REDACTED(?:_SECRET)?")[^"]+"/i.test(serialized) ||
+                /[?&](?:token|sig|signature|policy|key|auth|credential)=(?!REDACTED(?:%20|\b))[^&#"\s]+/i.test(serialized) ||
+                /(?:^|[\/~;,])(?:dvt\d*|exp(?:ires)?|signature|sig|policy|tokens?|auth(?:orization)?|credentials?|psid|playback_?session_?id)=(?!REDACTED(?:%20|\b)|TOKEN_[1-9]\d*(?:[\/~;,]|$))[^\s"'<>]*/im.test(serialized);
+        }
+
+        function compactExport(result) {
+            var serialized = safeJson(result);
+            if (!serialized) return null;
+            if (byteLength(serialized) <= limits.maxCaptureBytes) return result;
+            result.capture.truncated = true;
+            if (result.sanitization.warnings.indexOf('limit:export-size') < 0) result.sanitization.warnings.push('limit:export-size');
+            var artifactIds = Object.keys(result.artifacts).reverse();
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && artifactIds.length) {
+                delete result.artifacts[artifactIds.shift()];
+            }
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && result.snapshots.length) result.snapshots.pop();
+            while (byteLength(safeJson(result)) > limits.maxCaptureBytes && result.events.length > 1) result.events.pop();
+            return byteLength(safeJson(result)) <= limits.maxCaptureBytes ? result : null;
+        }
+
+        function exportObject() {
+            try {
+                if (!data || state === 'idle') return null;
+                var result = cloneJson(data);
+                if (!result) {
+                    lastError = 'export-serialization-failed';
+                    return null;
+                }
+                if (state === 'recording') result.capture.durationMs = Math.max(0, Math.round(safeNow() - startedAtMs));
+                result = compactExport(result);
+                if (!result) {
+                    lastError = 'export-size-limit';
+                    return null;
+                }
+                var serialized = safeJson(result);
+                if (securityBlocked || scanExport(serialized)) {
+                    securityBlocked = true;
+                    lastError = 'export-blocked-sensitive-data';
+                    return null;
+                }
+                return result;
+            } catch (error) {
+                lastError = 'export-failed';
+                return null;
+            }
+        }
+
+        function exportBlob(pretty) {
+            try {
+                var result = exportObject();
+                if (!result) return null;
+                var BlobConstructor = options.Blob;
+                if (!BlobConstructor && typeof Blob !== 'undefined') BlobConstructor = Blob;
+                if (typeof BlobConstructor !== 'function') {
+                    lastError = 'blob-unavailable';
+                    return null;
+                }
+                return new BlobConstructor([JSON.stringify(result, null, pretty === false ? 0 : 2)], {
+                    type: 'application/json;charset=utf-8'
+                });
+            } catch (error) {
+                lastError = 'blob-export-failed';
+                return null;
+            }
+        }
+
+        function status() {
+            try {
+                return {
+                    state: state,
+                    recording: state === 'recording',
+                    eventCount: data ? data.events.length : 0,
+                    artifactCount: data ? Object.keys(data.artifacts).length : 0,
+                    snapshotCount: data ? data.snapshots.length : 0,
+                    truncated: !!(data && data.capture.truncated),
+                    exportBlocked: securityBlocked,
+                    lastError: lastError
+                };
+            } catch (error) {
+                return {
+                    state: state,
+                    recording: false,
+                    eventCount: 0,
+                    artifactCount: 0,
+                    snapshotCount: 0,
+                    truncated: false,
+                    exportBlocked: true,
+                    lastError: 'status-failed'
+                };
+            }
+        }
+
+        return {
+            start: start,
+            stop: stop,
+            clear: clear,
+            event: function (type, eventData, context) {
+                try {
+                    return captureEvent(type, eventData, context, false);
+                } catch (error) {
+                    lastError = 'event-failed';
+                    return false;
+                }
+            },
+            artifact: captureArtifact,
+            snapshot: captureSnapshot,
+            setObserved: setObserved,
+            exportObject: exportObject,
+            exportBlob: exportBlob,
+            status: status
+        };
+    }
+    // END SHARED FIXTURE CAPTURE CORE
+
 let idOverrides = {};
 let subCache = {};
 let titleCache = {};
 let domDerivedTitleIds = {};
 let subCacheWaitGeneration = 0;
 let batchDownloadInProgress = false;
+let singleDownloadInProgress = false;
+let lastBatchMetadataLookup = null;
 let downloadUiState = {
   active: false,
   filename: '',
@@ -175,6 +1080,539 @@ let prefLocale = localStorage.getItem('NSD_pref-locale') || '';
 let langs = localStorage.getItem('NSD_lang-setting') || '';
 let subFormat = localStorage.getItem('NSD_sub-format') || WEBVTT;
 let batchDelay = parseFloat(localStorage.getItem('NSD_batch-delay') || '0');
+
+const FIXTURE_CAPTURE_ARM_KEY = 'ssd:fixture-capture:netflix:armed-until';
+const FIXTURE_CAPTURE_ARM_TTL_MS = 2 * 60 * 1000;
+const fixtureCaptureEnabled = consumeFixtureCaptureArm();
+const fixtureCapture = fixtureCaptureEnabled ? createFixtureCapture({
+  service: 'netflix',
+  scriptVersion: currentUserscriptVersion(),
+  page: {
+    host: location.host,
+    path: /^\/watch\//.test(location.pathname || '') ? '/watch/TOKEN_1' : '/'
+  },
+  Blob: typeof Blob === 'function' ? Blob : null
+}) : null;
+let fixtureCaptureRecording = false;
+let fixtureCaptureMenuCommandIds = [];
+let fixtureSnapshotValues = fixtureCaptureEnabled ? Object.create(null) : null;
+let fixtureArtifactCache = fixtureCaptureEnabled ? [] : null;
+let fixtureSessionSequence = 0;
+let fixtureSessionId = '';
+let fixtureVideoKey = '';
+let fixtureLastMetadata = null;
+let fixtureLastTrackCatalog = [];
+let fixtureLastFilename = '';
+let fixtureDownloadSequence = 0;
+let fixtureActiveDownloadOperation = null;
+
+function currentUserscriptVersion() {
+  try {
+    if(typeof GM_info === 'object' && GM_info && GM_info.script &&
+       typeof GM_info.script.version === 'string' && GM_info.script.version)
+      return GM_info.script.version;
+  }
+  catch(ignore) {}
+  return 'unknown';
+}
+
+function consumeFixtureCaptureArm() {
+  try {
+    if(window.top !== window)
+      return false;
+    const rawExpiry = window.sessionStorage.getItem(FIXTURE_CAPTURE_ARM_KEY);
+    if(!rawExpiry)
+      return false;
+    window.sessionStorage.removeItem(FIXTURE_CAPTURE_ARM_KEY);
+    const expiresAt = Number(rawExpiry);
+    const remainingMs = expiresAt - Date.now();
+    return Number.isFinite(expiresAt) && remainingMs >= 0 && remainingMs <= FIXTURE_CAPTURE_ARM_TTL_MS;
+  }
+  catch(ignore) {
+    return false;
+  }
+}
+
+function armFixtureCaptureAndReload() {
+  try {
+    if(window.top !== window)
+      return false;
+    window.sessionStorage.setItem(FIXTURE_CAPTURE_ARM_KEY, String(Date.now() + FIXTURE_CAPTURE_ARM_TTL_MS));
+    location.reload();
+    return true;
+  }
+  catch(ignore) {
+    return false;
+  }
+}
+
+function installFixtureCaptureCommands(skipAutoStart) {
+  try {
+    if(window.top !== window)
+      return;
+  }
+  catch(ignore) {
+    return;
+  }
+
+  if(!skipAutoStart && fixtureCapture)
+    startFixtureCapture('menu-armed-reload');
+  if(typeof GM_registerMenuCommand !== 'function')
+    return;
+
+  try {
+    if(typeof GM_unregisterMenuCommand === 'function') {
+      fixtureCaptureMenuCommandIds.forEach(commandId => {
+        try { GM_unregisterMenuCommand(commandId); }
+        catch(ignore) {}
+      });
+    }
+    fixtureCaptureMenuCommandIds = [];
+
+    const registerCommand = (label, handler) => {
+      const commandId = GM_registerMenuCommand(label, handler);
+      if(commandId !== undefined && commandId !== null)
+        fixtureCaptureMenuCommandIds.push(commandId);
+    };
+
+    if(!fixtureCaptureRecording) {
+      registerCommand('[Fixture] Start capture and reload this tab', armFixtureCaptureAndReload);
+      return;
+    }
+
+    registerCommand('[Fixture] Start/restart capture', () => {
+      startFixtureCapture('menu-restart');
+      installFixtureCaptureCommands(true);
+      printFixtureCaptureStatus();
+    });
+    registerCommand('[Fixture] Stop and export', () => exportFixtureCapture(true));
+    registerCommand('[Fixture] Export snapshot', () => exportFixtureCapture(false));
+    registerCommand('[Fixture] Clear capture', () => {
+      fixtureCapture.clear();
+      fixtureCaptureRecording = false;
+      resetFixtureCaptureAdapterState();
+      installFixtureCaptureCommands(true);
+      printFixtureCaptureStatus();
+    });
+    registerCommand('[Fixture] Print status', printFixtureCaptureStatus);
+  }
+  catch(ignore) {}
+}
+
+function resetFixtureCaptureAdapterState() {
+  fixtureSnapshotValues = fixtureCaptureEnabled ? Object.create(null) : null;
+  fixtureArtifactCache = fixtureCaptureEnabled ? [] : null;
+  fixtureSessionSequence = 0;
+  fixtureSessionId = '';
+  fixtureVideoKey = '';
+  fixtureLastMetadata = null;
+  fixtureLastTrackCatalog = [];
+  fixtureLastFilename = '';
+  fixtureDownloadSequence = 0;
+  fixtureActiveDownloadOperation = null;
+}
+
+function startFixtureCapture(reason) {
+  if(!fixtureCapture)
+    return false;
+  try {
+    fixtureCapture.clear();
+    resetFixtureCaptureAdapterState();
+    fixtureCaptureRecording = fixtureCapture.start({reason: reason || 'manual'});
+    if(fixtureCaptureRecording) {
+      syncFixturePlaybackSession('capture-start');
+      captureNetflixSnapshot('configuration', () => fixtureConfigurationState());
+    }
+    return fixtureCaptureRecording;
+  }
+  catch(ignore) {
+    fixtureCaptureRecording = false;
+    return false;
+  }
+}
+
+function exportFixtureCapture(stopFirst) {
+  if(!fixtureCapture)
+    return;
+  try {
+    if(fixtureCaptureRecording) {
+      if(stopFirst) {
+        fixtureCapture.stop(fixtureSafeCaptureValue(fixtureObservedState(), 'observed', 0));
+        fixtureCaptureRecording = false;
+        installFixtureCaptureCommands(true);
+      }
+      else {
+        fixtureCapture.setObserved(fixtureSafeCaptureValue(fixtureObservedState(), 'observed', 0));
+      }
+    }
+    const blob = fixtureCapture.exportBlob(true);
+    if(!blob) {
+      printFixtureCaptureStatus();
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    saveAs(blob, 'netflix-' + timestamp + '.fixture.local.json');
+    printFixtureCaptureStatus();
+  }
+  catch(ignore) {}
+}
+
+function printFixtureCaptureStatus() {
+  if(!fixtureCapture)
+    return;
+  try {
+    console.info('[Netflix Subtitle Downloader] Fixture capture status ' + JSON.stringify(fixtureCapture.status()));
+  }
+  catch(ignore) {}
+}
+
+function fixtureCurrentVideoKey() {
+  const parts = String(location.pathname || '').split('/');
+  return parts[1] === 'watch' ? String(parts[parts.length - 1] || '') : '';
+}
+
+function syncFixturePlaybackSession(reason) {
+  if(!fixtureCaptureRecording || !fixtureCapture)
+    return '';
+  const videoKey = fixtureCurrentVideoKey();
+  if(videoKey === fixtureVideoKey && fixtureSessionId)
+    return fixtureSessionId;
+
+  if(fixtureSessionId) {
+    fixtureCapture.event('session.invalidated', {
+      reason: reason || 'navigation',
+      hadPlayback: !!fixtureVideoKey
+    }, {session: fixtureSessionId});
+  }
+
+  fixtureVideoKey = videoKey;
+  fixtureLastMetadata = null;
+  fixtureLastTrackCatalog = [];
+  fixtureLastFilename = '';
+  fixtureSnapshotValues = Object.create(null);
+  fixtureSessionId = 'netflix-session-' + (++fixtureSessionSequence);
+  fixtureCapture.event('navigation.changed', {
+    playback: !!videoKey,
+    path: videoKey ? '/watch/TOKEN_1' : '/'
+  }, {session: fixtureSessionId});
+  fixtureCapture.event('session.started', {
+    reason: reason || 'navigation',
+    playback: !!videoKey
+  }, {session: fixtureSessionId});
+  return fixtureSessionId;
+}
+
+function captureNetflix(type, payloadFactory) {
+  if(!fixtureCaptureRecording || !fixtureCapture)
+    return false;
+  try {
+    const sessionId = syncFixturePlaybackSession('observation');
+    const payload = typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {});
+    return fixtureCapture.event(type, fixtureSafeCaptureValue(payload, 'event', 0), {session: sessionId});
+  }
+  catch(ignore) {
+    return false;
+  }
+}
+
+function captureNetflixSnapshot(kind, payloadFactory) {
+  if(!fixtureCaptureRecording || !fixtureCapture)
+    return false;
+  try {
+    const sessionId = syncFixturePlaybackSession('snapshot');
+    const payload = fixtureSafeCaptureValue(
+      typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {}),
+      'snapshot', 0
+    );
+    const dedupeKey = sessionId + '\n' + JSON.stringify(payload);
+    if(fixtureSnapshotValues[kind] === dedupeKey)
+      return false;
+    fixtureSnapshotValues[kind] = dedupeKey;
+    return fixtureCapture.snapshot(kind, payload, {session: sessionId});
+  }
+  catch(ignore) {
+    return false;
+  }
+}
+
+function captureNetflixArtifact(kind, text, metadataFactory, cacheable) {
+  if(!fixtureCaptureRecording || !fixtureCapture || typeof text !== 'string' || !text)
+    return null;
+  try {
+    if(fixtureArtifactHasCriticalRisk(text))
+      return null;
+    if(cacheable && fixtureArtifactCache) {
+      const cached = fixtureArtifactCache.find(entry => entry.kind === kind && entry.text === text);
+      if(cached)
+        return cached.artifact;
+    }
+    const metadata = fixtureSafeCaptureValue(
+      typeof metadataFactory === 'function' ? metadataFactory() : (metadataFactory || {}),
+      'artifactMetadata', 0
+    );
+    const artifact = fixtureCapture.artifact(kind, text, metadata);
+    if(artifact && cacheable && fixtureArtifactCache)
+      fixtureArtifactCache.push({kind, text, artifact});
+    return artifact;
+  }
+  catch(ignore) {
+    return null;
+  }
+}
+
+function fixtureSafeCaptureValue(value, key, depth) {
+  if(value == null || typeof value === 'boolean' || typeof value === 'number')
+    return value;
+  if(typeof value === 'string') {
+    if(fixtureCriticalString(value, key))
+      return /(?:url|uri|href|src|manifest|playlist)/i.test(key || '') || /^(?:https?:)?\/\//i.test(value) ? 'REDACTED_URL' : 'REDACTED';
+    return value;
+  }
+  if(typeof value !== 'object' || depth >= 12)
+    return null;
+  if(Array.isArray(value))
+    return value.slice(0, 200).map(item => fixtureSafeCaptureValue(item, key, depth + 1));
+
+  const result = Object.create(null);
+  Object.keys(value).slice(0, 200).forEach(property => {
+    result[property] = fixtureSafeCaptureValue(value[property], property, depth + 1);
+  });
+  return result;
+}
+
+function fixtureCriticalString(value, key) {
+  const string = String(value == null ? '' : value);
+  if(!string)
+    return false;
+  if(/(?:authorization|cookies?|set-cookie)/i.test(String(key || '')) && string !== 'REDACTED')
+    return true;
+  if(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(string))
+    return true;
+  if(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(string))
+    return true;
+  if(/\bAKIA[0-9A-Z]{16}\b/.test(string) || /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(string))
+    return true;
+  if(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(string))
+    return true;
+  if(!/\s/.test(string) && /^(?:[A-Za-z0-9+/]{256,}={0,2})$/.test(string))
+    return true;
+  if(/\/(?:drm|license|licenses|widevine|fairplay|playready|certificate|cert)(?:\/|[?#]|$)/i.test(string))
+    return true;
+  return false;
+}
+
+function fixtureArtifactHasCriticalRisk(text) {
+  if(typeof text !== 'string' || !text)
+    return false;
+  if(fixtureCriticalString(text, 'artifact'))
+    return true;
+  return /(?:^|["'=\s>])[A-Za-z0-9+/]{256,}={0,2}(?:$|["'<\s])/m.test(text);
+}
+
+function fixtureConfigurationState() {
+  return {
+    episodeTitleInFilename: !!epTitleInFilename,
+    forceAllLanguages: !!forceSubs,
+    preferredLocale: prefLocale || '',
+    languages: langs ? langs.split(',').map(value => value.trim()).filter(Boolean).slice(0, 50) : [],
+    preferredFormat: subFormat || '',
+    batchDelay: Number.isFinite(batchDelay) ? batchDelay : 0
+  };
+}
+
+function fixtureTitleSummary(title) {
+  title = title || {};
+  return {
+    type: title.type || '',
+    title: title.title || '',
+    season: positiveFixtureNumber(title.season),
+    episode: positiveFixtureNumber(title.episode),
+    subtitle: title.subtitle || '',
+    hiddenNumber: !!title.hiddenNumber
+  };
+}
+
+function positiveFixtureNumber(value) {
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function fixtureTrackCatalogSummary(subs) {
+  if(!subs || typeof subs !== 'object')
+    return [];
+  return Object.keys(subs).slice(0, 200).map(language => {
+    const formats = subs[language] || {};
+    return {
+      language,
+      formats: Object.keys(formats).slice(0, 20).map(format => {
+        const candidate = formats[format];
+        return {
+          formatProfile: format,
+          mirrorCount: Array.isArray(candidate) && Array.isArray(candidate[0]) ? candidate[0].length : 0,
+          extension: Array.isArray(candidate) ? candidate[1] || '' : ''
+        };
+      })
+    };
+  });
+}
+
+function fixtureObservedState() {
+  return {
+    metadata: fixtureLastMetadata,
+    outputFilename: fixtureLastFilename || downloadUiState.filename || '',
+    progress: {
+      active: !!downloadUiState.active,
+      completed: downloadUiState.completed,
+      total: downloadUiState.total,
+      label: downloadUiState.label || ''
+    },
+    tracks: fixtureLastTrackCatalog,
+    batch: {
+      active: Array.isArray(batch),
+      remaining: Array.isArray(batch) ? batch.length : 0,
+      allCount: Array.isArray(batchAll) ? batchAll.length : 0,
+      seasonCount: Array.isArray(batchSeason) ? batchSeason.length : 0,
+      toEndCount: Array.isArray(batchToEnd) ? batchToEnd.length : 0
+    }
+  };
+}
+
+function fixtureMetadataProjection(data) {
+  if(!fixtureCaptureRecording || !data || typeof data !== 'object' || !data.video)
+    return '';
+  const video = data.video;
+  const tokens = new Map();
+  let tokenSequence = 0;
+  let episodeTitleSequence = 0;
+  const token = value => {
+    const key = String(value == null ? '' : value);
+    if(!key)
+      return '';
+    if(!tokens.has(key))
+      tokens.set(key, 'TOKEN_' + (++tokenSequence));
+    return tokens.get(key);
+  };
+  const type = /^(?:show|movie|supplemental)$/.test(String(video.type || '')) ? String(video.type) : 'unknown';
+  const projection = {
+    video: {
+      type,
+      title: type === 'show' ? 'SHOW_001' : 'TITLE_001',
+      id: token(video.id),
+      currentEpisode: token(video.currentEpisode),
+      seasons: []
+    }
+  };
+  if(type === 'show' && Array.isArray(video.seasons)) {
+    projection.video.seasons = video.seasons.slice(0, 50).map(season => ({
+      seq: positiveFixtureNumber(season && season.seq),
+      episodes: Array.isArray(season && season.episodes) ? season.episodes.slice(0, 200).map(episode => ({
+        seq: positiveFixtureNumber(episode && episode.seq),
+        id: token(episode && episode.id),
+        title: 'TEXT_' + String(++episodeTitleSequence).padStart(3, '0'),
+        hiddenEpisodeNumbers: !!(episode && episode.hiddenEpisodeNumbers)
+      })) : []
+    }));
+  }
+  return JSON.stringify(projection, null, 2);
+}
+
+function fixtureSubtitleCatalogProjection(result) {
+  if(!fixtureCaptureRecording || !result || typeof result !== 'object')
+    return '';
+  const tracks = result.timedtexttracks || result.textTracks;
+  if(!Array.isArray(tracks))
+    return '';
+  let urlSequence = 0;
+  const placeholderUrl = () => 'URL_' + String(++urlSequence).padStart(3, '0');
+  const projectedTracks = tracks.slice(0, 200).map(track => {
+    track = track || {};
+    const projected = {
+      language: /^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2})?$/.test(String(track.language || '')) ? String(track.language) : 'und',
+      rawTrackType: /^(?:subtitles|closedcaptions)$/.test(String(track.rawTrackType || '')) ? String(track.rawTrackType) : 'other',
+      isForcedNarrative: !!track.isForcedNarrative,
+      isNoneTrack: !!track.isNoneTrack,
+      ttDownloadables: {}
+    };
+    if(typeof track.trackVariant !== 'undefined') {
+      projected.trackVariant = /^[A-Za-z0-9._-]{0,40}$/.test(String(track.trackVariant || '')) ?
+        String(track.trackVariant || '') : 'VARIANT';
+    }
+    const downloadables = track.ttDownloadables || track.downloadables || {};
+    ALL_FORMATS.forEach(format => {
+      const candidate = downloadables[format];
+      if(!candidate || typeof candidate !== 'object')
+        return;
+      if(candidate.downloadUrls && typeof candidate.downloadUrls === 'object') {
+        const output = {};
+        Object.keys(candidate.downloadUrls).slice(0, 20).forEach((key, index) => {
+          output['MIRROR_' + (index + 1)] = placeholderUrl();
+        });
+        projected.ttDownloadables[format] = {downloadUrls: output};
+      }
+      else if(Array.isArray(candidate.urls)) {
+        projected.ttDownloadables[format] = {
+          urls: candidate.urls.slice(0, 20).map(() => ({url: placeholderUrl()}))
+        };
+      }
+    });
+    return projected;
+  });
+  return JSON.stringify({movieId: 'TOKEN_1', timedtexttracks: projectedTracks}, null, 2);
+}
+
+function fixtureSubtitleArtifactFormat(profile, extension) {
+  if(profile === WEBVTT || extension === 'vtt')
+    return 'vtt';
+  if(profile === DFXP || extension === 'dfxp')
+    return 'dfxp';
+  return 'xml';
+}
+
+function fixtureErrorCode(error) {
+  const value = String(error && error.message ? error.message : (error || ''));
+  if(!value)
+    return '';
+  if(/timeout/i.test(value))
+    return 'timeout';
+  if(/HTTP|status/i.test(value))
+    return 'http';
+  if(/network|fetch/i.test(value))
+    return 'network';
+  if(/metadata|title|episode/i.test(value))
+    return 'metadata';
+  if(/empty|subtitle/i.test(value))
+    return 'empty-output';
+  if(/stop|abort/i.test(value))
+    return 'stopped';
+  return 'unknown';
+}
+
+function beginFixtureDownload(kind) {
+  if(!fixtureCaptureRecording)
+    return null;
+  const operation = {id: ++fixtureDownloadSequence, kind: kind || 'single'};
+  fixtureActiveDownloadOperation = operation;
+  captureNetflix('download.started', () => ({operationId: operation.id, kind: operation.kind}));
+  return operation;
+}
+
+function finishFixtureDownload(operation, outcome, details) {
+  if(!operation)
+    return false;
+  const captured = captureNetflix('download.finished', () => ({
+    operationId: operation.id,
+    kind: operation.kind,
+    outcome: outcome || 'unknown',
+    filename: details && details.filename || '',
+    remaining: details && details.remaining || 0,
+    errorCode: fixtureErrorCode(details && details.error)
+  }));
+  if(fixtureActiveDownloadOperation === operation)
+    fixtureActiveDownloadOperation = null;
+  return captured;
+}
+
+installFixtureCaptureCommands();
 
 const setEpTitleInFilename = () => {
   document.querySelector('#subtitle-downloader-menu .ep-title-in-filename > span').textContent = (epTitleInFilename ? 'on' : 'off');
@@ -320,6 +1758,10 @@ const ensureMenu = () => {
     setBatchDelayText();
   }
   downloaderMenu = menu;
+  if(batchPlanForKind('to-end'))
+    menu.classList.add('batch-ready');
+  else
+    menu.classList.remove('batch-ready');
   syncMenuVisibility(menu);
   if(created)
     applyDownloadUi(menu);
@@ -387,6 +1829,14 @@ const processSubInfo = async result => {
     }
   }
   subCache[result.movieId] = subs;
+  if(fixtureCaptureRecording) {
+    fixtureLastTrackCatalog = fixtureTrackCatalogSummary(subs);
+    captureNetflix('tracks.updated', () => ({
+      trackCount: fixtureLastTrackCatalog.length,
+      tracks: fixtureLastTrackCatalog
+    }));
+    captureNetflixSnapshot('tracks', () => ({tracks: fixtureLastTrackCatalog}));
+  }
   if(handleSubsReady(ensureMenu()))
     subCacheWaitGeneration++;
 };
@@ -422,19 +1872,20 @@ const processMetadata = data => {
     return;
 
   menu.classList.remove('series');
+  menu.classList.remove('batch-ready');
 
   const result = data.video;
   const {type, title} = result;
   if(type === 'show') {
-    batchAll = [];
-    batchSeason = [];
-    batchToEnd = [];
+    const nextBatchAll = [];
+    const nextBatchSeason = [];
+    const nextBatchToEnd = [];
     const allEpisodes = [];
     let currentSeason = 0;
     menu.classList.add('series');
-    for(const season of result.seasons) {
-      for(const episode of season.episodes) {
-        if(episode.id === result.currentEpisode)
+    for(const season of Array.isArray(result.seasons) ? result.seasons : []) {
+      for(const episode of Array.isArray(season.episodes) ? season.episodes : []) {
+        if(String(episode.id) === String(result.currentEpisode))
           currentSeason = season.seq;
         allEpisodes.push([season.seq, episode.seq, episode.id]);
         titleCache[episode.id] = {
@@ -451,22 +1902,47 @@ const processMetadata = data => {
     allEpisodes.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
     let toEnd = false;
     for(const [season, episode, id] of allEpisodes) {
-      batchAll.push(id);
+      nextBatchAll.push(id);
       if(season === currentSeason)
-        batchSeason.push(id);
-      if(id === result.currentEpisode)
+        nextBatchSeason.push(id);
+      if(String(id) === String(result.currentEpisode))
         toEnd = true;
       if(toEnd)
-        batchToEnd.push(id);
+        nextBatchToEnd.push(id);
+    }
+    if(currentSeason > 0 && nextBatchToEnd.length > 0) {
+      batchAll = nextBatchAll;
+      batchSeason = nextBatchSeason;
+      batchToEnd = nextBatchToEnd;
+      menu.classList.add('batch-ready');
+    }
+    else {
+      batchAll = null;
+      batchSeason = null;
+      batchToEnd = null;
     }
   }
   else if(type === 'movie' || type === 'supplemental') {
+    batchAll = null;
+    batchSeason = null;
+    batchToEnd = null;
     titleCache[result.id] = {type, title};
     delete domDerivedTitleIds[result.id];
   }
   else {
     console.debug('[Netflix Subtitle Downloader] unknown video type:', type, result)
     return;
+  }
+  if(fixtureCaptureRecording) {
+    const current = type === 'show' ? titleCache[result.currentEpisode] : titleCache[result.id];
+    fixtureLastMetadata = fixtureTitleSummary(current || {type, title});
+    captureNetflix('metadata.accepted', () => ({
+      metadata: fixtureLastMetadata,
+      batchAllCount: Array.isArray(batchAll) ? batchAll.length : 0,
+      batchSeasonCount: Array.isArray(batchSeason) ? batchSeason.length : 0,
+      batchToEndCount: Array.isArray(batchToEnd) ? batchToEnd.length : 0
+    }));
+    captureNetflixSnapshot('metadata', () => ({metadata: fixtureLastMetadata}));
   }
   syncPlaybackMetadataState(menu);
   checkSubsCache(menu);
@@ -504,6 +1980,46 @@ const normalizeDomTitle = value => String(value || '').replace(/\s+/g, ' ').trim
 const positiveInteger = value => {
   const number = parseInt(value, 10);
   return Number.isFinite(number) && number > 0 ? number : null;
+};
+
+const isPlaybackAdvisoryTitle = value => {
+  const title = normalizeDomTitle(value);
+  if(!title)
+    return false;
+  return /(?:^|\s)\uAD00\uB78C\s*\uB4F1\uAE09\s*[:：]/i.test(title) ||
+    /\uCCAD\uC18C\uB144\s*\uAD00\uB78C\s*\uBD88\uAC00/i.test(title) ||
+    /\d{1,2}\s*\uC138\s*\uBBF8\uB9CC.*\uC2DC\uCCAD\uD560\s*\uC218\s*\uC5C6/i.test(title) ||
+    /^(?:maturity|content)\s+rating(?:\s*[:：]|$)/i.test(title) ||
+    /^rated\s+(?:tv-)?[a-z0-9+\-]+(?:\s|$)/i.test(title) ||
+    /(?:not available|cannot be watched).*(?:viewers?|children|people)\s+under/i.test(title);
+};
+
+const isPlaybackAdvisoryNode = node => {
+  let current = node;
+  for(let depth = 0; current && depth < 6; depth++) {
+    let marker = '';
+    try {
+      marker = [
+        current.getAttribute && current.getAttribute('data-uia'),
+        current.getAttribute && current.getAttribute('aria-label'),
+        typeof current.className === 'string' ? current.className : ''
+      ].filter(Boolean).join(' ');
+    }
+    catch(ignore) {}
+    if(/(?:maturity|rating|advisory|content-warning|playback-error)/i.test(marker))
+      return true;
+    current = current.parentElement || current.parentNode;
+  }
+  return false;
+};
+
+const playbackTitleCandidate = node => {
+  const title = normalizeDomTitle(node && node.textContent);
+  if(!title || title.length > 300 || title.toLowerCase() === 'netflix')
+    return '';
+  if(isPlaybackAdvisoryTitle(title) || isPlaybackAdvisoryNode(node))
+    return '';
+  return title;
 };
 
 const seasonNumberFromLabel = value => {
@@ -624,7 +2140,7 @@ const playbackMetadataFromDom = () => {
   catch(ignore) {}
   if(titleContainer) {
     const separated = titleAndEpisodeFromDomContainer(titleContainer);
-    title = separated.title;
+    title = playbackTitleCandidate(titleContainer) ? separated.title : '';
     if(episodeNumberFromLabel(separated.episodeLabel) !== null)
       adjacentEpisodeLabel = separated.episodeLabel;
   }
@@ -640,8 +2156,8 @@ const playbackMetadataFromDom = () => {
     const nodeUia = normalizeDomTitle(node && node.getAttribute && node.getAttribute('data-uia'));
     if(/evidence-overlay-(?:season|episode)-title/i.test(nodeUia))
       continue;
-    title = normalizeDomTitle(node && node.textContent);
-    if(title && title.length <= 300 && title.toLowerCase() !== 'netflix')
+    title = playbackTitleCandidate(node);
+    if(title)
       break;
   }
   if(!title)
@@ -779,14 +2295,29 @@ const resetDownloadUiForPlaybackChange = () => {
 const syncPlaybackMetadataState = menu => {
   if(!isWatchPage())
     return null;
+  if(typeof fixtureCaptureRecording !== 'undefined' && fixtureCaptureRecording)
+    syncFixturePlaybackSession('metadata-sync');
   const title = getTitleEntry(true);
   if(!title) {
     applyDownloadUi(menu);
     return null;
   }
-  if(playbackUiMetadataChanged(lastPlaybackUiMetadata, title))
+  if(playbackUiMetadataChanged(lastPlaybackUiMetadata, title)) {
+    if(typeof fixtureCaptureRecording !== 'undefined' && fixtureCaptureRecording) {
+      captureNetflix('playback.reset', () => ({
+        previous: fixtureTitleSummary(lastPlaybackUiMetadata),
+        current: fixtureTitleSummary(title)
+      }));
+    }
     resetDownloadUiForPlaybackChange();
+    if(menu && menu.classList && !batchPlanForKind('to-end'))
+      menu.classList.remove('batch-ready');
+  }
   lastPlaybackUiMetadata = {...title};
+  if(typeof fixtureCaptureRecording !== 'undefined' && fixtureCaptureRecording) {
+    fixtureLastMetadata = fixtureTitleSummary(title);
+    captureNetflixSnapshot('metadata', () => ({metadata: fixtureLastMetadata}));
+  }
   if(menu && menu.classList) {
     if(title.type === 'show')
       menu.classList.add('series');
@@ -887,6 +2418,14 @@ const applyDownloadUi = menu => {
   const filenameText = downloadUiState.active && downloadUiState.filename
     ? downloadUiState.filename
     : predictedOutputFilename();
+  if(typeof fixtureCaptureRecording !== 'undefined' && fixtureCaptureRecording &&
+     filenameText && filenameText !== 'Waiting for title metadata...') {
+    fixtureLastFilename = filenameText;
+    captureNetflixSnapshot('filename.preview', () => ({
+      filename: filenameText,
+      metadata: fixtureLastMetadata
+    }));
+  }
   const progressLabel = total > 0
     ? `${downloadUiState.label} (${completed}/${total}, ${Math.floor(completed * 100 / total)}%)`
     : downloadUiState.label;
@@ -936,9 +2475,19 @@ const pickFormat = formats => {
   }
 };
 
+const selectedProfileForCandidate = (formats, candidate) => {
+  if(!formats || !candidate)
+    return '';
+  return Object.keys(formats).find(format => formats[format] === candidate) || '';
+};
 
-const _save = async (_zip, title) => {
+
+const _save = async (_zip, title, fixtureOperation) => {
   const filename = title + '.zip';
+  captureNetflix('archive.started', () => ({
+    operationId: fixtureOperation && fixtureOperation.id || 0,
+    filename
+  }));
   setMenuDownloadProgress(0, 100, 'Creating ZIP...', true, title);
   try {
     const content = await _zip.generateAsync({type:'blob'}, metadata => {
@@ -946,18 +2495,38 @@ const _save = async (_zip, title) => {
     });
     saveAs(content, filename);
     setMenuDownloadProgress(100, 100, 'Complete', false, title);
+    captureNetflix('archive.finished', () => ({
+      operationId: fixtureOperation && fixtureOperation.id || 0,
+      filename,
+      outcome: 'success'
+    }));
   }
   catch(error) {
     setMenuDownloadProgress(0, 0, 'Failed', false, title);
+    captureNetflix('archive.finished', () => ({
+      operationId: fixtureOperation && fixtureOperation.id || 0,
+      filename,
+      outcome: 'failed',
+      errorCode: fixtureErrorCode(error)
+    }));
     throw error;
   }
 };
 
-const _download = async _zip => {
+const _download = async (_zip, fixtureOperation) => {
   const titleEntry = await waitForTitleEntry();
   const subs = getSubsFromCache();
   const [title, seriesTitle] = getTitleFromCache(titleEntry);
   const downloaded = [];
+  if(fixtureCaptureRecording) {
+    fixtureLastMetadata = fixtureTitleSummary(titleEntry);
+    fixtureLastFilename = title;
+    captureNetflixSnapshot('filename.resolved', () => ({
+      operationId: fixtureOperation && fixtureOperation.id || 0,
+      filename: title,
+      metadata: fixtureLastMetadata
+    }));
+  }
 
   let filteredLangs;
   const requestedLangs = langs.split(',').map(value => value.trim()).filter(Boolean);
@@ -972,19 +2541,41 @@ const _download = async _zip => {
     }
   }
 
+  captureNetflix('download.selection', () => ({
+    operationId: fixtureOperation && fixtureOperation.id || 0,
+    requestedLanguages: requestedLangs,
+    selectedLanguages: filteredLangs,
+    preferredFormat: subFormat
+  }));
   setMenuDownloadProgress(0, filteredLangs.length, 'Downloading subtitle tracks...', true, title);
   const progress = new ProgressBar(filteredLangs.length);
   let stop = false;
   for(const lang of filteredLangs) {
     const selectedFormat = pickFormat(subs[lang]);
     if(!selectedFormat) {
+      captureNetflix('download.track-skipped', () => ({
+        operationId: fixtureOperation && fixtureOperation.id || 0,
+        language: lang,
+        reason: 'no-usable-format'
+      }));
       progress.increment();
       continue;
     }
+    const selectedProfile = fixtureCaptureRecording ? selectedProfileForCandidate(subs[lang], selectedFormat) : '';
     const [cachedUrls, extension] = selectedFormat;
     const urls = cachedUrls.filter(url => typeof url === 'string' && url.length > 0);
+    const mirrorTotal = urls.length;
+    let mirrorAttempt = 0;
+    captureNetflix('download.track-selected', () => ({
+      operationId: fixtureOperation && fixtureOperation.id || 0,
+      language: lang,
+      formatProfile: selectedProfile,
+      extension,
+      mirrorCount: mirrorTotal
+    }));
     while(urls.length > 0) {
       const url = popRandomElement(urls);
+      mirrorAttempt++;
       let result;
       try {
         result = await Promise.race([
@@ -994,18 +2585,47 @@ const _download = async _zip => {
         ]);
       }
       catch(error) {
+        captureNetflix('download.mirror-failed', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang,
+          formatProfile: selectedProfile,
+          mirrorAttempt,
+          mirrorTotal,
+          errorCode: fixtureErrorCode(error)
+        }));
         console.warn('[Netflix Subtitle Downloader] subtitle fetch failed, trying another URL', url, error);
         continue;
       }
       if(result === STOP_THE_DOWNLOAD) {
         stop = true;
+        captureNetflix('download.stopped', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang
+        }));
         break;
       }
       if(result === DOWNLOAD_TIMEOUT) {
+        captureNetflix('download.mirror-failed', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang,
+          formatProfile: selectedProfile,
+          mirrorAttempt,
+          mirrorTotal,
+          errorCode: 'timeout'
+        }));
         console.warn('[Netflix Subtitle Downloader] subtitle fetch timed out, trying another URL', url);
         continue;
       }
       if(!result || result.ok !== true) {
+        captureNetflix('download.mirror-failed', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang,
+          formatProfile: selectedProfile,
+          mirrorAttempt,
+          mirrorTotal,
+          errorCode: 'http',
+          status: result && result.status || 0
+        }));
         console.warn('[Netflix Subtitle Downloader] subtitle HTTP request failed, trying another URL', url, result && result.status);
         continue;
       }
@@ -1014,13 +2634,44 @@ const _download = async _zip => {
         data = await result.text();
       }
       catch(error) {
+        captureNetflix('download.mirror-failed', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang,
+          formatProfile: selectedProfile,
+          mirrorAttempt,
+          mirrorTotal,
+          errorCode: 'body-read'
+        }));
         console.warn('[Netflix Subtitle Downloader] subtitle response could not be read, trying another URL', url, error);
         continue;
       }
       if(data.length > 0) {
+        const artifact = captureNetflixArtifact('subtitle', data, () => ({
+          format: fixtureSubtitleArtifactFormat(selectedProfile, extension),
+          formatProfile: selectedProfile,
+          language: lang,
+          extension
+        }), false);
+        captureNetflix('subtitle.response-observed', () => ({
+          operationId: fixtureOperation && fixtureOperation.id || 0,
+          language: lang,
+          formatProfile: selectedProfile,
+          extension,
+          mirrorAttempt,
+          mirrorTotal,
+          artifact: artifact || ''
+        }));
         downloaded.push({lang, data, extension});
         break;
       }
+      captureNetflix('download.mirror-failed', () => ({
+        operationId: fixtureOperation && fixtureOperation.id || 0,
+        language: lang,
+        formatProfile: selectedProfile,
+        mirrorAttempt,
+        mirrorTotal,
+        errorCode: 'empty-output'
+      }));
     }
     progress.increment();
     if(stop)
@@ -1036,23 +2687,41 @@ const _download = async _zip => {
     stop = true;
   progress.destroy();
   setMenuDownloadProgress(progress.current, progress.max, 'Preparing ZIP...', true, title);
+  captureNetflix('download.tracks-finished', () => ({
+    operationId: fixtureOperation && fixtureOperation.id || 0,
+    requestedCount: filteredLangs.length,
+    downloadedCount: downloaded.length,
+    stopped: stop
+  }));
 
   return [title, seriesTitle, stop];
 };
 
 const downloadThis = async () => {
+  if(singleDownloadInProgress || batchDownloadInProgress || batchPlanRequestInProgress) {
+    captureNetflix('download.ignored', () => ({reason: 'download-in-progress'}));
+    return;
+  }
+  singleDownloadInProgress = true;
+  const fixtureOperation = beginFixtureDownload('single');
   try {
     const _zip = new JSZip();
-    const [title] = await _download(_zip);
-    await _save(_zip, title);
+    const [title] = await _download(_zip, fixtureOperation);
+    await _save(_zip, title, fixtureOperation);
+    finishFixtureDownload(fixtureOperation, 'success', {filename: title + '.zip'});
   }
   catch(error) {
     setMenuDownloadProgress(0, 0, 'Failed', false);
+    finishFixtureDownload(fixtureOperation, 'failed', {error});
     console.error('[Netflix Subtitle Downloader] download failed', error);
+  }
+  finally {
+    singleDownloadInProgress = false;
   }
 };
 
 const cleanBatch = async () => {
+  captureNetflix('batch.cleaned', () => ({hadBatch: Array.isArray(batch)}));
   batch = null;
   setBatch(null);
   try {
@@ -1074,10 +2743,11 @@ const readAsBinaryString = blob => new Promise(resolve => {
 });
 
 const downloadBatch = async auto => {
-  if(batchDownloadInProgress)
+  if(batchDownloadInProgress || singleDownloadInProgress)
     return;
 
   batchDownloadInProgress = true;
+  const fixtureOperation = beginFixtureDownload(auto === true ? 'batch-auto' : 'batch');
   let keepLockedForNavigation = false;
   try {
     const cache = await caches.open('NSD');
@@ -1091,6 +2761,7 @@ const downloadBatch = async auto => {
     catch(error) {
       console.error(error);
       alert('An error occured when loading the zip file with subs from the cache. More info in the browser console.');
+      finishFixtureDownload(fixtureOperation, 'failed', {error});
       await cleanBatch();
       return;
     }
@@ -1099,24 +2770,37 @@ const downloadBatch = async auto => {
     zip = new JSZip();
 
   try {
-    [, title, stop] = await _download(zip);
+    [, title, stop] = await _download(zip, fixtureOperation);
   }
   catch(error) {
     title = 'unknown';
     stop = true;
+    captureNetflix('batch.episode-failed', () => ({
+      operationId: fixtureOperation && fixtureOperation.id || 0,
+      errorCode: fixtureErrorCode(error)
+    }));
   }
 
   const id = parseInt(getVideoId());
   batch = batch.filter(x => x !== id);
 
     if(stop || batch.length == 0) {
-      await _save(zip, title);
+      await _save(zip, title, fixtureOperation);
+      finishFixtureDownload(fixtureOperation, stop ? 'stopped' : 'success', {
+        filename: title + '.zip',
+        remaining: batch.length
+      });
       await cleanBatch();
     }
     else {
       setBatch(batch);
       await cache.put('/subs.zip', new Response(await zip.generateAsync({type:'blob'})));
       await asyncSleep(batchDelay);
+      captureNetflix('batch.navigation-scheduled', () => ({
+        operationId: fixtureOperation && fixtureOperation.id || 0,
+        remaining: batch.length
+      }));
+      finishFixtureDownload(fixtureOperation, 'continued', {remaining: batch.length});
       keepLockedForNavigation = true;
       window.location = window.location.origin + '/watch/' + batch[0];
     }
@@ -1127,37 +2811,476 @@ const downloadBatch = async auto => {
   }
 };
 
-const downloadAll = () => {
-  batch = batchAll.slice();
-  downloadBatch();
+const BATCH_METADATA_WAIT_TIMEOUT_MS = 5000;
+let batchPlanRequestInProgress = false;
+
+const currentBatchVideoId = () => {
+  if(!Array.isArray(batchAll))
+    return null;
+  const rawId = getVideoId();
+  const candidates = [rawId, idOverrides[rawId]];
+  try {
+    candidates.push(unsafeWindow.netflix.falcorCache.videos[rawId].current.value[1]);
+  }
+  catch(ignore) {}
+  for(const candidate of candidates) {
+    const matched = batchAll.find(id => String(id) === String(candidate));
+    if(matched !== undefined)
+      return matched;
+  }
+  return null;
 };
 
-const downloadSeason = () => {
-  batch = batchSeason.slice();
-  downloadBatch();
+const batchPlanForKind = kind => {
+  const currentId = currentBatchVideoId();
+  if(currentId === null || !Array.isArray(batchAll) || batchAll.length === 0)
+    return null;
+  if(kind === 'all')
+    return batchAll.slice();
+  const currentIndex = batchAll.findIndex(id => String(id) === String(currentId));
+  if(currentIndex < 0)
+    return null;
+  if(kind === 'to-end')
+    return batchAll.slice(currentIndex);
+  if(kind === 'season') {
+    const currentTitle = titleCache[currentId];
+    const currentSeason = positiveInteger(currentTitle && currentTitle.season);
+    if(currentSeason === null)
+      return null;
+    const seasonPlan = batchAll.filter(id =>
+      positiveInteger(titleCache[id] && titleCache[id].season) === currentSeason
+    );
+    return seasonPlan.length > 0 ? seasonPlan : null;
+  }
+  return null;
 };
 
-const downloadToEnd = () => {
-  batch = batchToEnd.slice();
-  downloadBatch();
+const requestPageMetadataRefresh = () => {
+  try {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_metadata_request'));
+  }
+  catch(ignore) {}
 };
+
+const waitForBatchPlan = async kind => {
+  const existing = batchPlanForKind(kind);
+  if(existing)
+    return existing;
+  requestPageMetadataRefresh();
+  const videoId = getVideoId();
+  const deadline = Date.now() + BATCH_METADATA_WAIT_TIMEOUT_MS;
+  while(getVideoId() === videoId && Date.now() < deadline) {
+    const plan = batchPlanForKind(kind);
+    if(plan)
+      return plan;
+    await asyncSleep(0.1);
+  }
+  return null;
+};
+
+const startBatchDownload = async kind => {
+  if(batchPlanRequestInProgress || batchDownloadInProgress || singleDownloadInProgress)
+    return;
+  batchPlanRequestInProgress = true;
+  lastBatchMetadataLookup = null;
+  captureNetflix('batch.requested', () => ({kind}));
+  setMenuDownloadProgress(0, 0, 'Waiting for episode metadata...', true);
+  try {
+    const plan = await waitForBatchPlan(kind);
+    if(!plan || plan.length === 0) {
+      setMenuDownloadProgress(0, 0, 'Batch metadata unavailable', false);
+      captureNetflix('batch.unavailable', () => ({
+        kind,
+        reason: 'episode-list-missing',
+        lookupReason: lastBatchMetadataLookup && lastBatchMetadataLookup.reason || ''
+      }));
+      alert('Episode metadata is not ready. Wait for the player to load, then try the batch download again.');
+      return;
+    }
+    captureNetflix('batch.planned', () => ({kind, count: plan.length}));
+    setMenuDownloadProgress(0, plan.length, 'Preparing batch...', true);
+    batch = plan;
+    await downloadBatch();
+  }
+  catch(error) {
+    setMenuDownloadProgress(0, 0, 'Batch failed', false);
+    captureNetflix('batch.failed', () => ({kind, errorCode: fixtureErrorCode(error)}));
+    console.error('[Netflix Subtitle Downloader] batch preparation failed', error);
+  }
+  finally {
+    batchPlanRequestInProgress = false;
+  }
+};
+
+const downloadAll = () => startBatchDownload('all');
+const downloadSeason = () => startBatchDownload('season');
+const downloadToEnd = () => startBatchDownload('to-end');
+
+function netflixAttachMetadataXhrObserver(xhr, requestUrl, isMetadataRequestUrl, parseJson,
+                                           BlobConstructor, dispatchMetadata, dispatchStatus, logError) {
+  if(!isMetadataRequestUrl(requestUrl))
+    return false;
+
+  const report = (stage, reason, status) => {
+    try {
+      dispatchStatus(stage, 'xhr', reason || '', Number.isFinite(Number(status)) ? Number(status) : 0);
+    }
+    catch(ignore) {}
+  };
+  const reportError = error => {
+    try {
+      logError(error);
+    }
+    catch(ignore) {}
+  };
+
+  report('request-matched', '', 0);
+  xhr.addEventListener('load', async function() {
+    const status = Number.isFinite(Number(this.status)) ? Number(this.status) : 0;
+    report('response-received', '', status);
+    try {
+      let data = this.response;
+      if(BlobConstructor && data instanceof BlobConstructor)
+        data = parseJson(await data.text());
+      else if(typeof data === 'string')
+        data = parseJson(data);
+      report('response-parsed', '', status);
+      dispatchMetadata(data);
+      report('response-dispatched', '', status);
+    }
+    catch(error) {
+      report('response-failed', 'parse-or-dispatch-error', status);
+      reportError(error);
+    }
+  }, false);
+  return true;
+}
+
+function netflixCreateMetadataFetchWrapper(realFetch, getFetchUrl, isMetadataRequestUrl,
+                                            dispatchMetadata, dispatchStatus, logError) {
+  const report = (stage, reason, status) => {
+    try {
+      dispatchStatus(stage, 'fetch', reason || '', Number.isFinite(Number(status)) ? Number(status) : 0);
+    }
+    catch(ignore) {}
+  };
+  const reportError = error => {
+    try {
+      logError(error);
+    }
+    catch(ignore) {}
+  };
+
+  return function() {
+    const args = arguments;
+    const requestUrl = getFetchUrl(args[0]);
+    const responsePromise = realFetch.apply(this, args);
+    if(!isMetadataRequestUrl(requestUrl))
+      return responsePromise;
+
+    report('request-matched', '', 0);
+    return responsePromise.then(response => {
+      const status = Number.isFinite(Number(response && response.status)) ? Number(response.status) : 0;
+      report('response-received', '', status);
+      let dataPromise;
+      try {
+        dataPromise = response.clone().json();
+      }
+      catch(error) {
+        report('response-failed', 'response-clone-error', status);
+        reportError(error);
+        return response;
+      }
+      return Promise.resolve(dataPromise).then(data => {
+        try {
+          report('response-parsed', '', status);
+          dispatchMetadata(data);
+          report('response-dispatched', '', status);
+        }
+        catch(error) {
+          report('response-failed', 'dispatch-error', status);
+          reportError(error);
+        }
+        return response;
+      }, error => {
+        report('response-failed', 'parse-error', status);
+        reportError(error);
+        return response;
+      });
+    }, error => {
+      report('response-failed', 'network-error', 0);
+      throw error;
+    });
+  };
+}
+
+function netflixMetadataFromGraphqlCache(payload, currentVideoId) {
+  if(!payload || typeof payload !== 'object')
+    return null;
+  const possibleCache = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+    ? payload.data : payload;
+  const entries = Object.entries(possibleCache).slice(0, 20000)
+    .filter(([, value]) => value && typeof value === 'object' && !Array.isArray(value));
+  if(!entries.some(([key]) => /^(?:Show|Season|Episode|Movie|Supplemental):/i.test(key)))
+    return null;
+
+  const cache = Object.fromEntries(entries);
+  const keyByEntity = new Map(entries.map(([key, value]) => [value, key]));
+  const numberFrom = (value, names) => {
+    for(const name of names) {
+      const number = Number(value && value[name]);
+      if(Number.isFinite(number) && number > 0)
+        return number;
+    }
+    return null;
+  };
+  const entityVideoId = value => {
+    const directId = numberFrom(value, ['videoId', 'episodeId', 'id']);
+    if(directId !== null)
+      return directId;
+    const entityKey = keyByEntity.get(value) || '';
+    const keyMatch = entityKey.match(/:(\d+)$/);
+    return keyMatch ? numberFrom({id: keyMatch[1]}, ['id']) : null;
+  };
+  const entityTitle = value => {
+    for(const name of ['title', 'name', 'displayName']) {
+      if(typeof (value && value[name]) === 'string' && value[name].trim())
+        return value[name].trim();
+    }
+    return '';
+  };
+  const resolve = value => {
+    let current = value;
+    for(let depth = 0; current && typeof current === 'object' && depth < 8; depth++) {
+      if(typeof current.__ref === 'string' && cache[current.__ref]) {
+        current = cache[current.__ref];
+        continue;
+      }
+      if(current.node && typeof current.node === 'object') {
+        current = current.node;
+        continue;
+      }
+      return current;
+    }
+    return current && typeof current === 'object' ? current : null;
+  };
+  const relationItems = (entity, relationName) => {
+    if(!entity || typeof entity !== 'object')
+      return [];
+    const relation = Object.entries(entity).find(([key]) =>
+      key === relationName || key.startsWith(relationName + '(')
+    );
+    if(!relation)
+      return [];
+    const value = relation[1];
+    const values = Array.isArray(value) ? value :
+      (value && Array.isArray(value.edges) ? value.edges :
+        (value && Array.isArray(value.nodes) ? value.nodes :
+          (value && Array.isArray(value.items) ? value.items : [])));
+    return values.map(resolve).filter(Boolean);
+  };
+  const relationValue = (entity, relationName) => {
+    if(!entity || typeof entity !== 'object')
+      return null;
+    const relation = Object.entries(entity).find(([key]) =>
+      key === relationName || key.startsWith(relationName + '(')
+    );
+    return relation ? resolve(relation[1]) : null;
+  };
+  const entitiesOfType = type => entries
+    .filter(([key, value]) => key.startsWith(type + ':') || value.__typename === type)
+    .map(([, value]) => value);
+  const referencesEntity = (value, target) => resolve(value) === target;
+  const requestedId = Number(currentVideoId);
+  if(!Number.isFinite(requestedId) || requestedId <= 0)
+    return null;
+
+  const allSeasons = entitiesOfType('Season');
+  const allEpisodes = entitiesOfType('Episode');
+  const episodeSequence = (episode, fallback) =>
+    numberFrom(episode, ['episodeNumber', 'episodeNum', 'sequenceNumber', 'seq', 'number']) || fallback;
+  const seasonSequence = (season, fallback) =>
+    numberFrom(season, ['seasonNumber', 'seasonNum', 'sequenceNumber', 'seq', 'number']) || fallback;
+
+  for(const show of entitiesOfType('Show')) {
+    let seasons = relationItems(show, 'seasons');
+    if(seasons.length === 0) {
+      seasons = allSeasons.filter(season =>
+        referencesEntity(season.parentShow || season.show || season.series, show)
+      );
+    }
+    const projectedSeasons = seasons.map((season, seasonIndex) => {
+      let episodes = relationItems(season, 'episodes');
+      if(episodes.length === 0) {
+        episodes = allEpisodes.filter(episode =>
+          referencesEntity(episode.parentSeason || episode.season, season)
+        );
+      }
+      const projectedEpisodes = episodes.map((episode, episodeIndex) => ({
+        seq: episodeSequence(episode, episodeIndex + 1),
+        id: entityVideoId(episode),
+        title: entityTitle(episode),
+        hiddenEpisodeNumbers: episode.hiddenEpisodeNumbers === true
+      })).filter(episode => episode.id !== null && episode.seq !== null);
+      return {
+        seq: seasonSequence(season, seasonIndex + 1),
+        episodes: projectedEpisodes
+      };
+    }).filter(season => season.seq !== null && season.episodes.length > 0);
+
+    const episodeIds = projectedSeasons.flatMap(season => season.episodes.map(episode => episode.id));
+    const currentEpisodeEntity = relationValue(show, 'currentEpisode');
+    const referencedCurrentId = entityVideoId(currentEpisodeEntity);
+    let currentEpisode = episodeIds.find(id => String(id) === String(requestedId));
+    if(currentEpisode === undefined && String(entityVideoId(show)) === String(requestedId))
+      currentEpisode = episodeIds.find(id => String(id) === String(referencedCurrentId));
+    if(currentEpisode === undefined && referencedCurrentId !== null && episodeIds.includes(referencedCurrentId))
+      currentEpisode = referencedCurrentId;
+    if(currentEpisode === undefined || projectedSeasons.length === 0)
+      continue;
+
+    const title = entityTitle(show) || entityTitle(currentEpisodeEntity);
+    if(!title)
+      continue;
+    return {
+      video: {
+        type: 'show',
+        title,
+        currentEpisode,
+        seasons: projectedSeasons
+      }
+    };
+  }
+
+  for(const type of ['Movie', 'Supplemental']) {
+    const entity = entitiesOfType(type).find(value => String(entityVideoId(value)) === String(requestedId));
+    const title = entityTitle(entity);
+    if(entity && title) {
+      return {
+        video: {
+          type: type.toLowerCase(),
+          title,
+          id: entityVideoId(entity),
+          seasons: []
+        }
+      };
+    }
+  }
+  return null;
+}
 
 const processMessage = e => {
   if(!e || !e.detail)
     return;
   const {type, data} = e.detail;
-  if(type === 'subs')
+  if(type === 'subs') {
+    if(fixtureCaptureRecording) {
+      const projection = fixtureSubtitleCatalogProjection(data);
+      const artifact = captureNetflixArtifact('track-catalog', projection, () => ({format: 'json'}), true);
+      captureNetflix('subtitle.catalog-observed', () => ({artifact: artifact || ''}));
+    }
     processSubInfo(data);
-  else if(type === 'id_override')
+  }
+  else if(type === 'id_override') {
     idOverrides[data[0]] = data[1];
-  else if(type === 'metadata')
+    captureNetflix('playback.id-override', () => ({mapped: true}));
+  }
+  else if(type === 'metadata') {
+    if(fixtureCaptureRecording) {
+      const projection = fixtureMetadataProjection(data);
+      const artifact = captureNetflixArtifact('metadata-structure', projection, () => ({format: 'json'}), true);
+      captureNetflix('metadata.response-observed', () => ({artifact: artifact || ''}));
+    }
     processMetadata(data);
+  }
+  else if(type === 'metadata_status') {
+    lastBatchMetadataLookup = {
+      stage: typeof data.stage === 'string' ? data.stage : '',
+      source: typeof data.source === 'string' ? data.source : '',
+      reason: typeof data.reason === 'string' ? data.reason : '',
+      status: Number.isFinite(Number(data.status)) ? Number(data.status) : 0
+    };
+    captureNetflix('metadata.lookup', () => ({...lastBatchMetadataLookup}));
+  }
+  else if(type === 'metadata_observer_status') {
+    const observerStatus = {
+      stage: typeof data.stage === 'string' ? data.stage : '',
+      transport: typeof data.transport === 'string' ? data.transport : '',
+      reason: typeof data.reason === 'string' ? data.reason : '',
+      status: Number.isFinite(Number(data.status)) ? Number(data.status) : 0
+    };
+    captureNetflix('metadata.interception', () => observerStatus);
+  }
 }
 
-const injection = (ALL_FORMATS) => {
+const injection = (ALL_FORMATS, projectGraphqlMetadata, createMetadataFetchWrapper,
+                   attachMetadataXhrObserver) => {
   const MANIFEST_PATTERN = new RegExp('manifest|licensedManifest');
   const forceSubs = localStorage.getItem('NSD_force-all-lang') !== 'false';
   const prefLocale = localStorage.getItem('NSD_pref-locale') || '';
+  let lastGraphqlMetadataSignature = '';
+
+  const dispatchMetadataStatus = (stage, source, reason, status) => {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+      detail: {
+        type: 'metadata_status',
+        data: {
+          stage: stage || '',
+          source: source || '',
+          reason: reason || '',
+          status: Number.isFinite(Number(status)) ? Number(status) : 0
+        }
+      }
+    }));
+  };
+
+  const dispatchMetadataObserverStatus = (stage, transport, reason, status) => {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+      detail: {
+        type: 'metadata_observer_status',
+        data: {
+          stage: stage || '',
+          transport: transport || '',
+          reason: reason || '',
+          status: Number.isFinite(Number(status)) ? Number(status) : 0
+        }
+      }
+    }));
+  };
+
+  const currentPlaybackVideoId = () => {
+    const pathId = Number(String(document.location.pathname || '').split('/').pop());
+    return Number.isFinite(pathId) && pathId > 0 ? pathId : null;
+  };
+
+  const dispatchGraphqlMetadata = payload => {
+    try {
+      const videoId = currentPlaybackVideoId();
+      if(videoId === null || typeof projectGraphqlMetadata !== 'function')
+        return false;
+      const data = projectGraphqlMetadata(payload, videoId);
+      if(!data || !data.video)
+        return false;
+      const signature = JSON.stringify([
+        data.video.type,
+        data.video.id || 0,
+        data.video.currentEpisode || 0,
+        Array.isArray(data.video.seasons) ? data.video.seasons.map(season => [
+          season.seq,
+          Array.isArray(season.episodes) ? season.episodes.map(episode => [episode.seq, episode.id]) : []
+        ]) : []
+      ]);
+      if(signature === lastGraphqlMetadataSignature)
+        return false;
+      lastGraphqlMetadataSignature = signature;
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data}}));
+      return true;
+    }
+    catch(error) {
+      console.debug('[Netflix Subtitle Downloader] GraphQL metadata observer failed:', error);
+      return false;
+    }
+  };
 
   // hide the menu when we go back to the browse list
   window.addEventListener('popstate', () => {
@@ -1175,6 +3298,7 @@ const injection = (ALL_FORMATS) => {
         if (data && data.result && (data.result.timedtexttracks || data.result.textTracks) && data.result.movieId) {
           window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'subs', data: data.result}}));
         }
+        dispatchGraphqlMetadata(data);
       }
       catch(error) {
         console.debug('[Netflix Subtitle Downloader] JSON.parse observer failed:', error);
@@ -1229,6 +3353,20 @@ const injection = (ALL_FORMATS) => {
       return stringify.apply(this, arguments);
     };
 
+    const isMetadataRequestUrl = requestUrl =>
+      typeof requestUrl === 'string' && requestUrl.includes('/metadata?');
+    const dispatchObservedMetadata = data => {
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+        detail: {type: 'metadata', data}
+      }));
+    };
+    const logXhrMetadataError = error => {
+      console.debug('[Netflix Subtitle Downloader] XHR metadata observer failed:', error);
+    };
+    const logFetchMetadataError = error => {
+      console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
+    };
+
     XMLHttpRequest.prototype.open = function() {
       let requestUrl = '';
       try {
@@ -1237,19 +3375,16 @@ const injection = (ALL_FORMATS) => {
       }
       catch(ignore) {}
 
-      if(requestUrl.includes('/metadata?'))
-        this.addEventListener('load', () => {
-          Promise.resolve().then(async () => {
-            let data = this.response;
-            if(data instanceof Blob)
-              data = JSON.parse(await data.text());
-            else if(typeof data === 'string')
-              data = JSON.parse(data);
-            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
-          }).catch(error => {
-            console.debug('[Netflix Subtitle Downloader] XHR metadata observer failed:', error);
-          });
-        }, false);
+      attachMetadataXhrObserver(
+        this,
+        requestUrl,
+        isMetadataRequestUrl,
+        JSON.parse,
+        typeof Blob === 'function' ? Blob : null,
+        dispatchObservedMetadata,
+        dispatchMetadataObserverStatus,
+        logXhrMetadataError
+      );
       return open.apply(this, arguments);
     };
 
@@ -1266,28 +3401,37 @@ const injection = (ALL_FORMATS) => {
       }
     };
 
-    window.fetch = function() {
-      const args = arguments;
-      const requestUrl = getFetchUrl(args[0]);
-      const responsePromise = realFetch.apply(this, args);
-      if(!requestUrl.includes('/metadata?'))
-        return responsePromise;
-
-      responsePromise.then(response => {
-        try {
-          response.clone().json().then(data => {
-            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
-          }).catch(error => {
-            console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
-          });
-        }
-        catch(error) {
-          console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
-        }
-      }).catch(() => {});
-      return responsePromise;
-    };
+    window.fetch = createMetadataFetchWrapper(
+      realFetch,
+      getFetchUrl,
+      isMetadataRequestUrl,
+      dispatchObservedMetadata,
+      dispatchMetadataObserverStatus,
+      logFetchMetadataError
+    );
   })(JSON.parse, JSON.stringify, XMLHttpRequest.prototype.open, window.fetch);
+
+  window.addEventListener('netflix_sub_downloader_metadata_request', () => {
+    try {
+      const cacheHit = dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
+        window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
+      if(cacheHit) {
+        dispatchMetadataStatus('completed', 'normalized-cache', '', 0);
+        return;
+      }
+      dispatchMetadataStatus('waiting', 'passive-interception', 'awaiting-observed-response', 0);
+    }
+    catch(error) {
+      dispatchMetadataStatus('failed', 'normalized-cache', 'lookup-error', 0);
+    }
+  });
+  Promise.resolve().then(() => {
+    try {
+      dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
+        window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
+    }
+    catch(ignore) {}
+  });
 }
 
 window.addEventListener('netflix_sub_downloader_data', processMessage, false);
@@ -1299,7 +3443,9 @@ const injectPageHooks = () => {
     return;
   }
   const sc = document.createElement('script');
-  sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ')';
+  sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ',' +
+    netflixMetadataFromGraphqlCache.toString() + ',' + netflixCreateMetadataFetchWrapper.toString() + ',' +
+    netflixAttachMetadataXhrObserver.toString() + ')';
   parent.appendChild(sc);
   parent.removeChild(sc);
 };

@@ -455,13 +455,13 @@
                     return '';
                 }
                 if (/^WEBVTT(?:\s|$)/i.test(trimmed)) return 'WEBVTT';
+                if (inNote) return '';
                 if (/^NOTE(?:\s|$)/i.test(trimmed)) {
                     inNote = true;
                     textSequence++;
                     if (data) data.sanitization.redactions++;
                     return 'NOTE TEXT_' + textSequence;
                 }
-                if (inNote) return '';
                 if (/^(?:STYLE|REGION)$/i.test(trimmed)) {
                     structuralBlock = trimmed.toUpperCase();
                     return structuralBlock;

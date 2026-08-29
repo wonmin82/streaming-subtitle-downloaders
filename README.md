@@ -87,7 +87,8 @@ streaming-subtitle-downloaders/
 ├── fixtures/
 │   ├── apple/
 │   ├── coupang/
-│   └── disney/
+│   ├── disney/
+│   └── netflix/
 ├── scripts/
 │   ├── apple-tv-plus-subtitles-downloader.user.js
 │   ├── coupang-play-subtitles-downloader.user.js
@@ -101,6 +102,7 @@ streaming-subtitle-downloaders/
 │   ├── fixture-capture-apple.js
 │   ├── fixture-capture-coupang.js
 │   ├── fixture-capture-disney.js
+│   ├── fixture-capture-netflix.js
 │   ├── fixture-replay.js
 │   ├── fixture-tooling.js
 │   └── regression.js
@@ -139,6 +141,7 @@ node tests/fixture-capture-core.js
 node tests/fixture-capture-apple.js
 node tests/fixture-capture-coupang.js
 node tests/fixture-capture-disney.js
+node tests/fixture-capture-netflix.js
 node tests/fixture-tooling.js
 node tools/fixture.js verify-all
 node tests/fixture-replay.js
@@ -154,7 +157,7 @@ node tools/sync-hls-segment-parser.js --write
 node tools/sync-hls-segment-parser.js --check
 ```
 
-When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its generated targets are the Apple TV+, Coupang Play, and Disney+ userscripts.
+When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its generated targets are all four userscripts.
 
 The `Regression tests` GitHub Actions workflow performs both shared-block synchronization checks, userscript syntax checks, whitespace validation, the regression suites, repository-fixture safety verification, and offline fixture replay for pull requests and pushes to `main`.
 
@@ -162,7 +165,7 @@ When a userscript changes, increment its `@version` so installed copies can rece
 
 ## Fixture capture development
 
-The repository includes a developer-only workflow for recording a sanitized playback timeline and turning it into a reviewed, offline regression fixture. It is disabled during normal use and has adapters for Apple TV+, Coupang Play, and Disney+. Raw captures are ignored by Git; only minimized fixtures that pass the repository safety checks and contain human-reviewed expectations may be committed.
+The repository includes a developer-only workflow for recording a sanitized playback timeline and turning it into a reviewed, offline regression fixture. It is disabled during normal use and has adapters for all four supported services. Raw captures are ignored by Git; only minimized fixtures that pass the repository safety checks and contain human-reviewed expectations may be committed.
 
 See [`docs/fixture-capture.md`](docs/fixture-capture.md) for activation, sanitization boundaries, import commands, fixture layout, and replay requirements. [`fixtures/README.md`](fixtures/README.md) contains the shorter repository-fixture policy.
 
