@@ -175,7 +175,9 @@ test('stop and export replaces active commands with the start-and-reload command
   let commandSequence = 0;
   const code = [
     functionDeclaration('installFixtureCaptureCommands'),
-    functionDeclaration('exportFixtureCapture')
+    functionDeclaration('exportFixtureCapture'),
+    functionDeclaration('fixtureSafeCaptureValue'),
+    functionDeclaration('fixtureCriticalString')
   ].join('\n');
   const context = evaluate(code, {
     window: topWindow,
@@ -211,7 +213,11 @@ test('stop and export replaces active commands with the start-and-reload command
 test('disabled adapter wrappers do not evaluate lazy payloads', () => {
   let payloadCalls = 0;
   let eventCalls = 0;
-  const context = evaluate(functionDeclaration('captureCoupang'), {
+  const context = evaluate([
+    functionDeclaration('captureCoupang'),
+    functionDeclaration('fixtureSafeCaptureValue'),
+    functionDeclaration('fixtureCriticalString')
+  ].join('\n'), {
     fixtureCaptureRecording: false,
     fixtureCapture: { event: () => { eventCalls++; return true; } }
   });
@@ -231,7 +237,9 @@ test('identical metadata projections reuse one artifact', () => {
   const context = evaluate(functionDeclaration('captureCoupangArtifact'), {
     fixtureCaptureRecording: true,
     fixtureMetadataArtifactCache: [],
-    fixtureCapture: { artifact: () => `ARTIFACT_${++artifactCalls}` }
+    fixtureCapture: { artifact: () => `ARTIFACT_${++artifactCalls}` },
+    fixtureArtifactHasCriticalRisk: () => false,
+    fixtureSafeCaptureValue: value => value
   });
   const first = context.captureCoupangArtifact('metadata-structure', '{"data":"STRING_1"}', () => {
     metadataCalls++;
@@ -251,6 +259,7 @@ test('capture helpers add no page, request, persistent storage, observer, or tim
   const helperNames = [
     'startFixtureCapture', 'fixtureObservedState', 'exportFixtureCapture', 'printFixtureCaptureStatus',
     'captureCoupang', 'captureCoupangResource', 'captureCoupangArtifact', 'captureCoupangSnapshot', 'fixtureTrackSummary',
+    'fixtureSafeCaptureValue', 'fixtureCriticalString', 'fixtureArtifactHasCriticalRisk',
     'fixtureMetadataState', 'fixtureResourceKind', 'fixtureMetadataProjection',
     'fixtureManifestText', 'fixtureManifestProjection', 'fixtureErrorCode'
   ];
@@ -393,6 +402,7 @@ test('successful fixture export passes the JSON blob to the existing file saver'
     fixtureCaptureRecording: false,
     fixtureCapture: { exportBlob: pretty => pretty === true ? blob : null },
     saveAs: (value, filename) => saved.push({ value, filename }),
+    fixtureSafeCaptureValue: value => value,
     printFixtureCaptureStatus: () => {},
     debuglog: () => {},
     Date: class extends Date {
@@ -483,6 +493,36 @@ test('projected subtitle manifests remain exportable through the shared safety c
   assert.strictEqual(capture.status().exportBlocked, false);
 });
 
+test('adapter pre-sanitization keeps sensitive observations out of the shared core', () => {
+  const code = [
+    sharedCaptureCoreDeclaration(),
+    functionDeclaration('fixtureSafeCaptureValue'),
+    functionDeclaration('fixtureCriticalString'),
+    functionDeclaration('fixtureArtifactHasCriticalRisk')
+  ].join('\n');
+  const context = evaluate(code, { URL, Blob });
+  const capture = context.createFixtureCapture({
+    service: 'coupang',
+    scriptVersion: 'test',
+    page: { host: 'www.coupangplay.com', path: '/play/TOKEN_1/episode' },
+    Blob
+  });
+  assert.strictEqual(capture.start({ reason: 'test' }), true);
+  const payload = context.fixtureSafeCaptureValue({
+    manifestUrl: 'https://cdn.test/license/TOKEN_RAW',
+    authorization: 'Bearer PRIVATE_TOKEN',
+    title: 'SHOW_001'
+  }, 'event', 0);
+  assert.strictEqual(payload.manifestUrl, 'REDACTED_URL');
+  assert.strictEqual(payload.authorization, 'REDACTED');
+  assert.strictEqual(payload.title, 'SHOW_001');
+  assert.strictEqual(capture.event('resource.observed', payload), true);
+  assert.strictEqual(context.fixtureArtifactHasCriticalRisk('<cenc:pssh>' + 'A'.repeat(300) + '</cenc:pssh>'), true);
+  capture.stop(context.fixtureSafeCaptureValue({ status: 'complete' }, 'observed', 0));
+  assert(capture.exportObject());
+  assert.strictEqual(capture.status().exportBlocked, false);
+});
+
 test('metadata changes produce accepted events and deduplicated snapshots', () => {
   const events = [];
   const snapshots = [];
@@ -557,7 +597,7 @@ test('pilot records session, resource, metadata, manifest, track, filename, and 
     assert(source.includes(`'${event}'`), `${event} capture point missing`);
   }
   assert(source.includes('// @grant      GM_registerMenuCommand'));
-  assert(/^\/\/ @version\s+1\.0\.28$/m.test(source));
+  assert(/^\/\/ @version\s+1\.0\.29$/m.test(source));
 });
 
 console.log(`Coupang Play fixture capture adapter tests passed: ${passed}`);

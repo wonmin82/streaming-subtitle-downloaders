@@ -2,7 +2,7 @@
 // @name       Coupang Play Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Coupang Play
-// @version    1.0.28
+// @version    1.0.29
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -1123,11 +1123,11 @@
         try {
             if (fixtureCaptureRecording) {
                 if (stopFirst) {
-                    fixtureCapture.stop(fixtureObservedState());
+                    fixtureCapture.stop(fixtureSafeCaptureValue(fixtureObservedState(), 'observed', 0));
                     fixtureCaptureRecording = false;
                     installFixtureCaptureCommands(true);
                 } else {
-                    fixtureCapture.setObserved(fixtureObservedState());
+                    fixtureCapture.setObserved(fixtureSafeCaptureValue(fixtureObservedState(), 'observed', 0));
                 }
             }
             var blob = fixtureCapture.exportBlob(true);
@@ -1152,7 +1152,7 @@
         if (!fixtureCaptureRecording || !fixtureCapture) return false;
         try {
             var payload = typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {});
-            return fixtureCapture.event(type, payload, { session: sessionId || '' });
+            return fixtureCapture.event(type, fixtureSafeCaptureValue(payload, 'event', 0), { session: sessionId || '' });
         } catch (err) {
             return false;
         }
@@ -1170,12 +1170,14 @@
     function captureCoupangArtifact(kind, text, metadataFactory) {
         if (!fixtureCaptureRecording || !fixtureCapture) return null;
         try {
+            if (fixtureArtifactHasCriticalRisk(text)) return null;
             if (kind === 'metadata-structure' && fixtureMetadataArtifactCache) {
                 for (var index = 0; index < fixtureMetadataArtifactCache.length; index++) {
                     if (fixtureMetadataArtifactCache[index].text === text) return fixtureMetadataArtifactCache[index].artifact;
                 }
             }
             var metadata = typeof metadataFactory === 'function' ? metadataFactory() : (metadataFactory || {});
+            metadata = fixtureSafeCaptureValue(metadata, 'artifactMetadata', 0);
             var artifactId = fixtureCapture.artifact(kind, text, metadata);
             if (artifactId && kind === 'metadata-structure' && fixtureMetadataArtifactCache) {
                 fixtureMetadataArtifactCache.push({ text: text, artifact: artifactId });
@@ -1190,6 +1192,7 @@
         if (!fixtureCaptureRecording || !fixtureCapture) return false;
         try {
             var payload = typeof payloadFactory === 'function' ? payloadFactory() : (payloadFactory || {});
+            payload = fixtureSafeCaptureValue(payload, 'snapshot', 0);
             var dedupeKey = String(sessionId || '') + '\n' + JSON.stringify(payload);
             if (fixtureSnapshotValues[kind] === dedupeKey) return false;
             fixtureSnapshotValues[kind] = dedupeKey;
@@ -1197,6 +1200,47 @@
         } catch (err) {
             return false;
         }
+    }
+
+    function fixtureSafeCaptureValue(value, key, depth) {
+        if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+        if (typeof value === 'string') {
+            if (fixtureCriticalString(value, key)) {
+                return /(?:url|uri|href|src|manifest|playlist)/i.test(key || '') || /^(?:https?:)?\/\//i.test(value) ?
+                    'REDACTED_URL' : 'REDACTED';
+            }
+            return value;
+        }
+        if (typeof value !== 'object' || depth >= 12) return null;
+        if (Array.isArray(value)) {
+            return value.slice(0, 200).map(function (item) {
+                return fixtureSafeCaptureValue(item, key, depth + 1);
+            });
+        }
+        var result = Object.create(null);
+        Object.keys(value).slice(0, 200).forEach(function (property) {
+            result[property] = fixtureSafeCaptureValue(value[property], property, depth + 1);
+        });
+        return result;
+    }
+
+    function fixtureCriticalString(value, key) {
+        var string = String(value == null ? '' : value);
+        if (!string) return false;
+        if (/(?:authorization|cookies?|set-cookie)/i.test(String(key || '')) && string !== 'REDACTED') return true;
+        if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(string)) return true;
+        if (/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+=\/-]{8,}/i.test(string)) return true;
+        if (/\bAKIA[0-9A-Z]{16}\b/.test(string) || /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(string)) return true;
+        if (/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/.test(string)) return true;
+        if (!/\s/.test(string) && /^(?:[A-Za-z0-9+/]{256,}={0,2})$/.test(string)) return true;
+        if (/\/(?:drm|license|licenses|widevine|fairplay|playready|certificate|cert)(?:\/|[?#]|$)/i.test(string)) return true;
+        return false;
+    }
+
+    function fixtureArtifactHasCriticalRisk(text) {
+        if (typeof text !== 'string' || !text) return false;
+        if (fixtureCriticalString(text, 'artifact')) return true;
+        return /(?:^|["'=\s>])[A-Za-z0-9+/]{256,}={0,2}(?:$|["'<\s])/m.test(text);
     }
 
     function fixtureTrackSummary(track) {
