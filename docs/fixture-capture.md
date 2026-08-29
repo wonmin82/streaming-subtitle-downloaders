@@ -17,7 +17,7 @@ Before activation, Tampermonkey shows only the start-and-reload command. The com
 
 The export is named `apple-<timestamp>.fixture.local.json`, `coupang-<timestamp>.fixture.local.json`, `disney-<timestamp>.fixture.local.json`, or `netflix-<timestamp>.fixture.local.json`. This suffix and the local `captures/` directory are ignored by Git.
 
-Netflix batch downloads may navigate with a full document reload. Capture content remains memory-only, so one export covers the current document: it records the calculated batch plan, the current episode download, and any scheduled next navigation. Re-arm capture on the specific episode that needs diagnosis rather than persisting raw capture data across reloads.
+Netflix batch downloads navigate between episodes with a full document reload. Capture content is memory-only and the one-shot arm has already been consumed, so the first navigation discards the active capture and the next document starts with capture disabled. The current implementation therefore cannot export one continuous capture after a multi-episode batch completes. Capture the relevant movie or episode as a single download when diagnostic JSON is required, and validate the cross-episode batch separately from its resulting archive. See **Known limitation and follow-up** below.
 
 ## What a capture contains
 
@@ -30,7 +30,9 @@ Schema version 1 separates four kinds of evidence:
 
 Known non-playback configuration operations such as Disney+'s `getSiteConfig` response are omitted from metadata artifacts. Apple TV+ HLS responses are reduced to subtitle-relevant master entries or a bounded head-and-tail media-playlist projection before entering the shared capture limits. Coupang Play records projected discovery metadata plus bounded HLS, DASH, WebVTT, and TTML structures that the downloader already receives. Netflix records bounded title catalogs, subtitle-track and format availability, mirror outcomes without the original signed URLs, and sanitized WebVTT or XML structures already downloaded by the script. Repeated metadata projections reuse the first artifact while each observation remains represented in the event timeline.
 
-Session values and opaque identifiers are replaced with stable capture-local aliases. URL credentials, query signing parameters, and path-embedded CDN signing segments are removed. Metadata scalar strings are projected to placeholders except for narrowly allowed parser signals, account/profile fields are removed, and subtitle dialogue is replaced while timing and parser-relevant structure remain. Capture sizes and entry counts are bounded; an export that hits a limit is marked as truncated and cannot be imported as a repository fixture.
+Session values and opaque identifiers are replaced with stable capture-local aliases. URL credentials, query signing parameters, and path-embedded CDN signing segments are removed. Structure-only metadata artifacts replace private or copyright-bearing text with placeholders, account/profile fields are removed, and subtitle dialogue is replaced while timing and parser-relevant structure remain. Capture sizes and entry counts are bounded; an export that hits a limit is marked as truncated and cannot be imported as a repository fixture.
+
+The event timeline, snapshots, and final `observed` state may retain short values needed to diagnose user-visible behavior, including detected playback titles, language labels, status text, and output filenames. Treat every `.fixture.local.json` export as local review material even when `verify-capture` reports it as safe. That result means the export passes the schema and high-risk-data guard; it does not mean the file is anonymous or ready to commit.
 
 Export is blocked if a final safety scan still sees high-risk credentials, signed URLs, DRM/license material, or other sensitive data. This browser-side protection is followed by a separate repository-side verifier; neither replaces human review.
 
@@ -54,9 +56,9 @@ fixtures/<service>/<name>/
 └── expected.json
 ```
 
-`observed.json` records the faulty or successful behavior that occurred; it is evidence, not the expected result. Import therefore creates `expected.json` with `reviewed: false` and no assertions. A maintainer must minimize and pseudonymize the input, diagnose the behavior, write the intended assertions, and set `reviewed` to `true` before the fixture can be committed.
+`observed.json` records the faulty or successful behavior that occurred; it is evidence, not the expected result. Import therefore creates `expected.json` with `reviewed: false` and no assertions. A maintainer must minimize and pseudonymize `scenario.json`, the referenced inputs, and `observed.json`, diagnose the behavior, write the intended assertions, and set `reviewed` to `true` before the fixture can be committed.
 
-Do not commit raw captures, cookies, authorization headers, account or device identifiers, DRM data, media files, HAR files, DOM dumps, synopsis text, or real subtitle dialogue. Prefer synthetic values such as `SHOW_001`, `TOKEN_1`, and `CAPTION_001` whenever the original value is not needed to reproduce the parser decision.
+Do not commit raw captures, cookies, authorization headers, account or device identifiers, DRM data, media files, HAR files, DOM dumps, synopsis text, real subtitle dialogue, or identifying playback titles and filenames copied from a local capture. Prefer synthetic values such as `SHOW_001`, `TOKEN_1`, and `CAPTION_001` whenever the original value is not needed to reproduce the parser decision.
 
 ## Verification and replay
 
@@ -75,6 +77,10 @@ node tests/fixture-replay.js
 Repository verification checks the schema, reviewed flag, paths, symlinks, referenced inputs, size limits, secrets, signed URLs, DRM material, opaque binary data, and unsanitized long-form or subtitle text. Replay tests then feed fixture inputs into the applicable userscript parser and compare the fresh result with the human-reviewed assertions. No streaming-service request is allowed during replay.
 
 The committed Apple TV+, Coupang Play, Disney+, and Netflix synthetic cases demonstrate this full path. Future observed cases should be reduced to the smallest input that preserves the failing decision.
+
+## Known limitation and follow-up
+
+- [ ] Preserve or automatically export a sanitized Netflix capture across full-document episode navigation during batch downloads without weakening the memory-only safety boundary or changing normal downloader behavior.
 
 ## Maintaining the shared core
 

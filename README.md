@@ -43,7 +43,7 @@ Coupang Play additionally supports its DASH/TTML subtitle path. Apple TV+, Coupa
 - Permission to play the content whose subtitles you want to download.
 - Userscript permission to access the media hosts declared by each script's `@connect` metadata.
 
-Apple TV+, Coupang Play, and Disney+ fetch subtitle manifests and segments from media CDN domains. If Tampermonkey asks whether the script may connect to those domains, allow the request for the downloader to work. Disney+ playback commonly uses `*.dssott.com` and `*.dssedge.com`.
+Apple TV+, Coupang Play, and Disney+ use `GM_xmlhttpRequest` to fetch subtitle manifests and segments from media CDN domains. Their `@connect` metadata includes known service domains plus a wildcard fallback because playback CDN hosts can vary. If Tampermonkey asks whether one of these scripts may connect to a media host, allow the request for the downloader to work. Netflix uses the page's native request path and does not declare `@connect` access.
 
 ## Installation
 
@@ -135,7 +135,7 @@ Node.js is required for the repository tools and tests. Before submitting a chan
 ```bash
 node tools/sync-hls-segment-parser.js --check
 node tools/sync-fixture-capture.js --check
-for file in scripts/*.user.js; do node --check "$file"; done
+for file in scripts/*.user.js shared/*.js tools/*.js tools/fixture-lib/*.js tests/*.js; do node --check "$file"; done
 node tests/regression.js
 node tests/fixture-capture-core.js
 node tests/fixture-capture-apple.js
@@ -159,15 +159,15 @@ node tools/sync-hls-segment-parser.js --check
 
 When changing the shared developer-only fixture capture core, edit [`shared/fixture-capture.template.js`](shared/fixture-capture.template.js) and run the corresponding `sync-fixture-capture.js` write and check commands. Its generated targets are all four userscripts.
 
-The `Regression tests` GitHub Actions workflow performs both shared-block synchronization checks, userscript syntax checks, whitespace validation, the regression suites, repository-fixture safety verification, and offline fixture replay for pull requests and pushes to `main`.
+The `Regression tests` GitHub Actions workflow performs both shared-block synchronization checks, JavaScript syntax checks, whitespace validation, the regression suites, repository-fixture safety verification, and offline fixture replay for pull requests and pushes to `main`.
 
 When a userscript changes, increment its `@version` so installed copies can receive the update.
 
 ## Fixture capture development
 
-The repository includes a developer-only workflow for recording a sanitized playback timeline and turning it into a reviewed, offline regression fixture. It is disabled during normal use and has adapters for all four supported services. Raw captures are ignored by Git; only minimized fixtures that pass the repository safety checks and contain human-reviewed expectations may be committed.
+The repository includes a developer-only workflow for recording a sanitized playback timeline and turning it into a reviewed, offline regression fixture. It is disabled during normal use and has adapters for all four supported services. Raw captures are ignored by Git and may retain short debugging values such as detected titles, language labels, and output filenames; a successful capture safety check does not make a raw export anonymous or commit-ready. Only minimized, pseudonymized fixtures that pass the repository checks and contain human-reviewed expectations may be committed.
 
-See [`docs/fixture-capture.md`](docs/fixture-capture.md) for activation, sanitization boundaries, import commands, fixture layout, and replay requirements. [`fixtures/README.md`](fixtures/README.md) contains the shorter repository-fixture policy.
+See [`docs/fixture-capture.md`](docs/fixture-capture.md) for activation, sanitization boundaries, the current Netflix batch-capture limitation, import commands, fixture layout, and replay requirements. [`fixtures/README.md`](fixtures/README.md) contains the shorter repository-fixture policy.
 
 ## License and attribution
 
