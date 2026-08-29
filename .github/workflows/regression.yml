@@ -42,6 +42,8 @@ jobs:
         run: node tests/fixture-capture-apple.js
       - name: Test Coupang Play fixture capture adapter
         run: node tests/fixture-capture-coupang.js
+      - name: Test Netflix fixture capture adapter
+        run: node tests/fixture-capture-netflix.js
       - name: Test fixture repository tooling
         run: node tests/fixture-tooling.js
       - name: Verify repository fixtures
