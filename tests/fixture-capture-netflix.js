@@ -374,7 +374,7 @@ test('Netflix page injection remains unaware of fixture capture state', () => {
 test('instrumentation covers lifecycle, metadata, catalogs, filenames, downloads, and batch decisions', () => {
   [
     'session.started', 'session.invalidated', 'navigation.changed', 'playback.reset',
-    'metadata.response-observed', 'metadata.accepted', 'subtitle.catalog-observed', 'tracks.updated',
+    'metadata.lookup', 'metadata.response-observed', 'metadata.accepted', 'subtitle.catalog-observed', 'tracks.updated',
     'filename.preview', 'filename.resolved', 'download.started', 'download.track-selected',
     'download.mirror-failed', 'subtitle.response-observed', 'archive.finished', 'download.finished',
     'download.ignored', 'batch.requested', 'batch.planned', 'batch.unavailable', 'batch.failed',

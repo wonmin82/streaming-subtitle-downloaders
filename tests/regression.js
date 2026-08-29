@@ -741,6 +741,47 @@ test('netflix: normalized GraphQL metadata restores episode batch catalogs', () 
   });
 });
 
+test('netflix: explicit batch metadata requests use bounded same-origin member API configuration', () => {
+  const start = sources.netflix.indexOf('function netflixMetadataRequestConfig(');
+  const end = sources.netflix.indexOf('\nfunction netflixMetadataFromGraphqlCache(', start);
+  assert(start >= 0 && end > start, 'Netflix metadata request configuration missing');
+  const ctx = evaluateFunctions(sources.netflix.slice(start, end));
+  const config = ctx.netflixMetadataRequestConfig({
+    models: {
+      serverDefs: {data: {BUILD_IDENTIFIER: 'release/2026'}},
+      truths: {data: {volatileBillboardsEnabled: false}}
+    }
+  }, '102', 'ko-KR', 'Example Edg/140.0');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(config)), {
+    url: '/nq/website/memberapi/release%2F2026/metadata',
+    params: {
+      movieid: 102,
+      drmSystem: 'playready',
+      isWatchlistEnabled: false,
+      isShortformEnabled: false,
+      languages: 'ko-KR',
+      isVolatileBillboardsEnabled: false
+    }
+  });
+  assert.strictEqual(ctx.netflixMetadataRequestConfig({}, 102, 'ko-KR', ''), null);
+  assert.strictEqual(ctx.netflixMetadataRequestConfig({models: {serverDefs: {data: {BUILD_IDENTIFIER: 'release'}}}}, 'invalid', 'ko-KR', ''), null);
+  assert.strictEqual(
+    ctx.netflixMetadataRequestConfig({models: {serverDefs: {data: {BUILD_IDENTIFIER: 'release'}}}}, 102, '../../bad', '').params.languages,
+    'en-US'
+  );
+
+  const injectionStart = sources.netflix.indexOf('const injection =');
+  const injectionEnd = sources.netflix.indexOf("\nwindow.addEventListener('netflix_sub_downloader_data'", injectionStart);
+  assert(injectionStart >= 0 && injectionEnd > injectionStart, 'Netflix page injection missing');
+  const injection = sources.netflix.slice(injectionStart, injectionEnd);
+  requireText(injection, 'const pageFetch = window.fetch.bind(window);', 'native page fetch capture');
+  requireText(injection, 'METADATA_REQUEST_TIMEOUT_MS = 4500', 'bounded metadata request');
+  requireText(injection, "credentials: 'same-origin'", 'same-origin credentials policy');
+  requireText(injection, "requestMemberApiMetadata();", 'explicit batch metadata fallback');
+  requireText(injection, "'response-missing-video'", 'invalid response guard');
+  assert(!injection.includes('authURL'), 'metadata requests must not copy profile authentication values');
+});
+
 test('netflix: batch plans are derived from the current episode and fail closed when stale', () => {
   const start = sources.netflix.indexOf('const currentBatchVideoId =');
   const end = sources.netflix.indexOf('\nconst requestPageMetadataRefresh =', start);

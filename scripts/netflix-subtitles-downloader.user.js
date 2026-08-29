@@ -1054,6 +1054,7 @@ let domDerivedTitleIds = {};
 let subCacheWaitGeneration = 0;
 let batchDownloadInProgress = false;
 let singleDownloadInProgress = false;
+let lastBatchMetadataLookup = null;
 let downloadUiState = {
   active: false,
   filename: '',
@@ -2881,13 +2882,18 @@ const startBatchDownload = async kind => {
   if(batchPlanRequestInProgress || batchDownloadInProgress || singleDownloadInProgress)
     return;
   batchPlanRequestInProgress = true;
+  lastBatchMetadataLookup = null;
   captureNetflix('batch.requested', () => ({kind}));
   setMenuDownloadProgress(0, 0, 'Waiting for episode metadata...', true);
   try {
     const plan = await waitForBatchPlan(kind);
     if(!plan || plan.length === 0) {
       setMenuDownloadProgress(0, 0, 'Batch metadata unavailable', false);
-      captureNetflix('batch.unavailable', () => ({kind, reason: 'episode-list-missing'}));
+      captureNetflix('batch.unavailable', () => ({
+        kind,
+        reason: 'episode-list-missing',
+        lookupReason: lastBatchMetadataLookup && lastBatchMetadataLookup.reason || ''
+      }));
       alert('Episode metadata is not ready. Wait for the player to load, then try the batch download again.');
       return;
     }
@@ -2909,6 +2915,35 @@ const startBatchDownload = async kind => {
 const downloadAll = () => startBatchDownload('all');
 const downloadSeason = () => startBatchDownload('season');
 const downloadToEnd = () => startBatchDownload('to-end');
+
+function netflixMetadataRequestConfig(reactContext, currentVideoId, locale, userAgent) {
+  const models = reactContext && reactContext.models;
+  const buildIdentifier = models && models.serverDefs && models.serverDefs.data &&
+    models.serverDefs.data.BUILD_IDENTIFIER;
+  const videoId = Number(currentVideoId);
+  if(typeof buildIdentifier !== 'string' || !buildIdentifier.trim() ||
+     !Number.isFinite(videoId) || videoId <= 0)
+    return null;
+
+  const requestedLocale = typeof locale === 'string' ? locale.trim() : '';
+  const safeLocale = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(requestedLocale) ?
+    requestedLocale : 'en-US';
+  const volatileBillboards = models && models.truths && models.truths.data &&
+    models.truths.data.volatileBillboardsEnabled;
+  const params = {
+    movieid: Math.floor(videoId),
+    drmSystem: /(?:^|\s)Edg\//.test(String(userAgent || '')) ? 'playready' : 'widevine',
+    isWatchlistEnabled: false,
+    isShortformEnabled: false,
+    languages: safeLocale
+  };
+  if(typeof volatileBillboards === 'boolean')
+    params.isVolatileBillboardsEnabled = volatileBillboards;
+  return {
+    url: '/nq/website/memberapi/' + encodeURIComponent(buildIdentifier.trim()) + '/metadata',
+    params
+  };
+}
 
 function netflixMetadataFromGraphqlCache(payload, currentVideoId) {
   if(!payload || typeof payload !== 'object')
@@ -3089,17 +3124,60 @@ const processMessage = e => {
     }
     processMetadata(data);
   }
+  else if(type === 'metadata_status') {
+    lastBatchMetadataLookup = {
+      stage: typeof data.stage === 'string' ? data.stage : '',
+      source: typeof data.source === 'string' ? data.source : '',
+      reason: typeof data.reason === 'string' ? data.reason : '',
+      status: Number.isFinite(Number(data.status)) ? Number(data.status) : 0
+    };
+    captureNetflix('metadata.lookup', () => ({...lastBatchMetadataLookup}));
+  }
 }
 
-const injection = (ALL_FORMATS, projectGraphqlMetadata) => {
+const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) => {
   const MANIFEST_PATTERN = new RegExp('manifest|licensedManifest');
   const forceSubs = localStorage.getItem('NSD_force-all-lang') !== 'false';
   const prefLocale = localStorage.getItem('NSD_pref-locale') || '';
+  const pageFetch = window.fetch.bind(window);
+  const METADATA_REQUEST_TIMEOUT_MS = 4500;
   let lastGraphqlMetadataSignature = '';
+  let pendingMetadataRequest = null;
+  let pendingMetadataVideoId = null;
+
+  const dispatchMetadataStatus = (stage, reason, status) => {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+      detail: {
+        type: 'metadata_status',
+        data: {
+          stage: stage || '',
+          source: 'memberapi-metadata',
+          reason: reason || '',
+          status: Number.isFinite(Number(status)) ? Number(status) : 0
+        }
+      }
+    }));
+  };
 
   const currentPlaybackVideoId = () => {
     const pathId = Number(String(document.location.pathname || '').split('/').pop());
     return Number.isFinite(pathId) && pathId > 0 ? pathId : null;
+  };
+
+  const currentMetadataVideoId = () => {
+    const pathId = currentPlaybackVideoId();
+    if(pathId === null)
+      return null;
+    try {
+      const current = window.netflix && window.netflix.falcorCache &&
+        window.netflix.falcorCache.videos && window.netflix.falcorCache.videos[pathId] &&
+        window.netflix.falcorCache.videos[pathId].current;
+      const mappedId = Number(current && current.value && current.value[1]);
+      if(Number.isFinite(mappedId) && mappedId > 0)
+        return mappedId;
+    }
+    catch(ignore) {}
+    return pathId;
   };
 
   const dispatchGraphqlMetadata = payload => {
@@ -3129,6 +3207,76 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata) => {
       console.debug('[Netflix Subtitle Downloader] GraphQL metadata observer failed:', error);
       return false;
     }
+  };
+
+  const requestMemberApiMetadata = () => {
+    const videoId = currentMetadataVideoId();
+    if(videoId === null || typeof buildMetadataRequest !== 'function') {
+      dispatchMetadataStatus('failed', 'invalid-video-id', 0);
+      return Promise.resolve(false);
+    }
+    if(pendingMetadataRequest && pendingMetadataVideoId === videoId)
+      return pendingMetadataRequest;
+
+    const reactContext = window.netflix && window.netflix.reactContext;
+    const locale = prefLocale || document.documentElement.lang || navigator.language || '';
+    const config = buildMetadataRequest(reactContext, videoId, locale, navigator.userAgent || '');
+    if(!config || !config.url || !config.params) {
+      dispatchMetadataStatus('failed', 'context-unavailable', 0);
+      return Promise.resolve(false);
+    }
+
+    const url = new URL(config.url, window.location.origin);
+    Object.entries(config.params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timeout = window.setTimeout(() => {
+      if(controller)
+        controller.abort();
+    }, METADATA_REQUEST_TIMEOUT_MS);
+    pendingMetadataVideoId = videoId;
+    dispatchMetadataStatus('started', '', 0);
+    pendingMetadataRequest = pageFetch(url.toString(), {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {Accept: 'application/json'},
+      signal: controller ? controller.signal : undefined
+    }).then(async response => {
+      if(!response.ok) {
+        dispatchMetadataStatus('failed', response.status >= 500 ? 'server-error' : 'request-rejected', response.status);
+        return false;
+      }
+      let data;
+      try {
+        data = await response.json();
+      }
+      catch(error) {
+        dispatchMetadataStatus('failed', 'invalid-response', response.status);
+        return false;
+      }
+      if(currentMetadataVideoId() !== videoId) {
+        dispatchMetadataStatus('failed', 'playback-changed', response.status);
+        return false;
+      }
+      if(!data || !data.video) {
+        dispatchMetadataStatus('failed', 'response-missing-video', response.status);
+        return false;
+      }
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+        detail: {type: 'metadata', data}
+      }));
+      dispatchMetadataStatus('completed', '', response.status);
+      return true;
+    }).catch(error => {
+      dispatchMetadataStatus('failed', error && error.name === 'AbortError' ? 'timeout' : 'network-error', 0);
+      return false;
+    }).finally(() => {
+      window.clearTimeout(timeout);
+      if(pendingMetadataVideoId === videoId) {
+        pendingMetadataRequest = null;
+        pendingMetadataVideoId = null;
+      }
+    });
+    return pendingMetadataRequest;
   };
 
   // hide the menu when we go back to the browse list
@@ -3264,10 +3412,17 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata) => {
 
   window.addEventListener('netflix_sub_downloader_metadata_request', () => {
     try {
-      dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
+      const cacheHit = dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
         window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
+      if(cacheHit) {
+        dispatchMetadataStatus('completed', 'normalized-cache', 0);
+        return;
+      }
+      requestMemberApiMetadata();
     }
-    catch(ignore) {}
+    catch(error) {
+      dispatchMetadataStatus('failed', 'lookup-error', 0);
+    }
   });
   Promise.resolve().then(() => {
     try {
@@ -3288,7 +3443,7 @@ const injectPageHooks = () => {
   }
   const sc = document.createElement('script');
   sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ',' +
-    netflixMetadataFromGraphqlCache.toString() + ')';
+    netflixMetadataFromGraphqlCache.toString() + ',' + netflixMetadataRequestConfig.toString() + ')';
   parent.appendChild(sc);
   parent.removeChild(sc);
 };
