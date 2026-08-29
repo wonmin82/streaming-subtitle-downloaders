@@ -437,8 +437,25 @@ test('netflix: download fallback skips unusable candidates and failed mirrors', 
   requireText(source, 'subtitle fetch timed out, trying another URL', 'timeout mirror fallback');
   requireText(source, 'subtitle response could not be read, trying another URL', 'body-read mirror fallback');
   requireText(source, 'return [title, seriesTitle, stop];', 'episode and batch archive titles');
-  requireText(source, 'const [title] = await _download(_zip);', 'single-episode archive title');
-  requireText(source, '[, title, stop] = await _download(zip);', 'batch archive series title');
+  requireText(source, 'const [title] = await _download(_zip, fixtureOperation);', 'single-episode archive title');
+  requireText(source, '[, title, stop] = await _download(zip, fixtureOperation);', 'batch archive series title');
+  requireText(source, 'await _save(_zip, title, fixtureOperation);', 'single archive operation ownership');
+  requireText(source, 'await _save(zip, title, fixtureOperation);', 'batch archive operation ownership');
+});
+
+test('netflix: overlapping downloads cannot replace fixture operation ownership', () => {
+  const source = sources.netflix;
+  requireText(source, 'let singleDownloadInProgress = false;', 'single-download lock');
+  requireText(source, 'singleDownloadInProgress || batchDownloadInProgress || batchPlanRequestInProgress', 'single-download overlap guard');
+  requireText(source, 'batchDownloadInProgress || singleDownloadInProgress', 'batch-download overlap guard');
+  requireText(source, "captureNetflix('download.ignored'", 'ignored-overlap fixture event');
+  const saveStart = source.indexOf('const _save = async');
+  const saveEnd = source.indexOf('\nconst _download = async', saveStart);
+  const downloadStart = saveEnd;
+  const downloadEnd = source.indexOf('\nconst downloadThis = async', downloadStart);
+  assert(saveStart >= 0 && saveEnd > saveStart && downloadEnd > downloadStart, 'download helpers missing');
+  const helpers = source.slice(saveStart, downloadEnd);
+  assert(!helpers.includes('fixtureActiveDownloadOperation'), 'download helpers must use their explicit operation');
 });
 
 test('netflix: menu lifecycle does not depend on metadata readiness', () => {
@@ -640,7 +657,11 @@ test('netflix: show filenames always include season and episode without duplicat
     'document.seasonNode.textContent = "";',
     'document.episodeNode.textContent = "";',
     'titleCache["81697779"] = {type: "movie", title: "테드 래소"};',
-    'this.nextMovieFilename = getTitleFromCache()[0];'
+    'this.nextMovieFilename = getTitleFromCache()[0];',
+    'document.titleNode.textContent = "관람등급: 15+";',
+    'this.ratingOverlayFilename = getTitleFromCache()[0];',
+    'document.titleNode.textContent = "이 비디오물은 청소년 관람불가 등급으로 19세 미만의 청소년은 시청할 수 없습니다.";',
+    'this.adultAdvisoryFilename = getTitleFromCache()[0];'
   ].join('\n');
   const ctx = evaluateFunctions(block, {
     document,
@@ -662,6 +683,89 @@ test('netflix: show filenames always include season and episode without duplicat
   assert.strictEqual(ctx.modernDocumentaryFilename, 'EBS.다큐프라임.-.주식의.시대.S01E01.1부.우리는.왜.투자에.실패하는가');
   assert.strictEqual(ctx.nextEpisodeFilename, '이.사랑.통역.되나요.S01E06.마지막.화');
   assert.strictEqual(ctx.nextMovieFilename, 'F1.더.무비');
+  assert.strictEqual(ctx.ratingOverlayFilename, 'F1.더.무비');
+  assert.strictEqual(ctx.adultAdvisoryFilename, 'F1.더.무비');
+});
+
+test('netflix: normalized GraphQL metadata restores episode batch catalogs', () => {
+  const start = sources.netflix.indexOf('function netflixMetadataFromGraphqlCache(');
+  const end = sources.netflix.indexOf('\nconst processMessage =', start);
+  assert(start >= 0 && end > start, 'Netflix GraphQL metadata projector missing');
+  const ctx = evaluateFunctions(sources.netflix.slice(start, end));
+  const cache = {
+    'Show:10': {
+      __typename: 'Show',
+      videoId: 10,
+      title: 'Synthetic Show',
+      'currentEpisode({"locale":"en"})': {__ref: 'Episode:102'},
+      seasons: {edges: [{node: {__ref: 'Season:1'}}]}
+    },
+    'Season:1': {
+      __typename: 'Season',
+      sequenceNumber: 1,
+      parentShow: {__ref: 'Show:10'},
+      'episodes({"first":20})': {
+        edges: [
+          {node: {__ref: 'Episode:101'}},
+          {node: {__ref: 'Episode:102'}}
+        ]
+      }
+    },
+    'Episode:101': {
+      __typename: 'Episode',
+      videoId: 101,
+      episodeNumber: 1,
+      title: 'First',
+      parentSeason: {__ref: 'Season:1'}
+    },
+    'Episode:102': {
+      __typename: 'Episode',
+      episodeNumber: 2,
+      title: 'Second',
+      parentSeason: {__ref: 'Season:1'}
+    }
+  };
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.netflixMetadataFromGraphqlCache({data: cache}, 102))), {
+    video: {
+      type: 'show',
+      title: 'Synthetic Show',
+      currentEpisode: 102,
+      seasons: [{
+        seq: 1,
+        episodes: [
+          {seq: 1, id: 101, title: 'First', hiddenEpisodeNumbers: false},
+          {seq: 2, id: 102, title: 'Second', hiddenEpisodeNumbers: false}
+        ]
+      }]
+    }
+  });
+});
+
+test('netflix: batch plans are derived from the current episode and fail closed when stale', () => {
+  const start = sources.netflix.indexOf('const currentBatchVideoId =');
+  const end = sources.netflix.indexOf('\nconst requestPageMetadataRefresh =', start);
+  assert(start >= 0 && end > start, 'Netflix batch planner missing');
+  let currentId = '102';
+  const ctx = evaluateFunctions([
+    sources.netflix.slice(start, end),
+    'this.batchPlanForKind = batchPlanForKind;'
+  ].join('\n'), {
+    batchAll: [101, 102, 201],
+    titleCache: {
+      101: {season: 1},
+      102: {season: 1},
+      201: {season: 2}
+    },
+    idOverrides: {},
+    unsafeWindow: {netflix: {falcorCache: {videos: {}}}},
+    getVideoId: () => currentId,
+    positiveInteger: value => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : null
+  });
+  assert.deepStrictEqual(Array.from(ctx.batchPlanForKind('all')), [101, 102, 201]);
+  assert.deepStrictEqual(Array.from(ctx.batchPlanForKind('season')), [101, 102]);
+  assert.deepStrictEqual(Array.from(ctx.batchPlanForKind('to-end')), [102, 201]);
+  currentId = '999';
+  assert.strictEqual(ctx.batchPlanForKind('to-end'), null, 'stale episode catalogs must not be reused');
 });
 
 test('coupang: async metadata resolves before the operation filename is frozen', () => {

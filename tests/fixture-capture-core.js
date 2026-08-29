@@ -4,6 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { verifyCaptureObject } = require('../tools/fixture-lib/verifier');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEMPLATE_PATH = path.join(ROOT, 'shared', 'fixture-capture.template.js');
@@ -243,10 +244,12 @@ test('WebVTT sanitizer preserves timing, cue markup, style, and region but not d
     '<v Real Person><c.yellow>Actual subtitle dialogue</c>',
     '',
     'NOTE private note',
+    'NOTE another private note',
     'more private note'
   ].join('\n'), { format: 'webvtt' });
   capture.stop();
-  const text = capture.exportObject().artifacts[id].text;
+  const exported = capture.exportObject();
+  const text = exported.artifacts[id].text;
   assert(text.startsWith('WEBVTT'));
   assert(text.includes('STYLE'));
   assert(text.includes('::cue { color: lime; }'));
@@ -255,10 +258,12 @@ test('WebVTT sanitizer preserves timing, cue markup, style, and region but not d
   assert(text.includes('<v SPEAKER>'));
   assert(text.includes('CAPTION_'));
   assert(text.includes('NOTE TEXT_'));
+  assert.strictEqual((text.match(/^NOTE /gm) || []).length, 1);
   assert(!text.includes('Episode title'));
   assert(!text.includes('Real Person'));
   assert(!text.includes('Actual subtitle dialogue'));
   assert(!text.includes('private note'));
+  assert.doesNotThrow(() => verifyCaptureObject(exported));
 });
 
 test('XML sanitizer preserves TTML structure and attributes but replaces text nodes', () => {

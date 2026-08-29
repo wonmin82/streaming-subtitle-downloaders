@@ -377,7 +377,8 @@ test('instrumentation covers lifecycle, metadata, catalogs, filenames, downloads
     'metadata.response-observed', 'metadata.accepted', 'subtitle.catalog-observed', 'tracks.updated',
     'filename.preview', 'filename.resolved', 'download.started', 'download.track-selected',
     'download.mirror-failed', 'subtitle.response-observed', 'archive.finished', 'download.finished',
-    'batch.planned', 'batch.navigation-scheduled'
+    'download.ignored', 'batch.requested', 'batch.planned', 'batch.unavailable', 'batch.failed',
+    'batch.navigation-scheduled'
   ].forEach(type => assert(source.includes(type), `${type} instrumentation missing`));
 });
 

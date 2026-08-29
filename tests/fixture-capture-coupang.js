@@ -597,7 +597,7 @@ test('pilot records session, resource, metadata, manifest, track, filename, and 
     assert(source.includes(`'${event}'`), `${event} capture point missing`);
   }
   assert(source.includes('// @grant      GM_registerMenuCommand'));
-  assert(/^\/\/ @version\s+1\.0\.29$/m.test(source));
+  assert(/^\/\/ @version\s+\S+$/m.test(source), 'userscript version metadata missing');
 });
 
 console.log(`Coupang Play fixture capture adapter tests passed: ${passed}`);

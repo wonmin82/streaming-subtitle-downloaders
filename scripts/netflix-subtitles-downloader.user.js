@@ -91,9 +91,9 @@ const DOWNLOAD_MENU = `
 <ol>
 <li class="header">Netflix subtitle downloader</li>
 <li class="download">Download subs for this <span class="series">episode</span><span class="not-series">movie</span></li>
-<li class="download-to-end series">Download subs from this ep till last available</li>
-<li class="download-season series">Download subs for this season</li>
-<li class="download-all series">Download subs for all seasons</li>
+<li class="download-to-end series batch-action">Download subs from this ep till last available</li>
+<li class="download-season series batch-action">Download subs for this season</li>
+<li class="download-all series batch-action">Download subs for all seasons</li>
 <li class="ep-title-in-filename">Add episode title to filename: <span></span></li>
 <li class="force-all-lang">Force Netflix to show all languages: <span></span></li>
 <li class="pref-locale">Preferred locale: <span></span></li>
@@ -140,6 +140,8 @@ body:hover #subtitle-downloader-menu { display: block; }
 
 #subtitle-downloader-menu:not(.series) .series{ display: none; }
 #subtitle-downloader-menu.series .not-series{ display: none; }
+#subtitle-downloader-menu.series:not(.batch-ready) .batch-action { opacity: .55; }
+#subtitle-downloader-menu.series:not(.batch-ready) .batch-action:hover { cursor: wait; }
 `;
 
 const SUB_TYPES = {
@@ -605,13 +607,13 @@ const SUB_TYPES = {
                     return '';
                 }
                 if (/^WEBVTT(?:\s|$)/i.test(trimmed)) return 'WEBVTT';
+                if (inNote) return '';
                 if (/^NOTE(?:\s|$)/i.test(trimmed)) {
                     inNote = true;
                     textSequence++;
                     if (data) data.sanitization.redactions++;
                     return 'NOTE TEXT_' + textSequence;
                 }
-                if (inNote) return '';
                 if (/^(?:STYLE|REGION)$/i.test(trimmed)) {
                     structuralBlock = trimmed.toUpperCase();
                     return structuralBlock;
@@ -1051,6 +1053,7 @@ let titleCache = {};
 let domDerivedTitleIds = {};
 let subCacheWaitGeneration = 0;
 let batchDownloadInProgress = false;
+let singleDownloadInProgress = false;
 let downloadUiState = {
   active: false,
   filename: '',
@@ -1754,6 +1757,10 @@ const ensureMenu = () => {
     setBatchDelayText();
   }
   downloaderMenu = menu;
+  if(batchPlanForKind('to-end'))
+    menu.classList.add('batch-ready');
+  else
+    menu.classList.remove('batch-ready');
   syncMenuVisibility(menu);
   if(created)
     applyDownloadUi(menu);
@@ -1864,19 +1871,20 @@ const processMetadata = data => {
     return;
 
   menu.classList.remove('series');
+  menu.classList.remove('batch-ready');
 
   const result = data.video;
   const {type, title} = result;
   if(type === 'show') {
-    batchAll = [];
-    batchSeason = [];
-    batchToEnd = [];
+    const nextBatchAll = [];
+    const nextBatchSeason = [];
+    const nextBatchToEnd = [];
     const allEpisodes = [];
     let currentSeason = 0;
     menu.classList.add('series');
-    for(const season of result.seasons) {
-      for(const episode of season.episodes) {
-        if(episode.id === result.currentEpisode)
+    for(const season of Array.isArray(result.seasons) ? result.seasons : []) {
+      for(const episode of Array.isArray(season.episodes) ? season.episodes : []) {
+        if(String(episode.id) === String(result.currentEpisode))
           currentSeason = season.seq;
         allEpisodes.push([season.seq, episode.seq, episode.id]);
         titleCache[episode.id] = {
@@ -1893,16 +1901,30 @@ const processMetadata = data => {
     allEpisodes.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
     let toEnd = false;
     for(const [season, episode, id] of allEpisodes) {
-      batchAll.push(id);
+      nextBatchAll.push(id);
       if(season === currentSeason)
-        batchSeason.push(id);
-      if(id === result.currentEpisode)
+        nextBatchSeason.push(id);
+      if(String(id) === String(result.currentEpisode))
         toEnd = true;
       if(toEnd)
-        batchToEnd.push(id);
+        nextBatchToEnd.push(id);
+    }
+    if(currentSeason > 0 && nextBatchToEnd.length > 0) {
+      batchAll = nextBatchAll;
+      batchSeason = nextBatchSeason;
+      batchToEnd = nextBatchToEnd;
+      menu.classList.add('batch-ready');
+    }
+    else {
+      batchAll = null;
+      batchSeason = null;
+      batchToEnd = null;
     }
   }
   else if(type === 'movie' || type === 'supplemental') {
+    batchAll = null;
+    batchSeason = null;
+    batchToEnd = null;
     titleCache[result.id] = {type, title};
     delete domDerivedTitleIds[result.id];
   }
@@ -1957,6 +1979,46 @@ const normalizeDomTitle = value => String(value || '').replace(/\s+/g, ' ').trim
 const positiveInteger = value => {
   const number = parseInt(value, 10);
   return Number.isFinite(number) && number > 0 ? number : null;
+};
+
+const isPlaybackAdvisoryTitle = value => {
+  const title = normalizeDomTitle(value);
+  if(!title)
+    return false;
+  return /(?:^|\s)\uAD00\uB78C\s*\uB4F1\uAE09\s*[:：]/i.test(title) ||
+    /\uCCAD\uC18C\uB144\s*\uAD00\uB78C\s*\uBD88\uAC00/i.test(title) ||
+    /\d{1,2}\s*\uC138\s*\uBBF8\uB9CC.*\uC2DC\uCCAD\uD560\s*\uC218\s*\uC5C6/i.test(title) ||
+    /^(?:maturity|content)\s+rating(?:\s*[:：]|$)/i.test(title) ||
+    /^rated\s+(?:tv-)?[a-z0-9+\-]+(?:\s|$)/i.test(title) ||
+    /(?:not available|cannot be watched).*(?:viewers?|children|people)\s+under/i.test(title);
+};
+
+const isPlaybackAdvisoryNode = node => {
+  let current = node;
+  for(let depth = 0; current && depth < 6; depth++) {
+    let marker = '';
+    try {
+      marker = [
+        current.getAttribute && current.getAttribute('data-uia'),
+        current.getAttribute && current.getAttribute('aria-label'),
+        typeof current.className === 'string' ? current.className : ''
+      ].filter(Boolean).join(' ');
+    }
+    catch(ignore) {}
+    if(/(?:maturity|rating|advisory|content-warning|playback-error)/i.test(marker))
+      return true;
+    current = current.parentElement || current.parentNode;
+  }
+  return false;
+};
+
+const playbackTitleCandidate = node => {
+  const title = normalizeDomTitle(node && node.textContent);
+  if(!title || title.length > 300 || title.toLowerCase() === 'netflix')
+    return '';
+  if(isPlaybackAdvisoryTitle(title) || isPlaybackAdvisoryNode(node))
+    return '';
+  return title;
 };
 
 const seasonNumberFromLabel = value => {
@@ -2077,7 +2139,7 @@ const playbackMetadataFromDom = () => {
   catch(ignore) {}
   if(titleContainer) {
     const separated = titleAndEpisodeFromDomContainer(titleContainer);
-    title = separated.title;
+    title = playbackTitleCandidate(titleContainer) ? separated.title : '';
     if(episodeNumberFromLabel(separated.episodeLabel) !== null)
       adjacentEpisodeLabel = separated.episodeLabel;
   }
@@ -2093,8 +2155,8 @@ const playbackMetadataFromDom = () => {
     const nodeUia = normalizeDomTitle(node && node.getAttribute && node.getAttribute('data-uia'));
     if(/evidence-overlay-(?:season|episode)-title/i.test(nodeUia))
       continue;
-    title = normalizeDomTitle(node && node.textContent);
-    if(title && title.length <= 300 && title.toLowerCase() !== 'netflix')
+    title = playbackTitleCandidate(node);
+    if(title)
       break;
   }
   if(!title)
@@ -2247,6 +2309,8 @@ const syncPlaybackMetadataState = menu => {
       }));
     }
     resetDownloadUiForPlaybackChange();
+    if(menu && menu.classList && !batchPlanForKind('to-end'))
+      menu.classList.remove('batch-ready');
   }
   lastPlaybackUiMetadata = {...title};
   if(typeof fixtureCaptureRecording !== 'undefined' && fixtureCaptureRecording) {
@@ -2417,8 +2481,7 @@ const selectedProfileForCandidate = (formats, candidate) => {
 };
 
 
-const _save = async (_zip, title) => {
-  const fixtureOperation = fixtureActiveDownloadOperation;
+const _save = async (_zip, title, fixtureOperation) => {
   const filename = title + '.zip';
   captureNetflix('archive.started', () => ({
     operationId: fixtureOperation && fixtureOperation.id || 0,
@@ -2449,8 +2512,7 @@ const _save = async (_zip, title) => {
   }
 };
 
-const _download = async _zip => {
-  const fixtureOperation = fixtureActiveDownloadOperation;
+const _download = async (_zip, fixtureOperation) => {
   const titleEntry = await waitForTitleEntry();
   const subs = getSubsFromCache();
   const [title, seriesTitle] = getTitleFromCache(titleEntry);
@@ -2635,17 +2697,25 @@ const _download = async _zip => {
 };
 
 const downloadThis = async () => {
+  if(singleDownloadInProgress || batchDownloadInProgress || batchPlanRequestInProgress) {
+    captureNetflix('download.ignored', () => ({reason: 'download-in-progress'}));
+    return;
+  }
+  singleDownloadInProgress = true;
   const fixtureOperation = beginFixtureDownload('single');
   try {
     const _zip = new JSZip();
-    const [title] = await _download(_zip);
-    await _save(_zip, title);
+    const [title] = await _download(_zip, fixtureOperation);
+    await _save(_zip, title, fixtureOperation);
     finishFixtureDownload(fixtureOperation, 'success', {filename: title + '.zip'});
   }
   catch(error) {
     setMenuDownloadProgress(0, 0, 'Failed', false);
     finishFixtureDownload(fixtureOperation, 'failed', {error});
     console.error('[Netflix Subtitle Downloader] download failed', error);
+  }
+  finally {
+    singleDownloadInProgress = false;
   }
 };
 
@@ -2672,7 +2742,7 @@ const readAsBinaryString = blob => new Promise(resolve => {
 });
 
 const downloadBatch = async auto => {
-  if(batchDownloadInProgress)
+  if(batchDownloadInProgress || singleDownloadInProgress)
     return;
 
   batchDownloadInProgress = true;
@@ -2699,7 +2769,7 @@ const downloadBatch = async auto => {
     zip = new JSZip();
 
   try {
-    [, title, stop] = await _download(zip);
+    [, title, stop] = await _download(zip, fixtureOperation);
   }
   catch(error) {
     title = 'unknown';
@@ -2714,7 +2784,7 @@ const downloadBatch = async auto => {
   batch = batch.filter(x => x !== id);
 
     if(stop || batch.length == 0) {
-      await _save(zip, title);
+      await _save(zip, title, fixtureOperation);
       finishFixtureDownload(fixtureOperation, stop ? 'stopped' : 'success', {
         filename: title + '.zip',
         remaining: batch.length
@@ -2740,23 +2810,260 @@ const downloadBatch = async auto => {
   }
 };
 
-const downloadAll = () => {
-  captureNetflix('batch.planned', () => ({kind: 'all', count: Array.isArray(batchAll) ? batchAll.length : 0}));
-  batch = batchAll.slice();
-  downloadBatch();
+const BATCH_METADATA_WAIT_TIMEOUT_MS = 5000;
+let batchPlanRequestInProgress = false;
+
+const currentBatchVideoId = () => {
+  if(!Array.isArray(batchAll))
+    return null;
+  const rawId = getVideoId();
+  const candidates = [rawId, idOverrides[rawId]];
+  try {
+    candidates.push(unsafeWindow.netflix.falcorCache.videos[rawId].current.value[1]);
+  }
+  catch(ignore) {}
+  for(const candidate of candidates) {
+    const matched = batchAll.find(id => String(id) === String(candidate));
+    if(matched !== undefined)
+      return matched;
+  }
+  return null;
 };
 
-const downloadSeason = () => {
-  captureNetflix('batch.planned', () => ({kind: 'season', count: Array.isArray(batchSeason) ? batchSeason.length : 0}));
-  batch = batchSeason.slice();
-  downloadBatch();
+const batchPlanForKind = kind => {
+  const currentId = currentBatchVideoId();
+  if(currentId === null || !Array.isArray(batchAll) || batchAll.length === 0)
+    return null;
+  if(kind === 'all')
+    return batchAll.slice();
+  const currentIndex = batchAll.findIndex(id => String(id) === String(currentId));
+  if(currentIndex < 0)
+    return null;
+  if(kind === 'to-end')
+    return batchAll.slice(currentIndex);
+  if(kind === 'season') {
+    const currentTitle = titleCache[currentId];
+    const currentSeason = positiveInteger(currentTitle && currentTitle.season);
+    if(currentSeason === null)
+      return null;
+    const seasonPlan = batchAll.filter(id =>
+      positiveInteger(titleCache[id] && titleCache[id].season) === currentSeason
+    );
+    return seasonPlan.length > 0 ? seasonPlan : null;
+  }
+  return null;
 };
 
-const downloadToEnd = () => {
-  captureNetflix('batch.planned', () => ({kind: 'to-end', count: Array.isArray(batchToEnd) ? batchToEnd.length : 0}));
-  batch = batchToEnd.slice();
-  downloadBatch();
+const requestPageMetadataRefresh = () => {
+  try {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_metadata_request'));
+  }
+  catch(ignore) {}
 };
+
+const waitForBatchPlan = async kind => {
+  const existing = batchPlanForKind(kind);
+  if(existing)
+    return existing;
+  requestPageMetadataRefresh();
+  const videoId = getVideoId();
+  const deadline = Date.now() + BATCH_METADATA_WAIT_TIMEOUT_MS;
+  while(getVideoId() === videoId && Date.now() < deadline) {
+    const plan = batchPlanForKind(kind);
+    if(plan)
+      return plan;
+    await asyncSleep(0.1);
+  }
+  return null;
+};
+
+const startBatchDownload = async kind => {
+  if(batchPlanRequestInProgress || batchDownloadInProgress || singleDownloadInProgress)
+    return;
+  batchPlanRequestInProgress = true;
+  captureNetflix('batch.requested', () => ({kind}));
+  setMenuDownloadProgress(0, 0, 'Waiting for episode metadata...', true);
+  try {
+    const plan = await waitForBatchPlan(kind);
+    if(!plan || plan.length === 0) {
+      setMenuDownloadProgress(0, 0, 'Batch metadata unavailable', false);
+      captureNetflix('batch.unavailable', () => ({kind, reason: 'episode-list-missing'}));
+      alert('Episode metadata is not ready. Wait for the player to load, then try the batch download again.');
+      return;
+    }
+    captureNetflix('batch.planned', () => ({kind, count: plan.length}));
+    setMenuDownloadProgress(0, plan.length, 'Preparing batch...', true);
+    batch = plan;
+    await downloadBatch();
+  }
+  catch(error) {
+    setMenuDownloadProgress(0, 0, 'Batch failed', false);
+    captureNetflix('batch.failed', () => ({kind, errorCode: fixtureErrorCode(error)}));
+    console.error('[Netflix Subtitle Downloader] batch preparation failed', error);
+  }
+  finally {
+    batchPlanRequestInProgress = false;
+  }
+};
+
+const downloadAll = () => startBatchDownload('all');
+const downloadSeason = () => startBatchDownload('season');
+const downloadToEnd = () => startBatchDownload('to-end');
+
+function netflixMetadataFromGraphqlCache(payload, currentVideoId) {
+  if(!payload || typeof payload !== 'object')
+    return null;
+  const possibleCache = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+    ? payload.data : payload;
+  const entries = Object.entries(possibleCache).slice(0, 20000)
+    .filter(([, value]) => value && typeof value === 'object' && !Array.isArray(value));
+  if(!entries.some(([key]) => /^(?:Show|Season|Episode|Movie|Supplemental):/i.test(key)))
+    return null;
+
+  const cache = Object.fromEntries(entries);
+  const keyByEntity = new Map(entries.map(([key, value]) => [value, key]));
+  const numberFrom = (value, names) => {
+    for(const name of names) {
+      const number = Number(value && value[name]);
+      if(Number.isFinite(number) && number > 0)
+        return number;
+    }
+    return null;
+  };
+  const entityVideoId = value => {
+    const directId = numberFrom(value, ['videoId', 'episodeId', 'id']);
+    if(directId !== null)
+      return directId;
+    const entityKey = keyByEntity.get(value) || '';
+    const keyMatch = entityKey.match(/:(\d+)$/);
+    return keyMatch ? numberFrom({id: keyMatch[1]}, ['id']) : null;
+  };
+  const entityTitle = value => {
+    for(const name of ['title', 'name', 'displayName']) {
+      if(typeof (value && value[name]) === 'string' && value[name].trim())
+        return value[name].trim();
+    }
+    return '';
+  };
+  const resolve = value => {
+    let current = value;
+    for(let depth = 0; current && typeof current === 'object' && depth < 8; depth++) {
+      if(typeof current.__ref === 'string' && cache[current.__ref]) {
+        current = cache[current.__ref];
+        continue;
+      }
+      if(current.node && typeof current.node === 'object') {
+        current = current.node;
+        continue;
+      }
+      return current;
+    }
+    return current && typeof current === 'object' ? current : null;
+  };
+  const relationItems = (entity, relationName) => {
+    if(!entity || typeof entity !== 'object')
+      return [];
+    const relation = Object.entries(entity).find(([key]) =>
+      key === relationName || key.startsWith(relationName + '(')
+    );
+    if(!relation)
+      return [];
+    const value = relation[1];
+    const values = Array.isArray(value) ? value :
+      (value && Array.isArray(value.edges) ? value.edges :
+        (value && Array.isArray(value.nodes) ? value.nodes :
+          (value && Array.isArray(value.items) ? value.items : [])));
+    return values.map(resolve).filter(Boolean);
+  };
+  const relationValue = (entity, relationName) => {
+    if(!entity || typeof entity !== 'object')
+      return null;
+    const relation = Object.entries(entity).find(([key]) =>
+      key === relationName || key.startsWith(relationName + '(')
+    );
+    return relation ? resolve(relation[1]) : null;
+  };
+  const entitiesOfType = type => entries
+    .filter(([key, value]) => key.startsWith(type + ':') || value.__typename === type)
+    .map(([, value]) => value);
+  const referencesEntity = (value, target) => resolve(value) === target;
+  const requestedId = Number(currentVideoId);
+  if(!Number.isFinite(requestedId) || requestedId <= 0)
+    return null;
+
+  const allSeasons = entitiesOfType('Season');
+  const allEpisodes = entitiesOfType('Episode');
+  const episodeSequence = (episode, fallback) =>
+    numberFrom(episode, ['episodeNumber', 'episodeNum', 'sequenceNumber', 'seq', 'number']) || fallback;
+  const seasonSequence = (season, fallback) =>
+    numberFrom(season, ['seasonNumber', 'seasonNum', 'sequenceNumber', 'seq', 'number']) || fallback;
+
+  for(const show of entitiesOfType('Show')) {
+    let seasons = relationItems(show, 'seasons');
+    if(seasons.length === 0) {
+      seasons = allSeasons.filter(season =>
+        referencesEntity(season.parentShow || season.show || season.series, show)
+      );
+    }
+    const projectedSeasons = seasons.map((season, seasonIndex) => {
+      let episodes = relationItems(season, 'episodes');
+      if(episodes.length === 0) {
+        episodes = allEpisodes.filter(episode =>
+          referencesEntity(episode.parentSeason || episode.season, season)
+        );
+      }
+      const projectedEpisodes = episodes.map((episode, episodeIndex) => ({
+        seq: episodeSequence(episode, episodeIndex + 1),
+        id: entityVideoId(episode),
+        title: entityTitle(episode),
+        hiddenEpisodeNumbers: episode.hiddenEpisodeNumbers === true
+      })).filter(episode => episode.id !== null && episode.seq !== null);
+      return {
+        seq: seasonSequence(season, seasonIndex + 1),
+        episodes: projectedEpisodes
+      };
+    }).filter(season => season.seq !== null && season.episodes.length > 0);
+
+    const episodeIds = projectedSeasons.flatMap(season => season.episodes.map(episode => episode.id));
+    const currentEpisodeEntity = relationValue(show, 'currentEpisode');
+    const referencedCurrentId = entityVideoId(currentEpisodeEntity);
+    let currentEpisode = episodeIds.find(id => String(id) === String(requestedId));
+    if(currentEpisode === undefined && String(entityVideoId(show)) === String(requestedId))
+      currentEpisode = episodeIds.find(id => String(id) === String(referencedCurrentId));
+    if(currentEpisode === undefined && referencedCurrentId !== null && episodeIds.includes(referencedCurrentId))
+      currentEpisode = referencedCurrentId;
+    if(currentEpisode === undefined || projectedSeasons.length === 0)
+      continue;
+
+    const title = entityTitle(show) || entityTitle(currentEpisodeEntity);
+    if(!title)
+      continue;
+    return {
+      video: {
+        type: 'show',
+        title,
+        currentEpisode,
+        seasons: projectedSeasons
+      }
+    };
+  }
+
+  for(const type of ['Movie', 'Supplemental']) {
+    const entity = entitiesOfType(type).find(value => String(entityVideoId(value)) === String(requestedId));
+    const title = entityTitle(entity);
+    if(entity && title) {
+      return {
+        video: {
+          type: type.toLowerCase(),
+          title,
+          id: entityVideoId(entity),
+          seasons: []
+        }
+      };
+    }
+  }
+  return null;
+}
 
 const processMessage = e => {
   if(!e || !e.detail)
@@ -2784,10 +3091,45 @@ const processMessage = e => {
   }
 }
 
-const injection = (ALL_FORMATS) => {
+const injection = (ALL_FORMATS, projectGraphqlMetadata) => {
   const MANIFEST_PATTERN = new RegExp('manifest|licensedManifest');
   const forceSubs = localStorage.getItem('NSD_force-all-lang') !== 'false';
   const prefLocale = localStorage.getItem('NSD_pref-locale') || '';
+  let lastGraphqlMetadataSignature = '';
+
+  const currentPlaybackVideoId = () => {
+    const pathId = Number(String(document.location.pathname || '').split('/').pop());
+    return Number.isFinite(pathId) && pathId > 0 ? pathId : null;
+  };
+
+  const dispatchGraphqlMetadata = payload => {
+    try {
+      const videoId = currentPlaybackVideoId();
+      if(videoId === null || typeof projectGraphqlMetadata !== 'function')
+        return false;
+      const data = projectGraphqlMetadata(payload, videoId);
+      if(!data || !data.video)
+        return false;
+      const signature = JSON.stringify([
+        data.video.type,
+        data.video.id || 0,
+        data.video.currentEpisode || 0,
+        Array.isArray(data.video.seasons) ? data.video.seasons.map(season => [
+          season.seq,
+          Array.isArray(season.episodes) ? season.episodes.map(episode => [episode.seq, episode.id]) : []
+        ]) : []
+      ]);
+      if(signature === lastGraphqlMetadataSignature)
+        return false;
+      lastGraphqlMetadataSignature = signature;
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data}}));
+      return true;
+    }
+    catch(error) {
+      console.debug('[Netflix Subtitle Downloader] GraphQL metadata observer failed:', error);
+      return false;
+    }
+  };
 
   // hide the menu when we go back to the browse list
   window.addEventListener('popstate', () => {
@@ -2805,6 +3147,7 @@ const injection = (ALL_FORMATS) => {
         if (data && data.result && (data.result.timedtexttracks || data.result.textTracks) && data.result.movieId) {
           window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'subs', data: data.result}}));
         }
+        dispatchGraphqlMetadata(data);
       }
       catch(error) {
         console.debug('[Netflix Subtitle Downloader] JSON.parse observer failed:', error);
@@ -2918,6 +3261,21 @@ const injection = (ALL_FORMATS) => {
       return responsePromise;
     };
   })(JSON.parse, JSON.stringify, XMLHttpRequest.prototype.open, window.fetch);
+
+  window.addEventListener('netflix_sub_downloader_metadata_request', () => {
+    try {
+      dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
+        window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
+    }
+    catch(ignore) {}
+  });
+  Promise.resolve().then(() => {
+    try {
+      dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
+        window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
+    }
+    catch(ignore) {}
+  });
 }
 
 window.addEventListener('netflix_sub_downloader_data', processMessage, false);
@@ -2929,7 +3287,8 @@ const injectPageHooks = () => {
     return;
   }
   const sc = document.createElement('script');
-  sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ')';
+  sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ',' +
+    netflixMetadataFromGraphqlCache.toString() + ')';
   parent.appendChild(sc);
   parent.removeChild(sc);
 };
