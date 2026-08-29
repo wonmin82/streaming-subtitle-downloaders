@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "name": "synthetic-metadata",
+  "service": "coupang",
+  "source": {
+    "captureToolVersion": "1.0.0",
+    "scriptVersion": "fixture",
+    "sanitization": {
+      "version": 1,
+      "redactions": 2,
+      "warnings": []
+    }
+  },
+  "page": {
+    "host": "www.coupangplay.com",
+    "path": "/play/TOKEN_1/episode"
+  },
+  "capture": {
+    "startedAt": "2026-01-01T00:00:00.000Z",
+    "durationMs": 900,
+    "truncated": false,
+    "limits": {
+      "maxEvents": 3000,
+      "maxSnapshots": 500,
+      "maxArtifacts": 200,
+      "maxArtifactBytes": 1048576,
+      "maxCaptureBytes": 20971520,
+      "maxStringBytes": 4096,
+      "maxArrayItems": 200,
+      "maxObjectKeys": 200,
+      "maxDepth": 8
+    }
+  },
+  "replay": {
+    "driver": "coupang-metadata-v1",
+    "input": "ARTIFACT_1"
+  },
+  "events": [
+    {
+      "seq": 1,
+      "t": 0,
+      "type": "session.started",
+      "session": "SESSION_1",
+      "data": {
+        "reason": "navigation"
+      }
+    },
+    {
+      "seq": 2,
+      "t": 700,
+      "type": "metadata.accepted",
+      "session": "SESSION_1",
+      "data": {
+        "title": "SHOW_001",
+        "episodeTag": "S01E03"
+      }
+    }
+  ],
+  "snapshots": [
+    {
+      "seq": 3,
+      "t": 800,
+      "kind": "filename.resolved",
+      "session": "SESSION_1",
+      "data": {
+        "filename": "SHOW_001.S01E03"
+      }
+    }
+  ],
+  "artifacts": {
+    "ARTIFACT_1": {
+      "kind": "metadata-structure",
+      "format": "json",
+      "url": "https://www.coupangplay.com/api-discover/v2/discover/titles/TOKEN_1/episodes",
+      "byteLength": 128,
+      "input": "input/artifact-001.json"
+    }
+  }
+}
