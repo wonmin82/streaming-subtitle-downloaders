@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "metadata": {
+      "title": "SHOW_001",
+      "season": 1,
+      "episode": 2,
+      "subtitle": "TEXT_002",
+      "hiddenNumber": true
+    },
+    "filename": "SHOW_001.S01E02",
+    "batch": {
+      "allCount": 3,
+      "seasonCount": 2,
+      "toEndCount": 2
+    }
+  }
+}

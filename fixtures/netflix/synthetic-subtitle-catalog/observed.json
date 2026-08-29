@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "result": {
+    "tracks": [
+      {
+        "language": "en-forced",
+        "format": "imsc1.1",
+        "extension": "xml",
+        "mirrorCount": 1
+      },
+      {
+        "language": "ko[cc]-sdh",
+        "format": "webvtt-lssdh-ios8",
+        "extension": "vtt",
+        "mirrorCount": 2
+      }
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "movieId": "TOKEN_1",
+  "timedtexttracks": [
+    {
+      "language": "ko",
+      "rawTrackType": "closedcaptions",
+      "trackVariant": "sdh",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {
+            "MIRROR_1": "URL_001",
+            "MIRROR_2": "URL_002"
+          }
+        },
+        "imsc1.1": {
+          "urls": [
+            {
+              "url": "URL_003"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "language": "en",
+      "rawTrackType": "subtitles",
+      "isForcedNarrative": true,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "imsc1.1": {
+          "downloadUrls": {
+            "MIRROR_1": "URL_004"
+          }
+        }
+      }
+    }
+  ]
+}
