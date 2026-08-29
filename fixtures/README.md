@@ -27,12 +27,14 @@ Verify one fixture or the complete committed corpus with:
 node tools/fixture.js verify fixtures/disney/synthetic-metadata
 node tools/fixture.js verify fixtures/apple/synthetic-metadata
 node tools/fixture.js verify fixtures/coupang/synthetic-metadata
+node tools/fixture.js verify fixtures/netflix/synthetic-show-metadata
+node tools/fixture.js verify fixtures/netflix/synthetic-subtitle-catalog
 node tools/fixture.js verify-all
 node tests/fixture-replay.js
 ```
 
 The verifier is dependency-free and offline. It rejects malformed schema versions, path traversal, symbolic links, unreferenced inputs, unreviewed expectations, truncated captures, credentials, query- or path-signed URLs, DRM/license material, opaque binary blobs, and subtitle dialogue that has not been replaced with placeholders such as `CAPTION_001`.
 
-To make a fixture an executable test case, add a supported `scenario.json.replay` driver and input artifact reference. The replay suite feeds that sanitized input into the corresponding userscript parser and compares the fresh result with `expected.json.assertions`; it does not compare against `observed.json`. The synthetic Apple TV+, Coupang Play, and Disney+ metadata fixtures are the smallest examples.
+To make a fixture an executable test case, add a supported `scenario.json.replay` driver and input artifact reference. The replay suite feeds that sanitized input into the corresponding userscript parser and compares the fresh result with `expected.json.assertions`; it does not compare against `observed.json`. The synthetic service fixtures are the smallest examples; Netflix additionally includes a subtitle-catalog case for production format and mirror selection.
 
 Fixtures should be minimal. Preserve only the structure needed for the regression: timing, manifest structure, semantic metadata fields, state transitions, and expected decisions. Do not include cookies, authorization headers, account identifiers, DRM payloads, media files, full DOM snapshots, synopsis text, or real subtitle dialogue.
