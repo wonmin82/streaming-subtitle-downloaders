@@ -2916,32 +2916,101 @@ const downloadAll = () => startBatchDownload('all');
 const downloadSeason = () => startBatchDownload('season');
 const downloadToEnd = () => startBatchDownload('to-end');
 
-function netflixMetadataRequestConfig(reactContext, currentVideoId, locale, userAgent) {
-  const models = reactContext && reactContext.models;
-  const buildIdentifier = models && models.serverDefs && models.serverDefs.data &&
-    models.serverDefs.data.BUILD_IDENTIFIER;
-  const videoId = Number(currentVideoId);
-  if(typeof buildIdentifier !== 'string' || !buildIdentifier.trim() ||
-     !Number.isFinite(videoId) || videoId <= 0)
-    return null;
+function netflixAttachMetadataXhrObserver(xhr, requestUrl, isMetadataRequestUrl, parseJson,
+                                           BlobConstructor, dispatchMetadata, dispatchStatus, logError) {
+  if(!isMetadataRequestUrl(requestUrl))
+    return false;
 
-  const requestedLocale = typeof locale === 'string' ? locale.trim() : '';
-  const safeLocale = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(requestedLocale) ?
-    requestedLocale : 'en-US';
-  const volatileBillboards = models && models.truths && models.truths.data &&
-    models.truths.data.volatileBillboardsEnabled;
-  const params = {
-    movieid: Math.floor(videoId),
-    drmSystem: /(?:^|\s)Edg\//.test(String(userAgent || '')) ? 'playready' : 'widevine',
-    isWatchlistEnabled: false,
-    isShortformEnabled: false,
-    languages: safeLocale
+  const report = (stage, reason, status) => {
+    try {
+      dispatchStatus(stage, 'xhr', reason || '', Number.isFinite(Number(status)) ? Number(status) : 0);
+    }
+    catch(ignore) {}
   };
-  if(typeof volatileBillboards === 'boolean')
-    params.isVolatileBillboardsEnabled = volatileBillboards;
-  return {
-    url: '/nq/website/memberapi/' + encodeURIComponent(buildIdentifier.trim()) + '/metadata',
-    params
+  const reportError = error => {
+    try {
+      logError(error);
+    }
+    catch(ignore) {}
+  };
+
+  report('request-matched', '', 0);
+  xhr.addEventListener('load', async function() {
+    const status = Number.isFinite(Number(this.status)) ? Number(this.status) : 0;
+    report('response-received', '', status);
+    try {
+      let data = this.response;
+      if(BlobConstructor && data instanceof BlobConstructor)
+        data = parseJson(await data.text());
+      else if(typeof data === 'string')
+        data = parseJson(data);
+      report('response-parsed', '', status);
+      dispatchMetadata(data);
+      report('response-dispatched', '', status);
+    }
+    catch(error) {
+      report('response-failed', 'parse-or-dispatch-error', status);
+      reportError(error);
+    }
+  }, false);
+  return true;
+}
+
+function netflixCreateMetadataFetchWrapper(realFetch, getFetchUrl, isMetadataRequestUrl,
+                                            dispatchMetadata, dispatchStatus, logError) {
+  const report = (stage, reason, status) => {
+    try {
+      dispatchStatus(stage, 'fetch', reason || '', Number.isFinite(Number(status)) ? Number(status) : 0);
+    }
+    catch(ignore) {}
+  };
+  const reportError = error => {
+    try {
+      logError(error);
+    }
+    catch(ignore) {}
+  };
+
+  return function() {
+    const args = arguments;
+    const requestUrl = getFetchUrl(args[0]);
+    const responsePromise = realFetch.apply(this, args);
+    if(!isMetadataRequestUrl(requestUrl))
+      return responsePromise;
+
+    report('request-matched', '', 0);
+    return responsePromise.then(response => {
+      const status = Number.isFinite(Number(response && response.status)) ? Number(response.status) : 0;
+      report('response-received', '', status);
+      let dataPromise;
+      try {
+        dataPromise = response.clone().json();
+      }
+      catch(error) {
+        report('response-failed', 'response-clone-error', status);
+        reportError(error);
+        return response;
+      }
+      return Promise.resolve(dataPromise).then(data => {
+        try {
+          report('response-parsed', '', status);
+          dispatchMetadata(data);
+          report('response-dispatched', '', status);
+        }
+        catch(error) {
+          report('response-failed', 'dispatch-error', status);
+          reportError(error);
+        }
+        return response;
+      }, error => {
+        report('response-failed', 'parse-error', status);
+        reportError(error);
+        return response;
+      });
+    }, error => {
+      report('response-failed', 'network-error', 0);
+      throw error;
+    });
   };
 }
 
@@ -3133,25 +3202,45 @@ const processMessage = e => {
     };
     captureNetflix('metadata.lookup', () => ({...lastBatchMetadataLookup}));
   }
+  else if(type === 'metadata_observer_status') {
+    const observerStatus = {
+      stage: typeof data.stage === 'string' ? data.stage : '',
+      transport: typeof data.transport === 'string' ? data.transport : '',
+      reason: typeof data.reason === 'string' ? data.reason : '',
+      status: Number.isFinite(Number(data.status)) ? Number(data.status) : 0
+    };
+    captureNetflix('metadata.interception', () => observerStatus);
+  }
 }
 
-const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) => {
+const injection = (ALL_FORMATS, projectGraphqlMetadata, createMetadataFetchWrapper,
+                   attachMetadataXhrObserver) => {
   const MANIFEST_PATTERN = new RegExp('manifest|licensedManifest');
   const forceSubs = localStorage.getItem('NSD_force-all-lang') !== 'false';
   const prefLocale = localStorage.getItem('NSD_pref-locale') || '';
-  const pageFetch = window.fetch.bind(window);
-  const METADATA_REQUEST_TIMEOUT_MS = 4500;
   let lastGraphqlMetadataSignature = '';
-  let pendingMetadataRequest = null;
-  let pendingMetadataVideoId = null;
 
-  const dispatchMetadataStatus = (stage, reason, status) => {
+  const dispatchMetadataStatus = (stage, source, reason, status) => {
     window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
       detail: {
         type: 'metadata_status',
         data: {
           stage: stage || '',
-          source: 'memberapi-metadata',
+          source: source || '',
+          reason: reason || '',
+          status: Number.isFinite(Number(status)) ? Number(status) : 0
+        }
+      }
+    }));
+  };
+
+  const dispatchMetadataObserverStatus = (stage, transport, reason, status) => {
+    window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+      detail: {
+        type: 'metadata_observer_status',
+        data: {
+          stage: stage || '',
+          transport: transport || '',
           reason: reason || '',
           status: Number.isFinite(Number(status)) ? Number(status) : 0
         }
@@ -3162,22 +3251,6 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
   const currentPlaybackVideoId = () => {
     const pathId = Number(String(document.location.pathname || '').split('/').pop());
     return Number.isFinite(pathId) && pathId > 0 ? pathId : null;
-  };
-
-  const currentMetadataVideoId = () => {
-    const pathId = currentPlaybackVideoId();
-    if(pathId === null)
-      return null;
-    try {
-      const current = window.netflix && window.netflix.falcorCache &&
-        window.netflix.falcorCache.videos && window.netflix.falcorCache.videos[pathId] &&
-        window.netflix.falcorCache.videos[pathId].current;
-      const mappedId = Number(current && current.value && current.value[1]);
-      if(Number.isFinite(mappedId) && mappedId > 0)
-        return mappedId;
-    }
-    catch(ignore) {}
-    return pathId;
   };
 
   const dispatchGraphqlMetadata = payload => {
@@ -3207,76 +3280,6 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
       console.debug('[Netflix Subtitle Downloader] GraphQL metadata observer failed:', error);
       return false;
     }
-  };
-
-  const requestMemberApiMetadata = () => {
-    const videoId = currentMetadataVideoId();
-    if(videoId === null || typeof buildMetadataRequest !== 'function') {
-      dispatchMetadataStatus('failed', 'invalid-video-id', 0);
-      return Promise.resolve(false);
-    }
-    if(pendingMetadataRequest && pendingMetadataVideoId === videoId)
-      return pendingMetadataRequest;
-
-    const reactContext = window.netflix && window.netflix.reactContext;
-    const locale = prefLocale || document.documentElement.lang || navigator.language || '';
-    const config = buildMetadataRequest(reactContext, videoId, locale, navigator.userAgent || '');
-    if(!config || !config.url || !config.params) {
-      dispatchMetadataStatus('failed', 'context-unavailable', 0);
-      return Promise.resolve(false);
-    }
-
-    const url = new URL(config.url, window.location.origin);
-    Object.entries(config.params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timeout = window.setTimeout(() => {
-      if(controller)
-        controller.abort();
-    }, METADATA_REQUEST_TIMEOUT_MS);
-    pendingMetadataVideoId = videoId;
-    dispatchMetadataStatus('started', '', 0);
-    pendingMetadataRequest = pageFetch(url.toString(), {
-      method: 'GET',
-      credentials: 'same-origin',
-      headers: {Accept: 'application/json'},
-      signal: controller ? controller.signal : undefined
-    }).then(async response => {
-      if(!response.ok) {
-        dispatchMetadataStatus('failed', response.status >= 500 ? 'server-error' : 'request-rejected', response.status);
-        return false;
-      }
-      let data;
-      try {
-        data = await response.json();
-      }
-      catch(error) {
-        dispatchMetadataStatus('failed', 'invalid-response', response.status);
-        return false;
-      }
-      if(currentMetadataVideoId() !== videoId) {
-        dispatchMetadataStatus('failed', 'playback-changed', response.status);
-        return false;
-      }
-      if(!data || !data.video) {
-        dispatchMetadataStatus('failed', 'response-missing-video', response.status);
-        return false;
-      }
-      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
-        detail: {type: 'metadata', data}
-      }));
-      dispatchMetadataStatus('completed', '', response.status);
-      return true;
-    }).catch(error => {
-      dispatchMetadataStatus('failed', error && error.name === 'AbortError' ? 'timeout' : 'network-error', 0);
-      return false;
-    }).finally(() => {
-      window.clearTimeout(timeout);
-      if(pendingMetadataVideoId === videoId) {
-        pendingMetadataRequest = null;
-        pendingMetadataVideoId = null;
-      }
-    });
-    return pendingMetadataRequest;
   };
 
   // hide the menu when we go back to the browse list
@@ -3350,6 +3353,20 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
       return stringify.apply(this, arguments);
     };
 
+    const isMetadataRequestUrl = requestUrl =>
+      typeof requestUrl === 'string' && requestUrl.includes('/metadata?');
+    const dispatchObservedMetadata = data => {
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+        detail: {type: 'metadata', data}
+      }));
+    };
+    const logXhrMetadataError = error => {
+      console.debug('[Netflix Subtitle Downloader] XHR metadata observer failed:', error);
+    };
+    const logFetchMetadataError = error => {
+      console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
+    };
+
     XMLHttpRequest.prototype.open = function() {
       let requestUrl = '';
       try {
@@ -3358,19 +3375,16 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
       }
       catch(ignore) {}
 
-      if(requestUrl.includes('/metadata?'))
-        this.addEventListener('load', () => {
-          Promise.resolve().then(async () => {
-            let data = this.response;
-            if(data instanceof Blob)
-              data = JSON.parse(await data.text());
-            else if(typeof data === 'string')
-              data = JSON.parse(data);
-            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
-          }).catch(error => {
-            console.debug('[Netflix Subtitle Downloader] XHR metadata observer failed:', error);
-          });
-        }, false);
+      attachMetadataXhrObserver(
+        this,
+        requestUrl,
+        isMetadataRequestUrl,
+        JSON.parse,
+        typeof Blob === 'function' ? Blob : null,
+        dispatchObservedMetadata,
+        dispatchMetadataObserverStatus,
+        logXhrMetadataError
+      );
       return open.apply(this, arguments);
     };
 
@@ -3387,27 +3401,14 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
       }
     };
 
-    window.fetch = function() {
-      const args = arguments;
-      const requestUrl = getFetchUrl(args[0]);
-      const responsePromise = realFetch.apply(this, args);
-      if(!requestUrl.includes('/metadata?'))
-        return responsePromise;
-
-      responsePromise.then(response => {
-        try {
-          response.clone().json().then(data => {
-            window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {detail: {type: 'metadata', data: data}}));
-          }).catch(error => {
-            console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
-          });
-        }
-        catch(error) {
-          console.debug('[Netflix Subtitle Downloader] fetch metadata observer failed:', error);
-        }
-      }).catch(() => {});
-      return responsePromise;
-    };
+    window.fetch = createMetadataFetchWrapper(
+      realFetch,
+      getFetchUrl,
+      isMetadataRequestUrl,
+      dispatchObservedMetadata,
+      dispatchMetadataObserverStatus,
+      logFetchMetadataError
+    );
   })(JSON.parse, JSON.stringify, XMLHttpRequest.prototype.open, window.fetch);
 
   window.addEventListener('netflix_sub_downloader_metadata_request', () => {
@@ -3415,13 +3416,13 @@ const injection = (ALL_FORMATS, projectGraphqlMetadata, buildMetadataRequest) =>
       const cacheHit = dispatchGraphqlMetadata(window.netflix && window.netflix.reactContext &&
         window.netflix.reactContext.models && window.netflix.reactContext.models.graphql);
       if(cacheHit) {
-        dispatchMetadataStatus('completed', 'normalized-cache', 0);
+        dispatchMetadataStatus('completed', 'normalized-cache', '', 0);
         return;
       }
-      requestMemberApiMetadata();
+      dispatchMetadataStatus('waiting', 'passive-interception', 'awaiting-observed-response', 0);
     }
     catch(error) {
-      dispatchMetadataStatus('failed', 'lookup-error', 0);
+      dispatchMetadataStatus('failed', 'normalized-cache', 'lookup-error', 0);
     }
   });
   Promise.resolve().then(() => {
@@ -3443,7 +3444,8 @@ const injectPageHooks = () => {
   }
   const sc = document.createElement('script');
   sc.innerHTML = '(' + injection.toString() + ')(' + JSON.stringify(ALL_FORMATS) + ',' +
-    netflixMetadataFromGraphqlCache.toString() + ',' + netflixMetadataRequestConfig.toString() + ')';
+    netflixMetadataFromGraphqlCache.toString() + ',' + netflixCreateMetadataFetchWrapper.toString() + ',' +
+    netflixAttachMetadataXhrObserver.toString() + ')';
   parent.appendChild(sc);
   parent.removeChild(sc);
 };

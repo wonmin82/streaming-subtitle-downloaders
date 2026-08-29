@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -741,45 +742,77 @@ test('netflix: normalized GraphQL metadata restores episode batch catalogs', () 
   });
 });
 
-test('netflix: explicit batch metadata requests use bounded same-origin member API configuration', () => {
-  const start = sources.netflix.indexOf('function netflixMetadataRequestConfig(');
+test('netflix: passive metadata observers preserve legacy response ordering', () => {
+  const start = sources.netflix.indexOf('function netflixAttachMetadataXhrObserver(');
   const end = sources.netflix.indexOf('\nfunction netflixMetadataFromGraphqlCache(', start);
-  assert(start >= 0 && end > start, 'Netflix metadata request configuration missing');
-  const ctx = evaluateFunctions(sources.netflix.slice(start, end));
-  const config = ctx.netflixMetadataRequestConfig({
-    models: {
-      serverDefs: {data: {BUILD_IDENTIFIER: 'release/2026'}},
-      truths: {data: {volatileBillboardsEnabled: false}}
+  assert(start >= 0 && end > start, 'Netflix metadata observer helpers missing');
+  const helpers = sources.netflix.slice(start, end);
+  const ctx = evaluateFunctions(helpers);
+  const xhrEvents = [];
+  let loadListener = null;
+  const xhr = {
+    response: '{"video":{"title":"Synthetic"}}',
+    status: 200,
+    addEventListener(type, listener) {
+      if(type === 'load')
+        loadListener = listener;
     }
-  }, '102', 'ko-KR', 'Example Edg/140.0');
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(config)), {
-    url: '/nq/website/memberapi/release%2F2026/metadata',
-    params: {
-      movieid: 102,
-      drmSystem: 'playready',
-      isWatchlistEnabled: false,
-      isShortformEnabled: false,
-      languages: 'ko-KR',
-      isVolatileBillboardsEnabled: false
-    }
-  });
-  assert.strictEqual(ctx.netflixMetadataRequestConfig({}, 102, 'ko-KR', ''), null);
-  assert.strictEqual(ctx.netflixMetadataRequestConfig({models: {serverDefs: {data: {BUILD_IDENTIFIER: 'release'}}}}, 'invalid', 'ko-KR', ''), null);
-  assert.strictEqual(
-    ctx.netflixMetadataRequestConfig({models: {serverDefs: {data: {BUILD_IDENTIFIER: 'release'}}}}, 102, '../../bad', '').params.languages,
-    'en-US'
-  );
+  };
+  assert.strictEqual(ctx.netflixAttachMetadataXhrObserver(
+    xhr,
+    'https://www.netflix.com/nq/website/memberapi/release/metadata?movieid=102',
+    url => url.includes('/metadata?'),
+    JSON.parse,
+    null,
+    data => xhrEvents.push('metadata:' + data.video.title),
+    stage => xhrEvents.push(stage),
+    () => xhrEvents.push('error')
+  ), true);
+  assert.strictEqual(typeof loadListener, 'function');
+  loadListener.call(xhr);
+  assert.deepStrictEqual(xhrEvents, [
+    'request-matched', 'response-received', 'response-parsed',
+    'metadata:Synthetic', 'response-dispatched'
+  ]);
+
+  const probe = [
+    helpers,
+    "const events = [];",
+    "const response = {status: 200, clone() { return {json() { return Promise.resolve({video: {title: 'Synthetic'}}); }}; }};",
+    "const failedResponse = {status: 200, clone() { return {json() { return Promise.reject(new Error('invalid json')); }}; }};",
+    "let lastNativePromise = null;",
+    "const realFetch = input => { lastNativePromise = Promise.resolve(input.includes('invalid') ? failedResponse : response); return lastNativePromise; };",
+    "const wrapped = netflixCreateMetadataFetchWrapper(realFetch, input => String(input), input => input.includes('/metadata?'),",
+    "  data => events.push('metadata:' + data.video.title),",
+    "  stage => events.push(stage),",
+    "  () => events.push('observer-error'));",
+    "wrapped('https://www.netflix.com/metadata?movieid=102').then(value => {",
+    "  if(value !== response) throw new Error('metadata response identity changed');",
+    "  events.push('netflix-caller');",
+    "  const nonMetadata = wrapped('https://www.netflix.com/manifest');",
+    "  if(nonMetadata !== lastNativePromise) throw new Error('non-metadata promise identity changed');",
+    "  return nonMetadata;",
+    "}).then(() => wrapped('https://www.netflix.com/metadata?invalid=1')).then(value => {",
+    "  if(value !== failedResponse) throw new Error('parse failure changed response');",
+    "  events.push('parse-failure-caller');",
+    "  process.stdout.write(JSON.stringify(events));",
+    "}).catch(error => { console.error(error); process.exitCode = 1; });"
+  ].join('\n');
+  const fetchEvents = JSON.parse(execFileSync(process.execPath, ['-e', probe], {encoding: 'utf8'}));
+  assert(fetchEvents.indexOf('metadata:Synthetic') < fetchEvents.indexOf('netflix-caller'),
+    'metadata must be dispatched before the intercepted fetch settles for Netflix');
+  assert(fetchEvents.includes('observer-error'), 'observer parse failures must remain isolated');
+  assert(fetchEvents.includes('parse-failure-caller'), 'observer parse failures must not reject Netflix fetches');
 
   const injectionStart = sources.netflix.indexOf('const injection =');
   const injectionEnd = sources.netflix.indexOf("\nwindow.addEventListener('netflix_sub_downloader_data'", injectionStart);
   assert(injectionStart >= 0 && injectionEnd > injectionStart, 'Netflix page injection missing');
   const injection = sources.netflix.slice(injectionStart, injectionEnd);
-  requireText(injection, 'const pageFetch = window.fetch.bind(window);', 'native page fetch capture');
-  requireText(injection, 'METADATA_REQUEST_TIMEOUT_MS = 4500', 'bounded metadata request');
-  requireText(injection, "credentials: 'same-origin'", 'same-origin credentials policy');
-  requireText(injection, "requestMemberApiMetadata();", 'explicit batch metadata fallback');
-  requireText(injection, "'response-missing-video'", 'invalid response guard');
-  assert(!injection.includes('authURL'), 'metadata requests must not copy profile authentication values');
+  requireText(injection, 'attachMetadataXhrObserver(', 'ordered XHR metadata observer');
+  requireText(injection, 'createMetadataFetchWrapper(', 'ordered fetch metadata observer');
+  requireText(injection, "'passive-interception'", 'passive batch metadata lookup status');
+  assert(!injection.includes('requestMemberApiMetadata'), 'batch preparation must not issue a separate metadata request');
+  assert(!sources.netflix.includes('/nq/website/memberapi/'), 'userscript must not construct a direct member API request');
 });
 
 test('netflix: batch plans are derived from the current episode and fail closed when stale', () => {
