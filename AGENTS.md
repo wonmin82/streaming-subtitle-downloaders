@@ -8,14 +8,16 @@
 ## Git Workflow
 
 - Start each change from an up-to-date `origin/main`.
-- If `origin/main` advances after a pull request is opened, report the drift before final review or merge.
+- Before final review or merge, fetch the remote and rebase the pull request branch onto the latest target branch, normally `origin/main`.
+- Do not merge the target branch into the pull request branch as a substitute for the required rebase.
+- If the rebase rewrites commits that were already pushed, update the remote branch with `git push --force-with-lease`; never use an unconditional force push.
 - Do not commit or push directly to `main`.
 - Create a dedicated branch for each logical change.
 - Keep unrelated changes in separate branches and pull requests.
 - Preserve unrelated working-tree changes.
 - Review the complete diff before committing or opening a pull request.
 - Run relevant automated checks before opening a pull request.
-- Re-run relevant automated checks after material changes or base updates and before merging.
+- Re-run relevant automated checks after material changes, base updates, or rebases and before merging.
 - Manual validation is optional unless explicitly requested.
 - Create a pull request only when requested or when the agreed workflow explicitly requires one.
 - Before merging, confirm that the pull request is not a draft, is mergeable, has passed required checks, has no unresolved review conversations, and reports current validation results.
@@ -29,7 +31,8 @@
 - Keep each commit focused on one logical change.
 - Use a concise, imperative subject that describes the result.
 - Include the motivation, significant implementation details, and validation results in the body when useful.
-- Preserve the pull request's commit history; do not rebase, amend, squash, force-push, or otherwise rewrite its commits unless explicitly requested.
+- Rebase only as required by the pre-merge workflow or when explicitly requested. During the required rebase, preserve commit order and messages.
+- Apart from the required pre-merge rebase, do not amend, squash, reorder, or otherwise rewrite commits unless explicitly requested.
 - Do not include credentials, personal paths, sensitive data, or identifying sample data.
 
 ## Pull Requests
