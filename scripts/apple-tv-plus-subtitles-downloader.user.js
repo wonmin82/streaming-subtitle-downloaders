@@ -2,7 +2,7 @@
 // @name       Apple TV+ Subtitles Downloader
 // @namespace  https://github.com/wonmin82/streaming-subtitle-downloaders
 // @description Download subtitles from Apple TV+
-// @version    1.0.22
+// @version    1.0.23
 // @author     Wonmin Jung
 // @license    MIT
 // @homepageURL https://github.com/wonmin82/streaming-subtitle-downloaders
@@ -3241,13 +3241,29 @@
         });
         var currentMap = null;
         var pendingByteRange = null;
+        var pendingSegmentDuration = null;
         var previousSegment = null;
         var pendingParts = [];
         var previousPart = null;
+        var timelineSeconds = 0;
+        var discontinuityOffset = 0;
+        var pendingDiscontinuity = false;
 
         lines.forEach(function (rawLine) {
             var line = rawLine.trim();
             if (!line) return;
+
+            if (/^#EXT-X-DISCONTINUITY$/i.test(line)) {
+                pendingDiscontinuity = true;
+                return;
+            }
+
+            var durationMatch = line.match(/^#EXTINF:([\d.]+)/i);
+            if (durationMatch) {
+                var segmentDuration = Number(durationMatch[1]);
+                pendingSegmentDuration = isFinite(segmentDuration) && segmentDuration > 0 ? segmentDuration : null;
+                return;
+            }
 
             var mapMatch = line.match(/^#EXT-X-MAP:(.*)$/i);
             if (mapMatch) {
@@ -3285,10 +3301,16 @@
                     if (!parsedPartRange) throw new Error('Invalid EXT-X-PART BYTERANGE.');
                     partByteRange = resolveHlsByteRange(parsedPartRange, partUrl, previousPart);
                 }
+                if (pendingDiscontinuity) {
+                    discontinuityOffset = timelineSeconds;
+                    pendingDiscontinuity = false;
+                }
                 var partEntry = {
                     url: partUrl,
                     map: currentMap,
                     byterange: partByteRange,
+                    duration: partDuration,
+                    discontinuityOffset: discontinuityOffset,
                     partial: true
                 };
                 previousPart = {
@@ -3316,16 +3338,24 @@
                 var segmentUrl = absoluteUrl(line, baseUrl);
                 var segmentByteRange = pendingByteRange === null ? null :
                     resolveHlsByteRange(pendingByteRange, segmentUrl, previousSegment);
+                if (pendingDiscontinuity) {
+                    discontinuityOffset = timelineSeconds;
+                    pendingDiscontinuity = false;
+                }
                 entries.push({
                     url: segmentUrl,
                     map: currentMap,
-                    byterange: segmentByteRange
+                    byterange: segmentByteRange,
+                    duration: pendingSegmentDuration,
+                    discontinuityOffset: discontinuityOffset
                 });
                 previousSegment = {
                     url: segmentUrl,
                     byterange: segmentByteRange
                 };
                 pendingByteRange = null;
+                if (pendingSegmentDuration !== null) timelineSeconds += pendingSegmentDuration;
+                pendingSegmentDuration = null;
             }
         });
 
@@ -3738,7 +3768,7 @@
                 ]).then(function (values) {
                     collectHlsVttHeaderMetadata(values[1], headerState);
                     collectHlsVttHeaderMetadata(values[0], headerState);
-                    var cleaned = normalizeHlsVttSegment(values[0], timestampState, values[1]);
+                    var cleaned = normalizeHlsVttSegment(values[0], timestampState, values[1], segment.discontinuityOffset);
                     var uniqueBody = uniqueHlsVttBody(cleaned, seenBlocks);
                     if (uniqueBody) {
                         merged += uniqueBody + '\n\n';
@@ -3822,15 +3852,21 @@
         return { baseOffsetSeconds: null };
     }
 
-    function normalizeHlsVttSegment(text, timestampState, initText) {
+    function normalizeHlsVttSegment(text, timestampState, initText, discontinuityOffset) {
         var value = String(text || '').replace(/\r\n|\r/g, '\n');
         var initValue = String(initText || '').replace(/\r\n|\r/g, '\n');
         var timestampMap = parseHlsTimestampMap(value) || parseHlsTimestampMap(initValue);
-        var offsetSeconds = timestampMap ? timestampMap.mpegTimestamp / 90000 - timestampMap.localSeconds : 0;
-        if (timestampState.baseOffsetSeconds === null) {
-            timestampState.baseOffsetSeconds = offsetSeconds;
+        var shiftSeconds = 0;
+        if (timestampMap) {
+            var offsetSeconds = timestampMap.mpegTimestamp / 90000 - timestampMap.localSeconds;
+            if (timestampState.baseOffsetSeconds === null) {
+                timestampState.baseOffsetSeconds = offsetSeconds;
+            }
+            shiftSeconds = normalizeHlsTimestampOffset(offsetSeconds - timestampState.baseOffsetSeconds);
+        } else {
+            var fallbackOffset = Number(discontinuityOffset);
+            if (isFinite(fallbackOffset) && fallbackOffset > 0) shiftSeconds = fallbackOffset;
         }
-        var shiftSeconds = normalizeHlsTimestampOffset(offsetSeconds - timestampState.baseOffsetSeconds);
         if (Math.abs(shiftSeconds) >= 0.0005) {
             value = shiftHlsVttCueTimes(value, shiftSeconds);
         }
@@ -3957,11 +3993,27 @@
             String(ms).padStart(3, '0');
     }
 
+    function isInvisibleHlsVttCueBlock(block) {
+        var lines = String(block || '').split(/\r\n|\r|\n/);
+        var timingIndex = -1;
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('-->') >= 0) {
+                timingIndex = i;
+                break;
+            }
+        }
+        if (timingIndex < 0) return false;
+        var payload = lines.slice(timingIndex + 1).join('\n')
+            .replace(/<[^>]*>/g, '')
+            .replace(/[\s\u200B\u200C\u200D\u2060\uFEFF]/g, '');
+        return payload.length === 0;
+    }
+
     function uniqueHlsVttBody(text, seenBlocks) {
         var output = [];
         String(text || '').replace(/\r\n|\r/g, '\n').split(/\n{2,}/).forEach(function (block) {
             block = block.trim();
-            if (!block || seenBlocks[block]) return;
+            if (!block || seenBlocks[block] || isInvisibleHlsVttCueBlock(block)) return;
             seenBlocks[block] = true;
             output.push(block);
         });

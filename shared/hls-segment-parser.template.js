@@ -12,13 +12,29 @@
         });
         var currentMap = null;
         var pendingByteRange = null;
+        var pendingSegmentDuration = null;
         var previousSegment = null;
         var pendingParts = [];
         var previousPart = null;
+        var timelineSeconds = 0;
+        var discontinuityOffset = 0;
+        var pendingDiscontinuity = false;
 
         lines.forEach(function (rawLine) {
             var line = rawLine.trim();
             if (!line) return;
+
+            if (/^#EXT-X-DISCONTINUITY$/i.test(line)) {
+                pendingDiscontinuity = true;
+                return;
+            }
+
+            var durationMatch = line.match(/^#EXTINF:([\d.]+)/i);
+            if (durationMatch) {
+                var segmentDuration = Number(durationMatch[1]);
+                pendingSegmentDuration = isFinite(segmentDuration) && segmentDuration > 0 ? segmentDuration : null;
+                return;
+            }
 
             var mapMatch = line.match(/^#EXT-X-MAP:(.*)$/i);
             if (mapMatch) {
@@ -56,10 +72,16 @@
                     if (!parsedPartRange) throw new Error('Invalid EXT-X-PART BYTERANGE.');
                     partByteRange = resolveHlsByteRange(parsedPartRange, partUrl, previousPart);
                 }
+                if (pendingDiscontinuity) {
+                    discontinuityOffset = timelineSeconds;
+                    pendingDiscontinuity = false;
+                }
                 var partEntry = {
                     url: partUrl,
                     map: currentMap,
                     byterange: partByteRange,
+                    duration: partDuration,
+                    discontinuityOffset: discontinuityOffset,
                     partial: true
                 };
                 previousPart = {
@@ -87,16 +109,24 @@
                 var segmentUrl = absoluteUrl(line, baseUrl);
                 var segmentByteRange = pendingByteRange === null ? null :
                     resolveHlsByteRange(pendingByteRange, segmentUrl, previousSegment);
+                if (pendingDiscontinuity) {
+                    discontinuityOffset = timelineSeconds;
+                    pendingDiscontinuity = false;
+                }
                 entries.push({
                     url: segmentUrl,
                     map: currentMap,
-                    byterange: segmentByteRange
+                    byterange: segmentByteRange,
+                    duration: pendingSegmentDuration,
+                    discontinuityOffset: discontinuityOffset
                 });
                 previousSegment = {
                     url: segmentUrl,
                     byterange: segmentByteRange
                 };
                 pendingByteRange = null;
+                if (pendingSegmentDuration !== null) timelineSeconds += pendingSegmentDuration;
+                pendingSegmentDuration = null;
             }
         });
 
