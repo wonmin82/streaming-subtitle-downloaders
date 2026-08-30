@@ -122,6 +122,8 @@ for (const service of ['apple', 'disney', 'coupang']) {
     assert.strictEqual(entries.length, 3, 'completed parent must replace its PARTs while live-edge PARTs remain');
     assert.strictEqual(entries[0].url, 'https://example.test/subs/seg1.vtt');
     assert.strictEqual(entries[0].partial, undefined, 'completed parent must not be marked partial');
+    assert.strictEqual(entries[0].duration, 1);
+    assert.strictEqual(entries[0].discontinuityOffset, 0);
     assert.strictEqual(entries[1].partial, true);
     assert.deepStrictEqual(JSON.parse(JSON.stringify(entries[1].byterange)), { offset: 0, length: 8 });
     assert.deepStrictEqual(JSON.parse(JSON.stringify(entries[2].byterange)), { offset: 8, length: 9 });
@@ -146,6 +148,27 @@ for (const service of ['apple', 'disney', 'coupang']) {
     ].join('\n');
     assert.throws(() => ctx.extractHlsSegmentEntries(invalidImplicit, 'https://example.test/subs/live.m3u8'), /Implicit EXT-X-BYTERANGE offset/);
     assert.throws(() => ctx.extractHlsSegmentEntries('#EXTM3U\n#EXT-X-PART:URI="missing-duration.vtt"', 'https://example.test/live.m3u8'), /duration/);
+
+    const discontinuous = [
+      '#EXTM3U',
+      '#EXTINF:5.0,',
+      'intro.vtt',
+      '#EXT-X-DISCONTINUITY',
+      '#EXTINF:7.5,',
+      'main-1.vtt',
+      '#EXTINF:3.0,',
+      'main-2.vtt'
+    ].join('\n');
+    const discontinuousEntries = ctx.extractHlsSegmentEntries(discontinuous, 'https://example.test/subs/playlist.m3u8');
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(discontinuousEntries.map(entry => ({duration: entry.duration, offset: entry.discontinuityOffset})))),
+      [
+        {duration: 5, offset: 0},
+        {duration: 7.5, offset: 5},
+        {duration: 3, offset: 5}
+      ],
+      'discontinuity groups must retain their cumulative playlist offset'
+    );
   });
 
   test(`${service}: WebVTT HLS metadata path remains present`, () => {
@@ -161,6 +184,47 @@ for (const service of ['apple', 'disney', 'coupang']) {
     assert(/408/.test(source) && /429/.test(source), 'retryable HTTP status handling missing');
   });
 }
+
+test('apple: discontinuity offsets repair local WebVTT timelines and remove empty cues', () => {
+  const source = sources.apple;
+  const block = functionDeclarations(source, [
+    'createHlsTimestampState', 'normalizeHlsVttSegment', 'parseHlsTimestampMap',
+    'normalizeHlsTimestampOffset', 'shiftHlsVttCueTimes', 'hlsTimestampSeconds',
+    'formatHlsTimestamp', 'cleanVttSegment', 'hlsVttBlocks', 'isHlsVttCueBlock',
+    'isHlsVttHeaderMetadataBlock', 'isInvisibleHlsVttCueBlock', 'uniqueHlsVttBody'
+  ]);
+  const ctx = evaluateFunctions(block);
+  const timestampState = ctx.createHlsTimestampState();
+  const seen = {};
+  const first = ctx.uniqueHlsVttBody(ctx.normalizeHlsVttSegment(
+    'WEBVTT\n\n00:00:04.000 --> 00:00:05.000\nCAPTION_001', timestampState, '', 0
+  ), seen);
+  const second = ctx.uniqueHlsVttBody(ctx.normalizeHlsVttSegment(
+    'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nCAPTION_002\n\n00:00:03.000 --> 00:00:04.000\n\u200B',
+    timestampState, '', 10
+  ), seen);
+  const output = first + '\n\n' + second;
+  assert(output.includes('00:00:04.000 --> 00:00:05.000'));
+  assert(output.includes('00:00:11.000 --> 00:00:12.000'));
+  assert(!output.includes('00:00:13.000 --> 00:00:14.000'), 'zero-width placeholder cue must be removed');
+
+  const mappedState = ctx.createHlsTimestampState();
+  const mapped = ctx.normalizeHlsVttSegment(
+    'WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000\n\n00:00:02.000 --> 00:00:03.000\nCAPTION_003',
+    mappedState, '', 50
+  );
+  assert(mapped.includes('00:00:02.000 --> 00:00:03.000'), 'timestamp map must take precedence over the fallback discontinuity offset');
+});
+
+test('coupang: thumbnail WebVTT and hostname TLDs are not subtitle languages', () => {
+  const source = sources.coupang;
+  const block = functionDeclarations(source, ['inferLanguage', 'normalizeLanguageCode', 'isThumbnailTrack']);
+  const ctx = evaluateFunctions(block);
+  assert.strictEqual(ctx.inferLanguage('https://media.example.com/assets/captions.vtt'), '');
+  assert.strictEqual(ctx.inferLanguage('https://media.example.com/subtitles/ko_sdh.vtt'), 'ko');
+  assert.strictEqual(ctx.isThumbnailTrack({URI: 'https://media.example.com/storyboards/thumbnails.vtt'}), true);
+  assert.strictEqual(ctx.isThumbnailTrack({NAME: 'Korean SDH', URI: 'https://media.example.com/subtitles/ko_sdh.vtt'}), false);
+});
 
 test('coupang: DASH Number/Time template token semantics', () => {
   const source = sources.coupang;
