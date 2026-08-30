@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "filename": "SHOW_001.S07E06.EPISODE_001",
+    "tracks": [
+      {"name": "Korean SDH (CC)", "language": "ko", "forced": false, "cc": true}
+    ],
+    "tldLanguage": ""
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "series": {
+    "title": "SHOW_001"
+  },
+  "episode": {
+    "title": "6. EPISODE_001",
+    "season": 7,
+    "episode": 6
+  },
+  "tracks": [
+    {
+      "NAME": "",
+      "LANGUAGE": "",
+      "TYPE": "",
+      "URI": "https://media.example.com/storyboards/thumbnails.vtt"
+    },
+    {
+      "NAME": "thumbnails",
+      "LANGUAGE": "",
+      "TYPE": "thumbnails",
+      "URI": "https://media.example.com/assets/thumbs.vtt"
+    },
+    {
+      "NAME": "Korean SDH (CC)",
+      "LANGUAGE": "",
+      "TYPE": "captions",
+      "CHARACTERISTICS": "public.accessibility.transcribes-spoken-dialog",
+      "URI": "https://media.example.com/subtitles/ko_sdh.vtt"
+    }
+  ],
+  "tldProbe": "https://media.example.com/assets/captions.vtt"
+}

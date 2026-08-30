@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "result": {
+    "metadata": {"title": "SHOW_001", "episodeTag": "S01E08"},
+    "outputFilename": "SHOW_001.S01E08",
+    "downloadedTrackCount": 4,
+    "cueRegressions": 4,
+    "visibleCueRegressions": 2,
+    "invisibleCueCount": 5
+  }
+}
