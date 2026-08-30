@@ -8,13 +8,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   regression:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
       - name: Check shared HLS parser synchronization
         run: |
           node tools/sync-hls-segment-parser.js --check

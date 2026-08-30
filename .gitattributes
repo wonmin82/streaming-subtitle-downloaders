@@ -1,5 +1,6 @@
 * text=auto
 *.md text eol=lf
+/.github/**/*.yml text eol=lf
 /scripts/*.user.js text eol=lf
 /shared/*.js text eol=lf
 /tools/*.js text eol=lf
