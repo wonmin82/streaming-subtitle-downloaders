@@ -1,0 +1,4 @@
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",FORCED=NO,CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog",URI="en_cc.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Korean",LANGUAGE="ko",FORCED=NO,CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog",URI="ko_cc.m3u8"

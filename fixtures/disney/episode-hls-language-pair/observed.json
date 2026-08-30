@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "result": {
+    "metadata": {"title": "SHOW_001", "episodeTag": "S01E05"},
+    "outputFilename": "SHOW_001.S01E05.en-ko.subtitles.zip",
+    "downloadedTracks": ["en", "ko"],
+    "forcedTrackCount": 0
+  }
+}
