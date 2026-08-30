@@ -104,6 +104,35 @@ function coupangMetadataRuntime() {
   return context;
 }
 
+function appleHlsRuntime() {
+  const names = [
+    'extractHlsSegmentEntries', 'parseAttrList', 'parseHlsByteRange',
+    'isSafeHlsByteInteger', 'resolveHlsByteRange', 'absoluteUrl',
+    'createHlsTimestampState', 'normalizeHlsVttSegment', 'parseHlsTimestampMap',
+    'normalizeHlsTimestampOffset', 'shiftHlsVttCueTimes', 'hlsTimestampSeconds',
+    'formatHlsTimestamp', 'cleanVttSegment', 'hlsVttBlocks', 'isHlsVttCueBlock',
+    'isHlsVttHeaderMetadataBlock', 'isInvisibleHlsVttCueBlock', 'uniqueHlsVttBody'
+  ];
+  const context = {URL};
+  vm.createContext(context);
+  vm.runInContext(names.map(name => functionDeclaration(APPLE_SOURCE, name)).join('\n'), context);
+  return context;
+}
+
+function coupangEpisodeTrackRuntime() {
+  const names = [
+    'mergeEpisodeObjectMetadata', 'episodeMetadataFromTitle', 'isUsableMetadataLine',
+    'isPlaybackTimeText', 'cleanDisplayTitle', 'seasonEpisodeNumbers',
+    'formatSeasonEpisodeTag', 'parseOptionalNumber', 'uniqueFilenameParts',
+    'sanitizeFilename', 'pad2', 'inferLanguage', 'normalizeLanguageCode',
+    'isThumbnailTrack', 'isForcedTrack', 'isCcTrack'
+  ];
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(names.map(name => functionDeclaration(COUPANG_SOURCE, name)).join('\n'), context);
+  return context;
+}
+
 function disneyHlsRuntime() {
   const names = ['parseManifest', 'parseAttrList', 'trackLabel', 'inferTrackName', 'inferLanguage', 'absoluteUrl'];
   const context = {URL};
@@ -113,6 +142,32 @@ function disneyHlsRuntime() {
 }
 
 const replayDrivers = {
+  'apple-hls-discontinuity-v1': (inputText) => {
+    const runtime = appleHlsRuntime();
+    const input = JSON.parse(inputText);
+    const entries = runtime.extractHlsSegmentEntries(input.playlist, input.baseUrl);
+    const timestampState = runtime.createHlsTimestampState();
+    const seen = {};
+    const bodies = [];
+    for (const entry of entries) {
+      const segmentText = input.segments[entry.url];
+      assert.strictEqual(typeof segmentText, 'string', `missing synthetic segment ${entry.url}`);
+      const normalized = runtime.normalizeHlsVttSegment(segmentText, timestampState, '', entry.discontinuityOffset);
+      const unique = runtime.uniqueHlsVttBody(normalized, seen);
+      if (unique) bodies.push(unique);
+    }
+    const output = bodies.join('\n\n');
+    const cueStarts = Array.from(output.matchAll(/^\s*((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})\s+-->/gm), match => match[1]);
+    const cueSeconds = cueStarts.map(value => runtime.hlsTimestampSeconds(value));
+    return {
+      segmentCount: entries.length,
+      discontinuityOffsets: entries.map(entry => entry.discontinuityOffset),
+      cueStarts,
+      cueCount: cueStarts.length,
+      monotonic: cueSeconds.every((value, index) => index === 0 || value >= cueSeconds[index - 1]),
+      containsInvisibleCue: output.indexOf('\u200B') >= 0
+    };
+  },
   'apple-metadata-v1': (inputText) => {
     const runtime = appleMetadataRuntime();
     runtime.state = {
@@ -164,6 +219,34 @@ const replayDrivers = {
         episodeTag,
         metadata.episodeTitle
       ]).join('.'))
+    };
+  },
+  'coupang-episode-track-v1': (inputText) => {
+    const runtime = coupangEpisodeTrackRuntime();
+    const input = JSON.parse(inputText);
+    const metadata = {
+      title: input.series.title,
+      seasonNumber: null,
+      episodeNumber: null,
+      episodeTitle: '',
+      episodeConfirmed: false
+    };
+    runtime.mergeEpisodeObjectMetadata(input.episode, metadata);
+    const episodeTag = runtime.formatSeasonEpisodeTag(metadata.seasonNumber, metadata.episodeNumber);
+    const tracks = input.tracks
+      .filter(track => !runtime.isThumbnailTrack(track))
+      .map(track => ({
+        name: track.NAME,
+        language: runtime.normalizeLanguageCode(track.LANGUAGE || runtime.inferLanguage(track.URI)),
+        forced: runtime.isForcedTrack(track),
+        cc: runtime.isCcTrack(track)
+      }));
+    return {
+      filename: runtime.sanitizeFilename(runtime.uniqueFilenameParts([
+        metadata.title, episodeTag, metadata.episodeTitle
+      ]).join('.')),
+      tracks,
+      tldLanguage: runtime.inferLanguage(input.tldProbe)
     };
   },
   'disney-metadata-v1': (inputText) => {

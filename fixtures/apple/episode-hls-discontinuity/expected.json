@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "segmentCount": 5,
+    "discontinuityOffsets": [0, 8, 13, 13, 133],
+    "cueStarts": ["00:00:09.000", "00:00:15.000", "00:01:15.000"],
+    "cueCount": 3,
+    "monotonic": true,
+    "containsInvisibleCue": false
+  }
+}

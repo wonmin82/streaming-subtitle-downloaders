@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "name": "episode-webvtt-track-filter",
+  "service": "coupang",
+  "source": {
+    "captureToolVersion": "1.0.0",
+    "scriptVersion": "1.0.30",
+    "sanitization": {"version": 1, "redactions": 8, "warnings": []}
+  },
+  "page": {"host": "www.coupangplay.com", "path": "/play/TOKEN_1"},
+  "capture": {
+    "startedAt": "2026-01-01T00:00:00.000Z",
+    "durationMs": 1000,
+    "truncated": false,
+    "limits": {
+      "maxEvents": 3000,
+      "maxSnapshots": 500,
+      "maxArtifacts": 200,
+      "maxArtifactBytes": 1048576,
+      "maxCaptureBytes": 20971520,
+      "maxStringBytes": 4096,
+      "maxArrayItems": 200,
+      "maxObjectKeys": 200,
+      "maxDepth": 12
+    }
+  },
+  "replay": {"driver": "coupang-episode-track-v1", "input": "ARTIFACT_1"},
+  "events": [
+    {
+      "seq": 1,
+      "t": 0,
+      "type": "session.started",
+      "session": "SESSION_1",
+      "data": {"reason": "navigation"}
+    },
+    {
+      "seq": 2,
+      "t": 700,
+      "type": "track.catalog.observed",
+      "session": "SESSION_1",
+      "data": {"artifact": "ARTIFACT_1", "detectedTrackCount": 3}
+    }
+  ],
+  "snapshots": [
+    {
+      "seq": 3,
+      "t": 800,
+      "kind": "filename.resolved",
+      "session": "SESSION_1",
+      "data": {"filename": "SHOW_001.S07E06.EPISODE_001"}
+    }
+  ],
+  "artifacts": {
+    "ARTIFACT_1": {
+      "kind": "track-catalog",
+      "format": "json",
+      "byteLength": 732,
+      "input": "input/artifact-001.json"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "baseUrl": "https://media.example.test/subtitles/playlist.m3u8",
+  "playlist": "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:8.0,\nintro-empty.vtt\n#EXT-X-DISCONTINUITY\n#EXTINF:5.0,\nrecap.vtt\n#EXT-X-DISCONTINUITY\n#EXTINF:60.0,\nmain-001.vtt\n#EXTINF:60.0,\nmain-002.vtt\n#EXT-X-DISCONTINUITY\n#EXTINF:12.0,\noutro-empty.vtt\n#EXT-X-ENDLIST",
+  "segments": {
+    "https://media.example.test/subtitles/intro-empty.vtt": "WEBVTT\n\n00:00:07.500 --> 00:00:08.000\n\u200B",
+    "https://media.example.test/subtitles/recap.vtt": "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nCAPTION_001\n\n00:00:04.500 --> 00:00:05.000\n\u200B",
+    "https://media.example.test/subtitles/main-001.vtt": "WEBVTT\n\n00:00:02.000 --> 00:00:03.000\nCAPTION_002",
+    "https://media.example.test/subtitles/main-002.vtt": "WEBVTT\n\n00:01:02.000 --> 00:01:03.000\nCAPTION_003",
+    "https://media.example.test/subtitles/outro-empty.vtt": "WEBVTT\n\n00:00:11.500 --> 00:00:12.000\n\u200B"
+  }
+}
