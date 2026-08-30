@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "tracks": [
+      {"language": "en", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "en-STRIPPED_SDH", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "en-forced", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "en[cc]", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "ko", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "ko-forced", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3},
+      {"language": "ko[cc]", "format": "webvtt-lssdh-ios8", "extension": "vtt", "mirrorCount": 3}
+    ]
+  }
+}

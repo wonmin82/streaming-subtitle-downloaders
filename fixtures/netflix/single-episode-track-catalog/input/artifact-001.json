@@ -1,0 +1,83 @@
+{
+  "movieId": "TOKEN_1",
+  "timedtexttracks": [
+    {
+      "language": "ko",
+      "rawTrackType": "subtitles",
+      "isForcedNarrative": true,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_001", "MIRROR_2": "URL_002", "MIRROR_3": "URL_003"}
+        }
+      }
+    },
+    {
+      "language": "en",
+      "rawTrackType": "subtitles",
+      "isForcedNarrative": true,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_004", "MIRROR_2": "URL_005", "MIRROR_3": "URL_006"}
+        }
+      }
+    },
+    {
+      "language": "ko",
+      "rawTrackType": "closedcaptions",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_007", "MIRROR_2": "URL_008", "MIRROR_3": "URL_009"}
+        }
+      }
+    },
+    {
+      "language": "ko",
+      "rawTrackType": "subtitles",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_010", "MIRROR_2": "URL_011", "MIRROR_3": "URL_012"}
+        }
+      }
+    },
+    {
+      "language": "en",
+      "rawTrackType": "closedcaptions",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_013", "MIRROR_2": "URL_014", "MIRROR_3": "URL_015"}
+        }
+      }
+    },
+    {
+      "language": "en",
+      "rawTrackType": "subtitles",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_016", "MIRROR_2": "URL_017", "MIRROR_3": "URL_018"}
+        }
+      }
+    },
+    {
+      "language": "en",
+      "rawTrackType": "subtitles",
+      "trackVariant": "STRIPPED_SDH",
+      "isForcedNarrative": false,
+      "isNoneTrack": false,
+      "ttDownloadables": {
+        "webvtt-lssdh-ios8": {
+          "downloadUrls": {"MIRROR_1": "URL_019", "MIRROR_2": "URL_020", "MIRROR_3": "URL_021"}
+        }
+      }
+    }
+  ]
+}

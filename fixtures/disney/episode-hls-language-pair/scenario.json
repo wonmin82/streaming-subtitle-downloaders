@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "name": "episode-hls-language-pair",
+  "service": "disney",
+  "source": {
+    "captureToolVersion": "1.0.0",
+    "scriptVersion": "1.0.18",
+    "sanitization": {"version": 1, "redactions": 6, "warnings": []}
+  },
+  "page": {"host": "www.disneyplus.com", "path": "/play/TOKEN_1"},
+  "capture": {
+    "startedAt": "2026-01-01T00:00:00.000Z",
+    "durationMs": 1000,
+    "truncated": false,
+    "limits": {
+      "maxEvents": 3000,
+      "maxSnapshots": 500,
+      "maxArtifacts": 200,
+      "maxArtifactBytes": 1048576,
+      "maxCaptureBytes": 20971520,
+      "maxStringBytes": 4096,
+      "maxArrayItems": 200,
+      "maxObjectKeys": 200,
+      "maxDepth": 12
+    }
+  },
+  "replay": {"driver": "disney-hls-language-pair-v1", "input": "ARTIFACT_1"},
+  "events": [
+    {
+      "seq": 1,
+      "t": 0,
+      "type": "session.start",
+      "session": "SESSION_1",
+      "data": {"reason": "navigation"}
+    },
+    {
+      "seq": 2,
+      "t": 700,
+      "type": "manifest.parsed",
+      "session": "SESSION_1",
+      "data": {"artifact": "ARTIFACT_1", "subtitleTrackCount": 2}
+    }
+  ],
+  "snapshots": [
+    {
+      "seq": 3,
+      "t": 800,
+      "kind": "filename.resolved",
+      "session": "SESSION_1",
+      "data": {"filename": "SHOW_001.S01E05"}
+    }
+  ],
+  "artifacts": {
+    "ARTIFACT_1": {
+      "kind": "hls-manifest",
+      "format": "m3u8",
+      "url": "https://media.example.test/master.m3u8",
+      "byteLength": 354,
+      "input": "input/artifact-001.m3u8"
+    }
+  }
+}

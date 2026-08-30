@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "reviewed": true,
+  "assertions": {
+    "tracks": [
+      {"language": "en", "forced": false, "cc": true},
+      {"language": "ko", "forced": false, "cc": true}
+    ],
+    "forcedTrackCount": 0
+  }
+}

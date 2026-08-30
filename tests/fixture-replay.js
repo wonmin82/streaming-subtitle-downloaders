@@ -104,6 +104,14 @@ function coupangMetadataRuntime() {
   return context;
 }
 
+function disneyHlsRuntime() {
+  const names = ['parseManifest', 'parseAttrList', 'trackLabel', 'inferTrackName', 'inferLanguage', 'absoluteUrl'];
+  const context = {URL};
+  vm.createContext(context);
+  vm.runInContext(names.map(name => functionDeclaration(DISNEY_SOURCE, name)).join('\n'), context);
+  return context;
+}
+
 const replayDrivers = {
   'apple-metadata-v1': (inputText) => {
     const runtime = appleMetadataRuntime();
@@ -172,6 +180,25 @@ const replayDrivers = {
     return {
       metadata: { title, season, episode },
       filename: runtime.formatMediaBaseFilename(title, runtime.state.episodeTag)
+    };
+  },
+  'disney-hls-language-pair-v1': (inputText) => {
+    const runtime = disneyHlsRuntime();
+    runtime.state = {langs: [], playbackSessionId: 'SESSION_1', status: ''};
+    runtime.isPlaybackSessionCurrent = session => session === runtime.state.playbackSessionId;
+    runtime.addTrack = track => runtime.state.langs.push(track);
+    runtime.looksLikeSubtitlePlaylist = () => false;
+    runtime.extractSegmentUrls = () => [];
+    runtime.captureDisney = () => false;
+    runtime.parseManifest('https://media.example.test/master.m3u8', inputText, runtime.state.playbackSessionId);
+    const tracks = runtime.state.langs.map(track => ({
+      language: track.LANGUAGE,
+      forced: /^YES$/i.test(track.FORCED || ''),
+      cc: /sdh|transcribes-spoken-dialog/i.test(track.CHARACTERISTICS || '')
+    })).sort((left, right) => left.language.localeCompare(right.language));
+    return {
+      tracks,
+      forcedTrackCount: tracks.filter(track => track.forced).length
     };
   },
   'disney-playback-resolution-v1': (inputText, scenario) => {
